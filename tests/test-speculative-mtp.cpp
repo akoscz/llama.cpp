@@ -30,6 +30,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -159,8 +160,10 @@ struct server_rig {
     };
     std::vector<seq> seqs = std::vector<seq>(N_SEQ);
 
-    server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0) : n_max(n_max) {
+    server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
+               ggml_type type_idx = GGML_TYPE_F16) : n_max(n_max) {
         params.n_ctx      = 8192;
+        params.cache_type_idx = type_idx;
         params.n_parallel = N_SEQ;
         params.n_batch    = 512;
         params.n_ubatch   = 512;
@@ -294,6 +297,10 @@ struct acceptance {
     }
 };
 
+static void log_errors(ggml_log_level level, const char * text, void *) {
+    if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
+}
+
 static bool fail(const char * what) {
     fprintf(stderr, "FAIL: %s\n", what);
     return false;
@@ -361,6 +368,39 @@ static bool test_draft_ubatch(llama_model * model) {
             acc[s]((int) steps.seqs[s].draft.size(), rng_steps);
             whole.accept(s, n, rng_whole);
             steps.accept(s, n, rng_steps);
+        }
+    }
+    return true;
+}
+
+// -ctki q8_0 holds the head's indexer cache in q8_0, as it does the target's: the load names both caches' type, and the
+// head drafts its full depth every round
+static bool test_draft_indexer_type(llama_model * model) {
+    std::vector<std::string> lines;
+    llama_log_set([](ggml_log_level level, const char * text, void * data) {
+        log_errors(level, text, nullptr);
+        if (strstr(text, "creating indexer KV cache")) static_cast<std::vector<std::string> *>(data)->push_back(text);
+    }, &lines);
+    std::unique_ptr<server_rig> rig;
+    try {
+        rig = std::make_unique<server_rig>(model, 0.0f, N_MAX, 0, 0, GGML_TYPE_Q8_0);
+    } catch (...) {
+        llama_log_set(log_errors, nullptr);
+        throw;
+    }
+    llama_log_set(log_errors, nullptr);
+    if (lines.size() != 2) return fail("the load did not create the target's and the head's indexer caches");
+    for (const auto & line : lines) {
+        if (line.find("type = q8_0") == std::string::npos) return fail("an indexer cache is not -ctki's q8_0");
+    }
+    std::mt19937 rng(3);
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) rig->request(s, rng, 40 + 11*s);
+    for (int round = 0; round < 2*WINDOW; ++round) {
+        const auto len = rig->draft({0, 1, 2});
+        rig->verify({0, 1, 2});
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            if (len.at(s) != N_MAX) return fail("a head on a q8_0 indexer cache drafted fewer than n_max tokens");
+            rig->accept(s, 1, rng);
         }
     }
     return true;
@@ -796,9 +836,7 @@ static bool test_media(llama_model * model) {
 int main(void) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
-    llama_log_set([](ggml_log_level level, const char * text, void *) {
-        if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
-    }, nullptr);
+    llama_log_set(log_errors, nullptr);
     llama_backend_init();
 
     bool ok = true;
@@ -813,6 +851,7 @@ int main(void) {
             { "kept-row",  test_kept_row  },
             { "media",     test_media     },
             { "ubatch",    test_draft_ubatch },
+            { "indexer",   test_draft_indexer_type },
         };
         for (const auto & t : tests) {
             const bool pass = t.second(model.get());

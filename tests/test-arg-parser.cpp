@@ -245,6 +245,16 @@ static void test(void) {
         }
     }
 
+    // the draft's indexer cache takes the type -ctki names, as the target's does; without -ctki both stay f16
+    {
+        common_params named;
+        argv = {"binary_name", "-ctki", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), named, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(named).cache_type_idx == GGML_TYPE_Q8_0);
+        common_params plain;
+        assert(common_base_params_to_speculative(plain).cache_type_idx == GGML_TYPE_F16);
+    }
+
     // the adaptive MTP depth takes the cost of a draft token past the first, as a share of a one-token round; off by default
     {
         common_params adaptive;

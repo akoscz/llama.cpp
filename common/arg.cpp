@@ -2492,7 +2492,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctki", "--cache-type-idx"}, "TYPE",
         string_format(
-            "sparse-attention indexer cache data type (GLM-5.3 DSA: the indexer keys and the compressor gates)\n"
+            "sparse-attention indexer cache data type (GLM-5.3 DSA: the indexer keys and the compressor gates),\n"
+            "the target's and an MTP draft head's\n"
             "allowed values: f16, q8_0\n"
             "(default: %s)",
             ggml_type_name(params.cache_type_idx)
