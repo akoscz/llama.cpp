@@ -353,6 +353,10 @@ struct common_params_speculative_draft {
     // cost of a draft token past the first, as a share of a one-token round's time (0 = off: always n_max)
     float mtp_adaptive = 0.0f;
 
+    // > 0: the draft context reads each target batch in steps of at most this many rows (capped at the target's
+    // n_ubatch), so its compute buffer is sized for that step; 0 = the target's n_ubatch
+    int32_t n_ubatch = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

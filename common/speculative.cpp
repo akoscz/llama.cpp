@@ -2744,6 +2744,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.cache_type_idx = GGML_TYPE_F16; // the draft's indexer cache is one layer's: f16
 
+    // the draft reads each target batch (n_batch rows at most, one llama_decode) in steps of at most n_ubatch rows, and
+    // its compute buffer is reserved for that step: an MTP head's catch-up holds an n_kv x n_ubatch attention mask
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = std::min(result.n_ubatch, params_spec.n_ubatch);
+    }
+
     // the K-cache mean-center bias is calibrated for the target model
     // (per-head/channel K layout); the draft model has a different K
     // geometry, so it must not inherit the bias

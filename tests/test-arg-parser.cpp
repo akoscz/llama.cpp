@@ -217,6 +217,34 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    // --spec-draft-ubatch N: the draft context reads a batch in steps of at most N rows, never more than the target's own
+    // step, and takes the target's whole batch in one call; without it the draft steps as the target does
+    {
+        common_params steps;
+        argv = {"binary_name", "-b", "2048", "-ub", "2048", "--spec-draft-ubatch", "512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), steps, LLAMA_EXAMPLE_SERVER));
+        const auto draft = common_base_params_to_speculative(steps);
+        assert(draft.n_ubatch == 512);
+        assert(draft.n_batch == 2048);
+        assert(steps.n_ubatch == 2048);
+
+        common_params whole;
+        argv = {"binary_name", "-b", "2048", "-ub", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), whole, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(whole).n_ubatch == 1024);
+
+        common_params wider;
+        argv = {"binary_name", "-b", "1024", "-ub", "1024", "--spec-draft-ubatch", "4096"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), wider, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(wider).n_ubatch == 1024);
+
+        for (const char * bad : {"0", "-1", "half"}) {
+            common_params refused;
+            argv = {"binary_name", "--spec-draft-ubatch", bad};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), refused, LLAMA_EXAMPLE_SERVER));
+        }
+    }
+
     // the adaptive MTP depth takes the cost of a draft token past the first, as a share of a one-token round; off by default
     {
         common_params adaptive;
