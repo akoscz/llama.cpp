@@ -243,6 +243,38 @@ static void test(void) {
             argv = {"binary_name", "--spec-draft-ubatch", bad};
             assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), refused, LLAMA_EXAMPLE_SERVER));
         }
+
+        // a block draft (DFlash, DSpark) decodes every drafting slot's noise block in one non-causal step, which must fit
+        // one ubatch: its step never drops below n_parallel x (n_max + 1) rows, up to the target's own step, whatever
+        // --spec-draft-ubatch says (3 slots x 16 rows = 48 here)
+        for (const char * type : {"draft-dflash", "draft-dspark"}) {
+            common_params block;
+            argv = {"binary_name", "-ub", "512", "-np", "3", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "32"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), block, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(block).n_ubatch == 48);
+
+            // a block wider than the target's own step keeps the target's step, as before the flag existed
+            common_params narrow;
+            argv = {"binary_name", "-ub", "32", "-np", "3", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "16"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), narrow, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(narrow).n_ubatch == 32);
+
+            // a block that fits the flag's step takes the flag's step
+            common_params fits;
+            argv = {"binary_name", "-ub", "512", "-np", "1", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "64"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fits, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(fits).n_ubatch == 64);
+        }
+
+        // an MTP draft catches up causally, so the flag's step holds below the slots' rows
+        common_params mtp;
+        argv = {"binary_name", "-ub", "512", "-np", "3", "--spec-type", "draft-mtp", "--spec-draft-n-max", "15",
+                "--spec-draft-ubatch", "32"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mtp, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(mtp).n_ubatch == 32);
     }
 
     // the draft's indexer cache takes the type -ctki names, as the target's does; without -ctki both stay f16

@@ -328,7 +328,6 @@ static bool stable_shape(const std::vector<int> & len, bool request_start = true
     return true;
 }
 
-// fixed depth: every round of every sequence drafts n_max whatever lands
 // --spec-draft-ubatch: the head reads each target batch in steps of at most N rows, so its compute is sized for N rows
 // while the target keeps its own step, and every draft is the one a head reading the whole batch at once makes: prompts
 // longer than a step, a batch carrying two sequences' prompts across a step boundary, then rounds of drafts, verifications
@@ -406,6 +405,7 @@ static bool test_draft_indexer_type(llama_model * model) {
     return true;
 }
 
+// fixed depth: every round of every sequence drafts n_max whatever lands
 static bool test_baseline(llama_model * model) {
     server_rig rig(model, 0.0f);
     std::mt19937 rng(1);

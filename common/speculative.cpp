@@ -2769,6 +2769,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
+        // the block decode is non-causal and must fit one ubatch (llama_context::decode asserts it): the step never
+        // drops below every slot's block, up to the target's own step, whatever --spec-draft-ubatch says
+        result.n_ubatch = std::max(result.n_ubatch, std::min(params.n_ubatch, result.n_outputs_max));
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }

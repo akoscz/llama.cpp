@@ -4202,7 +4202,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-ubatch", "-ubd", "--ubatch-size-draft"}, "N",
         "the draft context reads each target batch in steps of at most N rows, capped at --ubatch-size: its compute\n"
-        "buffer is sized for N rows (default: the target's --ubatch-size)",
+        "buffer is sized for N rows (default: the target's --ubatch-size). A block draft (draft-dflash, draft-dspark)\n"
+        "never steps below every slot's block, n_parallel x (n_max + 1) rows, up to --ubatch-size",
         [](common_params & params, int value) {
             if (value < 1) {
                 throw std::invalid_argument("--spec-draft-ubatch must be at least 1");
