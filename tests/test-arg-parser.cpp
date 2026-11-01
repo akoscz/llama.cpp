@@ -269,6 +269,26 @@ static void test(void) {
             assert(common_base_params_to_speculative(fits).n_ubatch == 64);
         }
 
+        // -ub 0 is the target stepping its whole batch (llama_context reads it as n_batch): the flag still caps the
+        // draft at N rows, and a block draft's floor stays the slots' rows; without the flag nothing changes
+        {
+            common_params zero;
+            argv = {"binary_name", "-b", "2048", "-ub", "0", "--spec-draft-ubatch", "512"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero).n_ubatch == 512);
+
+            common_params zero_block;
+            argv = {"binary_name", "-b", "512", "-ub", "0", "-np", "3", "--spec-type", "draft-dflash", "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "32"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero_block, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero_block).n_ubatch == 48);
+
+            common_params zero_plain;
+            argv = {"binary_name", "-b", "512", "-ub", "0", "-np", "3", "--spec-type", "draft-dflash", "--spec-draft-n-max", "15"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero_plain, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero_plain).n_ubatch == 0);
+        }
+
         // an MTP draft catches up causally, so the flag's step holds below the slots' rows
         common_params mtp;
         argv = {"binary_name", "-ub", "512", "-np", "3", "--spec-type", "draft-mtp", "--spec-draft-n-max", "15",
