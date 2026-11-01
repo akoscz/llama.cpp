@@ -60,12 +60,16 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+        std::vector<int32_t>        idx;
 
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // the batch index of each row: [n_tokens], or nullptr when the rows are the batch's own, in order
+    int32_t * idx = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

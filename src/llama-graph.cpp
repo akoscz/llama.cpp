@@ -143,6 +143,38 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_nextn::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->idx && nextn.base && "the MTP store needs each row's batch index");
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t base     = *nextn.base;
+
+    if (nextn.mode == LLM_GRAPH_NEXTN_WRITE) {
+        std::vector<int64_t> data(n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            GGML_ASSERT(ubatch->idx[i] < nextn.n_batch);
+            data[i] = base + ubatch->idx[i];
+        }
+        ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*ggml_element_size(rows));
+        return;
+    }
+
+    GGML_ASSERT(nextn.mode == LLM_GRAPH_NEXTN_READ && nextn.src);
+    std::vector<int32_t> data(n_tokens);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT((size_t) ubatch->idx[i] < nextn.src->size());
+        const int32_t s = (*nextn.src)[ubatch->idx[i]];
+        GGML_ASSERT(s < nextn.n_batch && -s <= nextn.n_carry);
+        data[i] = (int32_t) (s >= 0 ? base + s : base + nextn.n_batch - s - 1);
+    }
+    ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*ggml_element_size(rows));
+}
+
+bool llm_graph_input_nextn::can_reuse(const llm_graph_params & params) {
+    return rows && rows->ne[0] == params.ubatch.n_tokens &&
+        params.nextn.mode == nextn.mode && params.nextn.store == nextn.store;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -603,7 +635,7 @@ llm_graph_input_kpool_dims llm_graph_input_kpool::current_dims(
     dims.n_ps    = ubatch.n_seqs_unq/dims.n_stream;
     dims.n_pools = llama_kpool_n_pools_ubatch([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
         return kv->get_cells(s);
-    }, ubatch, dims.n_kv, kpool, dims.n_stream, hparams.indexer_top_k);
+    }, ubatch, dims.n_kv, kpool, dims.n_stream, hparams.indexer_top_k, llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
     dims.rebuild = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
     dims.n_new_max = dims.rebuild ? dims.n_pools : dims.n_tps/kpool + dims.n_ps;
     dims.n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
@@ -1663,6 +1695,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    nextn            (params.nextn),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -4064,7 +4097,8 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 llama_kpool_cells_fn([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
             return kv->get_cells(s);
         });
-        const int64_t n_pools = llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k);
+        const int64_t n_pools = llama_kpool_n_pools_ubatch(cells_of, ubatch, n_kv, kpool, n_stream, hparams.indexer_top_k,
+                llama_kpool_pool_pad(mctx_attn->get_n_pad(), kpool));
         const int64_t n_dump  = llama_kpool_select_k(n_pools, hparams.indexer_top_k, kpool);
 
         GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);

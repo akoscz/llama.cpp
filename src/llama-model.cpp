@@ -479,6 +479,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // the MTP store of the target's hidden rows (llama_set_nextn_source): a whole copy on every card, as the rows are
+        if (tensor_name == "mtp_h_store") {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -1709,8 +1713,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+    // there is very little benefit to offloading the input layer, so it stays on the CPU. LLAMA_TOK_EMBD_GPU=1, with every
+    // layer and the output offloaded, puts it where layer 0 is (under -sm tensor, mirrored on every card): GLM-5.3 Flash's
+    // 2,048-row prefill step gathered its rows from the 643 MiB q8_0 table on the host and copied the 32 MiB result to each
+    // card, and its MTP head gathered the same tokens again (two RTX PRO 6000, Nov 1, 2026). Read at each load
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    if (ggml_env_switch("LLAMA_TOK_EMBD_GPU") && i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1) {
+        pimpl->dev_input = get_layer_buft_list(0);
+        LLAMA_LOG_INFO("%s: input layer assigned to device %s (LLAMA_TOK_EMBD_GPU)\n", __func__,
+                ggml_backend_dev_name(pimpl->dev_input.dev));
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

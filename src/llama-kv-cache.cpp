@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -101,6 +102,18 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // A prompt read in equal steps grows the cache by a step's rows each step, and with it every graph shape that n_kv sets:
+    // padded to 256, each 2,048-row step of GLM-5.3 Flash rebuilt its graphs and planned their memory again, 45-60 ms of a
+    // 555 ms step with both cards idle (two RTX PRO 6000, -sm tensor, Nov 1, 2026). Read per cache, so a context takes the
+    // value set when it is made
+    if (hparams.indexer_kpool > 0) {
+        const char * pad = getenv("LLAMA_KV_PAD_PREFILL");
+        const long   val = pad ? strtol(pad, nullptr, 10) : 8192;
+        const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+        n_pad_prefill = val > 0 ? GGML_PAD((uint32_t) std::min<long>(val, kv_size), n_pad_cur) : 0;
+    }
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -1385,17 +1398,34 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
-    uint32_t result = 0;
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, uint32_t * n_pad_used) const {
+    const auto padded = [&](uint32_t pad) {
+        uint32_t result = 0;
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+
+            result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(cells.used_max_p1(), pad))), result);
+        }
+
+        return result;
+    };
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    uint32_t pad    = std::max(n_pad, 256u);
+    uint32_t result = padded(pad);
 
-    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const auto & cells = v_cells[sinfo.strm[s]];
+    // A prompt step of at least 256 rows whose pooled indexer scores at 256 (llama_kpool_needs_scoring) is padded to
+    // n_pad_prefill: it scores there too, so whether it scores is unchanged, and its sparse attention reads only the cells
+    // its top-k picks, so the empty cells it adds are never read. A decode step, and a step that reads densely, keep 256
+    if (n_pad_prefill > pad && n_tokens >= 256 && result > hparams.indexer_top_k + hparams.indexer_kpool - 1) {
+        pad    = n_pad_prefill;
+        result = padded(pad);
+    }
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+    if (n_pad_used) {
+        *n_pad_used = pad;
     }
 
     return result;
@@ -3136,7 +3166,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens, &n_pad_kv);
 
     return true;
 }
@@ -3153,6 +3183,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_pad() const {
+    return n_pad_kv;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
