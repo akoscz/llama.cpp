@@ -10,7 +10,10 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
+
+#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -876,6 +879,427 @@ static bool test_glm_short_dense(const size_t seed, const std::vector<ggml_backe
     return true;
 }
 
+// set or clear an environment variable a library reads when a model or context is created
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// A prompt read in equal steps reuses its graph. On the served GLM-5.3 Flash (two RTX PRO 6000, -sm tensor, 2,048-row
+// steps) every step of a 16K read rebuilt the main and the MTP context's graphs and planned their memory again, 45-60 ms
+// of the 555 ms a step took, with both cards idle (the host-gap trace of Nov 1, 2026): the cache length grew by a step's
+// rows each step, and the graph's shapes with it. A step of at least 256 rows whose indexer scores has its cache length
+// padded to LLAMA_KV_PAD_PREFILL cells and its pool count to as many pools, so a read builds a graph once a step of
+// cells. Its logits are the 256-padded read's byte for byte; a step that reads densely, and a decode step, keep 256.
+static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    struct read_result {
+        std::vector<float> logits;  // every row of seq 0's read
+        int32_t n_reused   = 0;     // graphs reused over the context's reads
+        int     n_scored   = 0;     // the read's steps whose indexer scored
+        int64_t n_kv_decode = -1;   // the cache length of the one-token decode after the read
+    };
+
+    for (const uint32_t top_k : {8u, 256u}) {
+        auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+        llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, top_k);
+        auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+        auto * model = pair.first.get();
+        const int n_embd  = llama_model_n_embd(model);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+        // top_k 8: every step scores. top_k 256 (the indexer scores past 259 cells): the first step reads densely
+        const int n_read   = top_k == 8 ? 4096 : 1024;
+        const int n_before = 1000;
+        const auto tokens = get_tokens(n_read + 1, n_vocab, seed);
+        const auto before = get_tokens(n_before, n_vocab, seed + 1);
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> normal(0.0f, 0.1f);
+        std::vector<float> hidden((size_t) (n_read + 1)*n_embd);
+        for (auto & value : hidden) value = normal(rng);
+
+        struct probe {
+            bool    decoding = false;
+            int     n_scored = 0;
+            int64_t n_kv     = -1;
+        };
+
+        // seq 0 reads n_read tokens in 256-row steps, after n_before tokens of seq 1 when unified; then one token decodes
+        const auto read = [&](const char * pad, bool mtp, bool unified) {
+            set_env("LLAMA_KV_PAD_PREFILL", pad);
+            probe pr;
+            llama_context_params params = llama_context_default_params();
+            if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            params.n_ctx      = 8192;
+            params.n_batch    = n_read;
+            params.n_ubatch   = 256;
+            params.n_seq_max  = unified ? 2 : 1;
+            params.kv_unified = unified;
+            params.n_threads  = params.n_threads_batch = 4;
+            params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+                auto * p = static_cast<probe *>(data);
+                if (ask && p->decoding && std::string(t->name).rfind("kpool_cand_mask", 0) == 0) {
+                    p->n_kv = t->ne[0];
+                }
+                if (ask && !p->decoding && std::string(t->name).rfind("indexer_top_k_pools", 0) == 0) {
+                    ++p->n_scored;
+                }
+                return false;
+            };
+            params.cb_eval_user_data = &pr;
+            llama_context_ptr ctx(llama_init_from_model(model, params));
+            set_env("LLAMA_KV_PAD_PREFILL", nullptr);
+            if (!ctx) throw std::runtime_error("prefill reuse: failed to create a context");
+
+            const auto decode = [&](const std::vector<llama_token> & input, int begin, int end, llama_seq_id seq,
+                    bool logits) {
+                llama_batch batch = llama_batch_init(end - begin, 0, 1);
+                for (int pos = begin; pos < end; ++pos) {
+                    common_batch_add(batch, input[pos], pos, {seq}, logits || pos == end - 1);
+                }
+                if (mtp) batch.embd = hidden.data() + (size_t) begin*n_embd;
+                const int result = llama_decode(ctx.get(), batch);
+                batch.embd = nullptr;
+                llama_batch_free(batch);
+                if (result) throw std::runtime_error("prefill reuse: decode failed");
+            };
+
+            read_result res;
+            if (unified) decode(before, 0, n_before, 1, false);
+            const int scored_before = pr.n_scored;
+            decode(tokens, 0, n_read, 0, true);
+            // the indexer scores once a step in every DSA layer: steps that scored, times those layers
+            res.n_scored = pr.n_scored - scored_before;
+            for (int i = 0; i < n_read; ++i) {
+                const float * row = llama_get_logits_ith(ctx.get(), i);
+                res.logits.insert(res.logits.end(), row, row + n_vocab);
+            }
+            res.n_reused = llama_perf_context(ctx.get()).n_reused;
+            pr.decoding = true;
+            decode(tokens, n_read, n_read + 1, 0, true);
+            res.n_kv_decode = pr.n_kv;
+            return res;
+        };
+
+        for (const bool mtp : {false, true}) {
+            for (const bool unified : {false, true}) {
+                const read_result fine   = read("0", mtp, unified);
+                const read_result coarse = read("1024", mtp, unified);
+
+                // Padded to 256, every step's cache is a step longer: nothing is reused. Padded to 1,024, a graph is built
+                // when the cache crosses a multiple of 1,024 cells, or seq 0's positions a multiple of 256 pools (seq 1's
+                // 1,000 cells put both crossings on the same steps), for a step that reads densely, for the first scoring
+                // step after one (it rebuilds the keys the dense step left stale), and for a step of another length.
+                //   top_k 8:   seq 0's 16 steps cross at steps 1, 5, 9 and 13: 12 reused. Seq 1's 1,000 tokens (256, 256,
+                //              256, 232 rows) build at step 1, reuse 2 and 3, and build again for the shorter step 4: 2
+                //   top_k 256: seq 0 reads step 1 densely, rebuilds stale keys at step 2, builds the steady graph at step
+                //              3 and reuses it at step 4: 1. Unified, seq 1 does that and ends on its shorter step: 0
+                //              reused, and seq 0, with no dense step of its own and 2,048 cells to the end, reuses 3
+                // The main context's KDA layers bake the recurrent state's zero row into the graph (build_rs): a sequence's
+                // first step starts from it and its second does not, so the second step of each sequence builds too,
+                // whatever the padding. The MTP head has no KDA layer
+                const int want_fine   = 0;
+                const int want_coarse = mtp ?
+                    (top_k == 8 ? (unified ? 14 : 12) : (unified ? 3 : 1)) :
+                    (top_k == 8 ? (unified ? 12 : 11) : (unified ? 2 : 1));
+
+                const int64_t want_n_kv = GGML_PAD(n_read + 1 + (unified ? n_before : 0), 256);
+
+                bool ok = true;
+                if (fine.logits != coarse.logits) {
+                    LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: logits differ, nmse=%g\n", top_k, mtp,
+                            unified, nmse(fine.logits, coarse.logits));
+                    ok = false;
+                }
+                if (fine.n_reused != want_fine || coarse.n_reused != want_coarse) {
+                    LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: reused %d graphs padded to 256 (want %d), "
+                            "%d padded to 1024 (want %d)\n", top_k, mtp, unified, fine.n_reused, want_fine,
+                            coarse.n_reused, want_coarse);
+                    ok = false;
+                }
+                if (coarse.n_scored != fine.n_scored) {
+                    LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: the indexer scored %d times padded to 1024, "
+                            "%d padded to 256\n", top_k, mtp, unified, coarse.n_scored, fine.n_scored);
+                    ok = false;
+                }
+                if (fine.n_kv_decode != want_n_kv || coarse.n_kv_decode != want_n_kv) {
+                    LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: a decode step read %lld cells padded to "
+                            "256 and %lld padded to 1024 (want %lld)\n", top_k, mtp, unified,
+                            (long long) fine.n_kv_decode, (long long) coarse.n_kv_decode, (long long) want_n_kv);
+                    ok = false;
+                }
+                if (!ok) return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The token embedding table on the GPUs (LLAMA_TOK_EMBD_GPU=1). The served GLM-5.3 Flash kept its 643 MiB q8_0 table
+// in host memory: each 2,048-row prefill step gathered its rows on the CPU and copied the 32 MiB result to each card,
+// and the MTP head gathered the same tokens again, 4 x 8 MiB to each card (the host-gap trace of Nov 1, 2026). With the
+// switch and every layer on a GPU, the table sits where layer 0 does (on every card under -sm tensor), the gather runs
+// there, and the logits of the main and the MTP context are the host gather's, byte for byte. Without a GPU, or with
+// the switch off, the table stays in host memory.
+static bool test_glm_tok_embd_on_device(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+
+    set_env("LLAMA_TOK_EMBD_GPU", nullptr);
+    auto host = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    set_env("LLAMA_TOK_EMBD_GPU", "1");
+    auto device = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    set_env("LLAMA_TOK_EMBD_GPU", nullptr);
+
+    // a device with memory of its own, as test_backends picks the tensor split's devices
+    const bool on_gpu = std::any_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+        return ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type();
+    });
+    if (!ggml_backend_buffer_is_host(host.first->tok_embd->buffer)) {
+        LOG_ERR("GLM tok_embd: the switch off put the table in device memory (%s)\n",
+                ggml_backend_buffer_name(host.first->tok_embd->buffer));
+        return false;
+    }
+    if (ggml_backend_buffer_is_host(device.first->tok_embd->buffer) == on_gpu) {
+        LOG_ERR("GLM tok_embd: the switch on with %zu devices left the table in %s\n", devs.size(),
+                ggml_backend_buffer_name(device.first->tok_embd->buffer));
+        return false;
+    }
+
+    auto * model = host.first.get();
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(100, n_vocab, seed);
+    if (get_logits(host.first.get(), host.second.get(), tokens) !=
+            get_logits(device.first.get(), device.second.get(), tokens)) {
+        LOG_ERR("GLM tok_embd: the main context's logits differ with the table on the device\n");
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 0.1f);
+    std::vector<float> hidden(tokens.size()*n_embd);
+    for (auto & value : hidden) value = normal(rng);
+    llama_context_params params = llama_context_default_params();
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.n_ctx = 256;
+    params.n_batch = params.n_ubatch = 128;
+    params.n_threads = params.n_threads_batch = 4;
+    llama_context_ptr mtp_host(llama_init_from_model(host.first.get(), params));
+    llama_context_ptr mtp_device(llama_init_from_model(device.first.get(), params));
+    if (!mtp_host || !mtp_device) return false;
+    if (get_mtp_logits(host.first.get(), mtp_host.get(), tokens, hidden) !=
+            get_mtp_logits(device.first.get(), mtp_device.get(), tokens, hidden)) {
+        LOG_ERR("GLM tok_embd: the MTP context's logits differ with the table on the device\n");
+        return false;
+    }
+    return true;
+}
+
+// The MTP head reads the target's hidden rows where the target left them (the drafter binds the two contexts when
+// LLAMA_MTP_DEVICE_H=1). On the served GLM-5.3 Flash each 2,048-row prefill step copied the target's 32 MiB of hidden
+// rows from card 0 to the host, and the head's input back to each card (the host-gap trace of Nov 1, 2026). Bound, a
+// target batch of 64 rows or more writes every row into a store in its output device's memory (on every card under
+// -sm tensor) by batch index, and the head gathers its rows there. On every device config, against an unbound pair:
+// the store holds exactly such a batch's rows, the target's logits and the rows read back through the host are the same
+// bytes, the head's logits are those of a head fed the same rows from the host, byte for byte, and the store makes no
+// compute buffer grow on its own: a bound context's buffer grows only on a step where the unbound one's grows too (the
+// engine's own growth after its first reserve, which the store doesn't change). A batch under 64 rows keeps the host
+// path.
+static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd  = llama_model_n_embd_out(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(1024, n_vocab, seed);
+
+    const auto make = [&](bool mtp) {
+        llama_context_params params = llama_context_default_params();
+        if (mtp) params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 1024;
+        params.n_batch    = 512;
+        params.n_ubatch   = 64;
+        params.n_seq_max  = 2;
+        params.kv_unified = true;
+        params.n_threads  = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        if (!ctx) throw std::runtime_error("nextn store: failed to create a context");
+        // as the MTP drafter asks: every target row, the head's output rows
+        llama_set_embeddings_nextn(ctx.get(), true, /*masked*/ mtp);
+        return ctx;
+    };
+    const auto compute = [](const llama_context * ctx) {
+        std::map<ggml_backend_buffer_type_t, size_t> sizes;
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+            sizes[buft] = mb.compute;
+        }
+        return sizes;
+    };
+
+    llama_context_ptr tgt_host = make(false), head_host = make(true);
+    llama_context_ptr tgt_dev  = make(false), head_dev  = make(true);
+    if (!llama_set_nextn_source(head_dev.get(), tgt_dev.get())) {
+        LOG_ERR("GLM nextn store: the target and its MTP head would not bind\n");
+        return false;
+    }
+    const auto tgt_at_bind = compute(tgt_dev.get()), head_at_bind = compute(head_dev.get());
+    const auto tgt_host_at0 = compute(tgt_host.get()), head_host_at0 = compute(head_host.get());
+    // each context's compute buffers before the current step
+    auto tgt_before = tgt_at_bind, head_before = head_at_bind, tgt_host_before = tgt_host_at0,
+         head_host_before = head_host_at0;
+
+    llama_pos n_past[2] = { 0, 0 };
+    std::vector<float> kept[2] = { std::vector<float>(n_embd, 0.0f), std::vector<float>(n_embd, 0.0f) };
+    int n_tok = 0;
+
+    // one prefill step: each part a sequence's next rows, the last row of each an output
+    const auto step = [&](const std::vector<std::pair<llama_seq_id, int>> & parts) {
+        int n = 0;
+        for (const auto & p : parts) n += p.second;
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        std::vector<int> first;
+        for (const auto & p : parts) {
+            first.push_back(batch.n_tokens);
+            for (int i = 0; i < p.second; ++i) {
+                common_batch_add(batch, tokens[n_tok++ % tokens.size()], n_past[p.first] + i, {p.first}, i == p.second - 1);
+            }
+        }
+        const auto fail = [&](const char * what) {
+            LOG_ERR("GLM nextn store: a %d-row step: %s\n", n, what);
+            llama_batch_free(batch);
+            return false;
+        };
+        if (llama_decode(tgt_host.get(), batch) || llama_decode(tgt_dev.get(), batch)) return fail("a target decode failed");
+        const bool device = n >= 64;
+        if (llama_get_nextn_store_rows(tgt_dev.get()) != (device ? n : 0) || llama_get_nextn_store_rows(tgt_host.get()) != 0) {
+            LOG_ERR("GLM nextn store: the store holds %d rows, the unbound target's %d\n",
+                    llama_get_nextn_store_rows(tgt_dev.get()), llama_get_nextn_store_rows(tgt_host.get()));
+            return fail("the store does not hold exactly the rows of a step of 64 rows or more");
+        }
+        for (size_t j = 0; j < parts.size(); ++j) {
+            const int i = first[j] + parts[j].second - 1;
+            if (std::memcmp(llama_get_logits_ith(tgt_host.get(), i), llama_get_logits_ith(tgt_dev.get(), i), n_vocab*sizeof(float))) {
+                return fail("the bound target's logits differ");
+            }
+        }
+        // the first and last rows of each sequence through the kept-row read, then every row through the host buffer
+        std::vector<int32_t> ends;
+        for (size_t j = 0; j < parts.size(); ++j) {
+            ends.push_back(first[j]);
+            ends.push_back(first[j] + parts[j].second - 1);
+        }
+        std::vector<float> h_ends(ends.size()*n_embd);
+        const float * h_host = llama_get_embeddings_nextn(tgt_host.get());
+        if (device) {
+            if (!llama_get_embeddings_nextn_rows(tgt_dev.get(), ends.data(), (int32_t) ends.size(), h_ends.data())) {
+                return fail("the kept rows could not be read");
+            }
+            for (size_t j = 0; j < ends.size(); ++j) {
+                if (std::memcmp(h_ends.data() + j*n_embd, h_host + (size_t) ends[j]*n_embd, n_embd*sizeof(float))) {
+                    return fail("a kept row read from the store differs from the unbound target's");
+                }
+            }
+        }
+        const float * h_dev = llama_get_embeddings_nextn(tgt_dev.get());
+        if (h_dev == nullptr || std::memcmp(h_host, h_dev, (size_t) n*n_embd*sizeof(float))) {
+            return fail("the bound target's rows read through the host differ from the unbound target's");
+        }
+
+        // the head: row k reads the target's row k - 1, a sequence's first row the row kept before it
+        std::vector<float> hidden((size_t) n*n_embd);
+        std::vector<int32_t> src(n);
+        std::vector<float> carry;
+        for (size_t j = 0; j < parts.size(); ++j) {
+            const llama_seq_id s = parts[j].first;
+            for (int i = first[j]; i < first[j] + parts[j].second; ++i) {
+                const bool head_row = i == first[j];
+                std::memcpy(hidden.data() + (size_t) i*n_embd, head_row ? kept[s].data() : h_host + (size_t) (i - 1)*n_embd,
+                            n_embd*sizeof(float));
+                src[i] = head_row ? -(int32_t) (carry.size()/n_embd + 1) : i - 1;
+                if (head_row) carry.insert(carry.end(), kept[s].begin(), kept[s].end());
+            }
+        }
+        for (int i = 0; i < n; ++i) batch.logits[i] = true;
+        batch.embd = hidden.data();
+        int rc = llama_decode(head_host.get(), batch);
+        if (device) {
+            llama_set_nextn_h_rows(head_dev.get(), src.data(), n, carry.data(), (int32_t) (carry.size()/n_embd));
+            batch.embd = nullptr;
+        }
+        rc = rc || llama_decode(head_dev.get(), batch);
+        batch.embd = nullptr;
+        if (rc) return fail("a head decode failed");
+        for (int i = 0; i < n; ++i) {
+            if (std::memcmp(llama_get_logits_ith(head_host.get(), i), llama_get_logits_ith(head_dev.get(), i), n_vocab*sizeof(float))) {
+                LOG_ERR("GLM nextn store: row %d of %d, nmse %g\n", i, n, nmse(
+                    std::vector<float>(llama_get_logits_ith(head_host.get(), i), llama_get_logits_ith(head_host.get(), i) + n_vocab),
+                    std::vector<float>(llama_get_logits_ith(head_dev.get(), i), llama_get_logits_ith(head_dev.get(), i) + n_vocab)));
+                return fail(device ? "the head's logits reading the store differ from the host-fed head's" :
+                                     "the head's logits on the host path differ once bound");
+            }
+        }
+        for (size_t j = 0; j < parts.size(); ++j) {
+            const llama_seq_id s = parts[j].first;
+            const float * last = h_host + (size_t) (first[j] + parts[j].second - 1)*n_embd;
+            kept[s].assign(last, last + n_embd);
+            n_past[s] += parts[j].second;
+        }
+        llama_batch_free(batch);
+        // a buffer of a bound context grew in this step while its unbound twin's did not
+        const auto grew_alone = [&](const std::map<ggml_backend_buffer_type_t, size_t> & bound_before,
+                                    const llama_context * bound,
+                                    const std::map<ggml_backend_buffer_type_t, size_t> & unbound_before,
+                                    const llama_context * unbound) {
+            const auto size = [](const std::map<ggml_backend_buffer_type_t, size_t> & m, ggml_backend_buffer_type_t b) {
+                const auto it = m.find(b);
+                return it == m.end() ? (size_t) 0 : it->second;
+            };
+            const auto bound_now = compute(bound), unbound_now = compute(unbound);
+            for (const auto & [buft, sz] : bound_now) {
+                if (sz > size(bound_before, buft) && size(unbound_now, buft) <= size(unbound_before, buft)) return true;
+            }
+            return false;
+        };
+        const bool alone = grew_alone(tgt_before, tgt_dev.get(), tgt_host_before, tgt_host.get()) ||
+                           grew_alone(head_before, head_dev.get(), head_host_before, head_host.get());
+        tgt_before = compute(tgt_dev.get());
+        head_before = compute(head_dev.get());
+        tgt_host_before = compute(tgt_host.get());
+        head_host_before = compute(head_host.get());
+        if (alone) {
+            LOG_ERR("GLM nextn store: a %d-row step grew a bound compute buffer while the unbound one's stayed\n", n);
+            const auto show = [](const char * who, const std::map<ggml_backend_buffer_type_t, size_t> & a,
+                                 const std::map<ggml_backend_buffer_type_t, size_t> & b) {
+                for (const auto & [buft, sz] : b) {
+                    const auto it = a.find(buft);
+                    LOG_ERR("GLM nextn store:   %s %s: %zu then %zu bytes\n", who, ggml_backend_buft_name(buft),
+                            it == a.end() ? (size_t) 0 : it->second, sz);
+                }
+            };
+            show("bound target", tgt_at_bind, compute(tgt_dev.get()));
+            show("bound head", head_at_bind, compute(head_dev.get()));
+            show("unbound target", tgt_host_at0, compute(tgt_host.get()));
+            show("unbound head", head_host_at0, compute(head_host.get()));
+            return false;
+        }
+        return true;
+    };
+
+    // two sequences' prompts, the longer first (the equal split interleaves them); one sequence's on the other half of
+    // the store; two short steps on the host path; then the first half again
+    return step({{0, 180}, {1, 120}}) && step({{1, 100}}) && step({{0, 3}, {1, 3}}) && step({{0, 200}});
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1213,6 +1637,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_reserve_holds_reads(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL reserve\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_prefill_reuse(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL prefill reuse\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_tok_embd_on_device(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL tok_embd on device\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_nextn_store(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL nextn store\033[0m";
                         }
                     }
 

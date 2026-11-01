@@ -4756,3 +4756,24 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+// the MTP store (llama-ext.h): stubs until it lands, so the tests written first build and fail against today's host path
+bool llama_set_nextn_source(llama_context * /*ctx_dft*/, llama_context * /*ctx_tgt*/) {
+    return false;
+}
+
+int32_t llama_get_nextn_store_rows(const llama_context * /*ctx_tgt*/) {
+    return 0;
+}
+
+void llama_set_nextn_h_rows(llama_context * /*ctx_dft*/, const int32_t * /*src*/, int32_t /*n*/, const float * /*carry*/,
+                            int32_t /*n_carry*/) {
+}
+
+bool llama_get_embeddings_nextn_rows(llama_context * /*ctx_tgt*/, const int32_t * /*rows*/, int32_t /*n*/, float * /*dst*/) {
+    return false;
+}
+
+int64_t llama_get_nextn_rows_to_host(const llama_context * /*ctx_tgt*/) {
+    return 0;
+}

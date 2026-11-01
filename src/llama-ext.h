@@ -130,6 +130,27 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// The MTP head reads the target's next-token hidden rows in device memory (GLM5NEXT; common turns it on with
+// LLAMA_MTP_DEVICE_H=1). Binding gives the target a store of rows in the memory of its output device (on every card
+// under -sm tensor): each target batch of at least LLAMA_MTP_DEVICE_H_MIN_ROWS rows (default 64) writes every row there
+// by batch index, and the head gathers its rows there instead of from a host copy. Returns false, and both contexts
+// keep the host path, when the pair cannot take it: another model, another arch, a masked target, pooling.
+LLAMA_API bool    llama_set_nextn_source(struct llama_context * ctx_dft, struct llama_context * ctx_tgt);
+
+// the rows the target's last decode left in the store: its batch's row count, or 0 when it did not write the store
+LLAMA_API int32_t llama_get_nextn_store_rows(const struct llama_context * ctx_tgt);
+
+// for the head's next decode, of a batch without embd: per batch row, the target batch row whose hidden row it reads,
+// or -(c + 1) for carry row c (n_carry rows of n_embd floats in carry, at most the target's n_seq_max)
+LLAMA_API void    llama_set_nextn_h_rows(struct llama_context * ctx_dft, const int32_t * src, int32_t n,
+                                         const float * carry, int32_t n_carry);
+
+// copies the listed batch rows of the target's last write to dst, n rows of n_embd floats
+LLAMA_API bool    llama_get_embeddings_nextn_rows(struct llama_context * ctx_tgt, const int32_t * rows, int32_t n, float * dst);
+
+// the hidden rows the target has copied to host memory since it was created
+LLAMA_API int64_t llama_get_nextn_rows_to_host(const struct llama_context * ctx_tgt);
+
 //
 // model/context data extraction
 //
