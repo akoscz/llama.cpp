@@ -217,6 +217,96 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    // --spec-draft-ubatch N: the draft context reads a batch in steps of at most N rows, never more than the target's own
+    // step, and takes the target's whole batch in one call; without it the draft steps as the target does
+    {
+        common_params steps;
+        argv = {"binary_name", "-b", "2048", "-ub", "2048", "--spec-draft-ubatch", "512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), steps, LLAMA_EXAMPLE_SERVER));
+        const auto draft = common_base_params_to_speculative(steps);
+        assert(draft.n_ubatch == 512);
+        assert(draft.n_batch == 2048);
+        assert(steps.n_ubatch == 2048);
+
+        common_params whole;
+        argv = {"binary_name", "-b", "2048", "-ub", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), whole, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(whole).n_ubatch == 1024);
+
+        common_params wider;
+        argv = {"binary_name", "-b", "1024", "-ub", "1024", "--spec-draft-ubatch", "4096"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), wider, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(wider).n_ubatch == 1024);
+
+        for (const char * bad : {"0", "-1", "half"}) {
+            common_params refused;
+            argv = {"binary_name", "--spec-draft-ubatch", bad};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), refused, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // a block draft (DFlash, DSpark) decodes every drafting slot's noise block in one non-causal step, which must fit
+        // one ubatch: its step never drops below n_parallel x (n_max + 1) rows, up to the target's own step, whatever
+        // --spec-draft-ubatch says (3 slots x 16 rows = 48 here)
+        for (const char * type : {"draft-dflash", "draft-dspark"}) {
+            common_params block;
+            argv = {"binary_name", "-ub", "512", "-np", "3", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "32"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), block, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(block).n_ubatch == 48);
+
+            // a block wider than the target's own step keeps the target's step, as before the flag existed
+            common_params narrow;
+            argv = {"binary_name", "-ub", "32", "-np", "3", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "16"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), narrow, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(narrow).n_ubatch == 32);
+
+            // a block that fits the flag's step takes the flag's step
+            common_params fits;
+            argv = {"binary_name", "-ub", "512", "-np", "1", "--spec-type", type, "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "64"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fits, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(fits).n_ubatch == 64);
+        }
+
+        // -ub 0 is the target stepping its whole batch (llama_context reads it as n_batch): the flag still caps the
+        // draft at N rows, and a block draft's floor stays the slots' rows; without the flag nothing changes
+        {
+            common_params zero;
+            argv = {"binary_name", "-b", "2048", "-ub", "0", "--spec-draft-ubatch", "512"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero).n_ubatch == 512);
+
+            common_params zero_block;
+            argv = {"binary_name", "-b", "512", "-ub", "0", "-np", "3", "--spec-type", "draft-dflash", "--spec-draft-n-max", "15",
+                    "--spec-draft-ubatch", "32"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero_block, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero_block).n_ubatch == 48);
+
+            common_params zero_plain;
+            argv = {"binary_name", "-b", "512", "-ub", "0", "-np", "3", "--spec-type", "draft-dflash", "--spec-draft-n-max", "15"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), zero_plain, LLAMA_EXAMPLE_SERVER));
+            assert(common_base_params_to_speculative(zero_plain).n_ubatch == 0);
+        }
+
+        // an MTP draft catches up causally, so the flag's step holds below the slots' rows
+        common_params mtp;
+        argv = {"binary_name", "-ub", "512", "-np", "3", "--spec-type", "draft-mtp", "--spec-draft-n-max", "15",
+                "--spec-draft-ubatch", "32"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mtp, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(mtp).n_ubatch == 32);
+    }
+
+    // the draft's indexer cache takes the type -ctki names, as the target's does; without -ctki both stay f16
+    {
+        common_params named;
+        argv = {"binary_name", "-ctki", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), named, LLAMA_EXAMPLE_SERVER));
+        assert(common_base_params_to_speculative(named).cache_type_idx == GGML_TYPE_Q8_0);
+        common_params plain;
+        assert(common_base_params_to_speculative(plain).cache_type_idx == GGML_TYPE_F16);
+    }
+
     // the adaptive MTP depth takes the cost of a draft token past the first, as a share of a one-token round; off by default
     {
         common_params adaptive;
