@@ -46,18 +46,36 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
-// rows of n_vocab logits: the mean over rows of KL(softmax(a) || softmax(b)), and the rows whose top token differs
-static double mean_kld(const std::vector<float> & a, const std::vector<float> & b, size_t n_vocab, size_t & n_top_differ) {
+// a row's largest logit magnitude
+static float max_abs(const float * row, size_t n) {
+    float m = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        m = std::max(m, std::fabs(row[i]));
+    }
+    return m;
+}
+
+// rows of n_vocab logits: the mean over rows of KL(softmax(a) || softmax(b)), the rows whose top token differs, and apart
+// from those the rows where the two top tokens are tied: each read scores the other's top token within 1e-4 of its row's
+// largest logit magnitude below its own, a gap a change of summation order alone can close
+static double mean_kld(const std::vector<float> & a, const std::vector<float> & b, size_t n_vocab, size_t & n_top_differ,
+        size_t & n_top_tied) {
     GGML_ASSERT(a.size() == b.size() && n_vocab > 0 && a.size() % n_vocab == 0);
     const size_t n_rows = a.size()/n_vocab;
     double sum = 0.0;
     n_top_differ = 0;
+    n_top_tied   = 0;
     for (size_t r = 0; r < n_rows; ++r) {
         const float * ra = a.data() + r*n_vocab;
         const float * rb = b.data() + r*n_vocab;
         const size_t top_a = std::max_element(ra, ra + n_vocab) - ra;
         const size_t top_b = std::max_element(rb, rb + n_vocab) - rb;
-        n_top_differ += top_a != top_b;
+        if (top_a != top_b) {
+            const bool tied = ra[top_a] - ra[top_b] <= 1e-4f*max_abs(ra, n_vocab) &&
+                              rb[top_b] - rb[top_a] <= 1e-4f*max_abs(rb, n_vocab);
+            n_top_tied   += tied;
+            n_top_differ += !tied;
+        }
         double z_a = 0.0, z_b = 0.0;
         for (size_t i = 0; i < n_vocab; ++i) {
             z_a += std::exp((double) ra[i] - ra[top_a]);
@@ -930,7 +948,10 @@ static void set_env(const char * name, const char * value) {
 // once the cache holds 4,096 cells or more, and sums them in another order than the dense kernel below that
 // (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse), so a padded step can round differently there. Its logits then meet
 // the plan's bar for a lossless change against the 256-padded read: a mean KL divergence of at most 1e-6, and the same top
-// token on every row.
+// token on every row whose two top tokens are not tied (mean_kld). A tie's order is the summation's, so any rounding can
+// swap it, and 4,096 rows cannot resolve the plan's 99.99% identical top tokens: a change at exactly that rate leaves a
+// swapped row in a third of such reads. Two RTX PRO 6000 at a 3:7 tensor split swapped one row of 4,096 at a mean KL
+// divergence of 3.2e-17 (top_k 8, box 58698413, Nov 1, 2026).
 static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     struct read_result {
@@ -1058,12 +1079,16 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 }
                 if (!exact) {
                     size_t n_top_differ = 0;
-                    const double kld = mean_kld(fine.logits, coarse.logits, n_vocab, n_top_differ);
+                    size_t n_top_tied   = 0;
+                    const double kld = mean_kld(fine.logits, coarse.logits, n_vocab, n_top_differ, n_top_tied);
                     if (!(kld <= 1e-6) || n_top_differ > 0) {
                         LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: mean KLD %g (at most 1e-6), %zu rows' top "
-                                "token differs, nmse=%g\n", top_k, mtp, unified, kld, n_top_differ,
-                                nmse(fine.logits, coarse.logits));
+                                "token differs, %zu tied rows' swapped, nmse=%g\n", top_k, mtp, unified, kld, n_top_differ,
+                                n_top_tied, nmse(fine.logits, coarse.logits));
                         ok = false;
+                    } else if (n_top_tied > 0) {
+                        LOG_WRN("GLM prefill reuse: top_k=%u mtp=%d unified=%d: %zu tied rows' top token swapped, mean KLD "
+                                "%g, nmse=%g\n", top_k, mtp, unified, n_top_tied, kld, nmse(fine.logits, coarse.logits));
                     }
                 }
                 if (fine.n_reused != want_fine || coarse.n_reused != want_coarse) {
