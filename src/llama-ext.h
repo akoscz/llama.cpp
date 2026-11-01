@@ -134,7 +134,10 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // LLAMA_MTP_DEVICE_H=1). Binding gives the target a store of rows in the memory of its output device (on every card
 // under -sm tensor): each target batch of at least LLAMA_MTP_DEVICE_H_MIN_ROWS rows (default 64) writes every row there
 // by batch index, and the head gathers its rows there instead of from a host copy. Returns false, and both contexts
-// keep the host path, when the pair cannot take it: another model, another arch, a masked target, pooling.
+// keep the host path, when the pair cannot take it: another model, another arch, a masked target, pooling, or no room
+// for the store itself. Once the store is in place, binding reserves both contexts' graphs again with it, and like a
+// context's first reserve that throws std::runtime_error when the devices cannot hold them; neither context is usable
+// after such a throw, so a caller short of memory fails as it would at context creation.
 LLAMA_API bool    llama_set_nextn_source(struct llama_context * ctx_dft, struct llama_context * ctx_tgt);
 
 // the rows the target's last decode left in the store: its batch's row count, or 0 when it did not write the store
