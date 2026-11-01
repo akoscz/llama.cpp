@@ -14,8 +14,13 @@
 // before it was copied out reaches the peer already summed), each with the receives beside the sends and then after
 // them (GGML_CUDA_AR_COPY_ONE_STREAM=1, the order before). The same kernels add the same bytes in both orders, so each
 // output after the sends must equal the one beside them bit for bit: a race that reaches a single chunk shows there,
-// though its error can stay under the CPU comparison's bar. Each pass must initialize the internal AllReduce pipeline
-// in its own order. On the first two GPUs, or on the first GPU twice; with no GPU the test is skipped.
+// though its error can stay under the CPU comparison's bar. Those passes stage through host memory
+// (GGML_CUDA_AR_COPY_PEER=0). A third pass on each wire takes the default: where the two cards can map each other's
+// memory (the pipeline's LL card-to-card limit is above 0), each copies its share once, straight into a receive buffer
+// on its peer, and its pipeline must say its receives are card to card; where they cannot, it stages as before. Its
+// outputs must equal the pass beside the sends bit for bit, since the same kernel adds the same bytes. Each pass must
+// initialize the internal AllReduce pipeline in its own order. On the first two GPUs, or on the first GPU twice; with
+// no GPU the test is skipped.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -56,13 +61,19 @@ static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, v
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
-static int  n_pipelines     = 0;     // "initialized AllReduce pipeline" lines logged
-static bool last_one_stream = false; // the last one's copy-engine receives run after its sends
+static int  n_pipelines       = 0;     // "initialized AllReduce pipeline" lines logged
+static bool last_one_stream   = false; // the last one's copy-engine receives run after its sends
+static bool last_card_to_card = false; // the last one's copy-engine receives come card to card
+static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
-        last_one_stream = strstr(text, "receives after the sends") != nullptr;
+        last_one_stream   = strstr(text, "receives after the sends") != nullptr;
+        last_card_to_card = strstr(text, "receives card to card") != nullptr;
+        const char * ll   = strstr(text, "LL card to card up to ");
+        unsigned long long ll_bytes = 0;
+        last_p2p = ll != nullptr && sscanf(ll, "LL card to card up to %llu", &ll_bytes) == 1 && ll_bytes > 0;
         fputs(text, stderr);
     }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
@@ -252,13 +263,16 @@ int main() {
         const char * name;
         const char * bf16_threshold; // GGML_CUDA_AR_BF16_THRESHOLD, nullptr for the default
         bool         one_stream;     // GGML_CUDA_AR_COPY_ONE_STREAM=1
+        bool         card_to_card;   // GGML_CUDA_AR_COPY_PEER left to its default; 0 otherwise
     };
-    // each wire's pass after the sends follows its pass beside them, whose outputs it must equal
+    // each wire's passes after the sends and card to card follow its pass beside them, whose outputs they must equal
     const pass passes[] = {
-        {"BF16 wire, beside the sends", nullptr, false},
-        {"BF16 wire, after the sends",  nullptr, true},
-        {"F32 wire, beside the sends",  "0",     false},
-        {"F32 wire, after the sends",   "0",     true},
+        {"BF16 wire, beside the sends", nullptr, false, false},
+        {"BF16 wire, after the sends",  nullptr, true,  false},
+        {"BF16 wire, card to card",     nullptr, false, true},
+        {"F32 wire, beside the sends",  "0",     false, false},
+        {"F32 wire, after the sends",   "0",     true,  false},
+        {"F32 wire, card to card",      "0",     false, true},
     };
 
     bool ok = true;
@@ -267,6 +281,7 @@ int main() {
     for (const pass & ps : passes) {
         set_env("GGML_CUDA_AR_BF16_THRESHOLD", ps.bf16_threshold);
         set_env("GGML_CUDA_AR_COPY_ONE_STREAM", ps.one_stream ? "1" : nullptr);
+        set_env("GGML_CUDA_AR_COPY_PEER", ps.card_to_card ? nullptr : "0");
 
         const int n_pipelines_before = n_pipelines;
         ggml_backend_t cpu     = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -282,7 +297,7 @@ int main() {
                 printf("%s %s, eval %d, %lld columns: NMSE vs CPU %.3e\n", ok_eval ? "ok  " : "FAIL", ps.name, e + 1,
                        (long long) n_tok[k], err);
                 ok = ok && ok_eval;
-                if (!ps.one_stream) {
+                if (!ps.one_stream && !ps.card_to_card) {
                     beside[e] = out;
                     continue;
                 }
@@ -299,10 +314,15 @@ int main() {
                 ok = ok && n_diff == 0;
             }
         }
-        const bool ok_pipeline = n_pipelines == n_pipelines_before + 1 && last_one_stream == ps.one_stream;
-        printf("%s %s: %d internal AllReduce pipeline initialized (1 expected), receives %s the sends\n",
+        // card to card wherever the cards map each other's memory and the pass leaves the switch on, and nowhere else
+        const bool want_card_to_card = ps.card_to_card && last_p2p;
+        const bool ok_pipeline = n_pipelines == n_pipelines_before + 1 && last_one_stream == ps.one_stream &&
+            last_card_to_card == want_card_to_card;
+        printf("%s %s: %d internal AllReduce pipeline initialized (1 expected), receives %s (%s expected)%s\n",
                ok_pipeline ? "ok  " : "FAIL", ps.name, n_pipelines - n_pipelines_before,
-               last_one_stream ? "after" : "beside");
+               last_card_to_card ? "card to card" : last_one_stream ? "after the sends" : "beside the sends",
+               want_card_to_card ? "card to card" : ps.one_stream ? "after the sends" : "beside the sends",
+               ps.card_to_card && !last_p2p ? ", the cards cannot map each other's memory" : "");
         ok = ok && ok_pipeline;
         ggml_backend_free(backend);
         ggml_backend_free(cpu);
