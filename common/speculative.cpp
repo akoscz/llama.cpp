@@ -2742,7 +2742,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.cache_type_idx = GGML_TYPE_F16; // the draft's indexer cache is one layer's: f16
+    // the draft's indexer cache (an MTP head's DSA keys) keeps the type -ctki names for the target's: result's copy
+
+    // the draft reads each target batch (n_batch rows at most, one llama_decode) in steps of at most n_ubatch rows, and
+    // its compute buffer is reserved for that step: an MTP head's catch-up holds an n_kv x n_ubatch attention mask
+    // the target's own step: -ub 0 steps the whole batch (llama_context reads 0 as n_batch)
+    const int32_t n_ubatch_tgt = params.n_ubatch > 0 ? params.n_ubatch : params.n_batch;
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = std::min(n_ubatch_tgt, params_spec.n_ubatch);
+    }
 
     // the K-cache mean-center bias is calibrated for the target model
     // (per-head/channel K layout); the draft model has a different K
@@ -2763,6 +2771,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
+        // the block decode is non-causal and must fit one ubatch (llama_context::decode asserts it): the flag's step
+        // never drops below every slot's block, up to the target's own step
+        if (params_spec.n_ubatch > 0) {
+            result.n_ubatch = std::max(result.n_ubatch, std::min(n_ubatch_tgt, result.n_outputs_max));
+        }
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }

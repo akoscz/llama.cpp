@@ -2492,7 +2492,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctki", "--cache-type-idx"}, "TYPE",
         string_format(
-            "sparse-attention indexer cache data type (GLM-5.3 DSA: the indexer keys and the compressor gates)\n"
+            "sparse-attention indexer cache data type (GLM-5.3 DSA: the indexer keys and the compressor gates),\n"
+            "the target's and an MTP draft head's\n"
             "allowed values: f16, q8_0\n"
             "(default: %s)",
             ggml_type_name(params.cache_type_idx)
@@ -4198,6 +4199,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch", "-ubd", "--ubatch-size-draft"}, "N",
+        "the draft context reads each target batch in steps of at most N rows, capped at --ubatch-size: its compute\n"
+        "buffer is sized for N rows (default: the target's --ubatch-size). A block draft (draft-dflash, draft-dspark)\n"
+        "never steps below every slot's block, n_parallel x (n_max + 1) rows, up to --ubatch-size",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--spec-draft-ubatch must be at least 1");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
