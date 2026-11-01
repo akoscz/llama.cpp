@@ -30,6 +30,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -159,8 +160,10 @@ struct server_rig {
     };
     std::vector<seq> seqs = std::vector<seq>(N_SEQ);
 
-    server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0) : n_max(n_max) {
+    server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
+               ggml_type type_idx = GGML_TYPE_F16) : n_max(n_max) {
         params.n_ctx      = 8192;
+        params.cache_type_idx = type_idx;
         params.n_parallel = N_SEQ;
         params.n_batch    = 512;
         params.n_ubatch   = 512;
@@ -170,6 +173,7 @@ struct server_rig {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         params.speculative.draft.n_max = n_max;
         params.speculative.draft.n_min = n_min;
+        params.speculative.draft.n_ubatch = n_ubatch_dft;
         params.speculative.draft.mtp_adaptive = adaptive;
         const auto limits = common_speculative_get_output_limits(params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
         params.n_outputs_max         = limits.total;
@@ -293,6 +297,10 @@ struct acceptance {
     }
 };
 
+static void log_errors(ggml_log_level level, const char * text, void *) {
+    if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
+}
+
 static bool fail(const char * what) {
     fprintf(stderr, "FAIL: %s\n", what);
     return false;
@@ -315,6 +323,83 @@ static bool stable_shape(const std::vector<int> & len, bool request_start = true
         }
         if (!full && !low) {
             return false;
+        }
+    }
+    return true;
+}
+
+// --spec-draft-ubatch: the head reads each target batch in steps of at most N rows, so its compute is sized for N rows
+// while the target keeps its own step, and every draft is the one a head reading the whole batch at once makes: prompts
+// longer than a step, a batch carrying two sequences' prompts across a step boundary, then rounds of drafts, verifications
+// and partial acceptance
+static bool test_draft_ubatch(llama_model * model) {
+    server_rig whole(model, 0.0f);
+    server_rig steps(model, 0.0f, N_MAX, 0, 32);
+    if (llama_n_ubatch(steps.init->context()) != 32) return fail("the head does not step at --spec-draft-ubatch's 32 rows");
+    if (llama_n_ubatch(steps.tgt.get()) != 512 || llama_n_ubatch(whole.init->context()) != 512) {
+        return fail("the target's step, or the head's without the flag, is not the target's 512");
+    }
+    std::mt19937 rng_whole(7), rng_steps(7);
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+        whole.request(s, rng_whole, 70 + 37*s);
+        steps.request(s, rng_steps, 70 + 37*s);
+    }
+    // two sequences' new prompt rows in one target batch, 45 + 45 rows: a 32-row step ends inside each of them
+    const auto more = whole.tokens(rng_whole, 45), other = whole.tokens(rng_whole, 45);
+    steps.tokens(rng_steps, 90);
+    whole.decode({{0, more}, {1, other}});
+    steps.decode({{0, more}, {1, other}});
+    for (llama_seq_id s : {0, 1}) {
+        whole.seqs[s].prompt.insert(whole.seqs[s].prompt.end(), s == 0 ? more.begin() : other.begin(), s == 0 ? more.end() : other.end());
+        steps.seqs[s].prompt = whole.seqs[s].prompt;
+    }
+    const acceptance acc[N_SEQ] = { {1.0f, 1.0f}, {1.0f, 0.0f}, {0.5f, 0.5f} };
+    for (int round = 0; round < 2*WINDOW; ++round) {
+        whole.draft({0, 1, 2});
+        steps.draft({0, 1, 2});
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            if (whole.seqs[s].draft != steps.seqs[s].draft) return fail("a head stepping 32 rows drafted other tokens");
+        }
+        whole.verify({1, 2, 0});
+        steps.verify({1, 2, 0});
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            const int n = acc[s]((int) whole.seqs[s].draft.size(), rng_whole);
+            acc[s]((int) steps.seqs[s].draft.size(), rng_steps);
+            whole.accept(s, n, rng_whole);
+            steps.accept(s, n, rng_steps);
+        }
+    }
+    return true;
+}
+
+// -ctki q8_0 holds the head's indexer cache in q8_0, as it does the target's: the load names both caches' type, and the
+// head drafts its full depth every round
+static bool test_draft_indexer_type(llama_model * model) {
+    std::vector<std::string> lines;
+    llama_log_set([](ggml_log_level level, const char * text, void * data) {
+        log_errors(level, text, nullptr);
+        if (strstr(text, "creating indexer KV cache")) static_cast<std::vector<std::string> *>(data)->push_back(text);
+    }, &lines);
+    std::unique_ptr<server_rig> rig;
+    try {
+        rig = std::make_unique<server_rig>(model, 0.0f, N_MAX, 0, 0, GGML_TYPE_Q8_0);
+    } catch (...) {
+        llama_log_set(log_errors, nullptr);
+        throw;
+    }
+    llama_log_set(log_errors, nullptr);
+    if (lines.size() != 2) return fail("the load did not create the target's and the head's indexer caches");
+    for (const auto & line : lines) {
+        if (line.find("type = q8_0") == std::string::npos) return fail("an indexer cache is not -ctki's q8_0");
+    }
+    std::mt19937 rng(3);
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) rig->request(s, rng, 40 + 11*s);
+    for (int round = 0; round < 2*WINDOW; ++round) {
+        const auto len = rig->draft({0, 1, 2});
+        rig->verify({0, 1, 2});
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            if (len.at(s) != N_MAX) return fail("a head on a q8_0 indexer cache drafted fewer than n_max tokens");
+            rig->accept(s, 1, rng);
         }
     }
     return true;
@@ -751,9 +836,7 @@ static bool test_media(llama_model * model) {
 int main(void) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
-    llama_log_set([](ggml_log_level level, const char * text, void *) {
-        if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
-    }, nullptr);
+    llama_log_set(log_errors, nullptr);
     llama_backend_init();
 
     bool ok = true;
@@ -767,6 +850,8 @@ int main(void) {
             { "n-min",     test_n_min     },
             { "kept-row",  test_kept_row  },
             { "media",     test_media     },
+            { "ubatch",    test_draft_ubatch },
+            { "indexer",   test_draft_indexer_type },
         };
         for (const auto & t : tests) {
             const bool pass = t.second(model.get());
