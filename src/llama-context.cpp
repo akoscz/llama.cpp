@@ -245,6 +245,51 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_weights_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the target's next-token hidden rows in its output device's memory (on every card under -sm tensor), where its MTP head
+// reads them (llama_set_nextn_source). Two halves, so that the target writes a batch while the head still reads the one
+// before; each half holds a batch by batch index, then n_carry rows for the head's carry rows
+struct llama_nextn_store {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+    ggml_tensor *           t   = nullptr; // F32 [n_embd, 2*(n_batch + n_carry)], "mtp_h_store"
+    ggml_backend_dev_t      dev = nullptr;
+
+    int64_t  n_embd   = 0;
+    int64_t  n_batch  = 0;
+    int64_t  n_carry  = 0;
+    uint32_t min_rows = 64; // env: LLAMA_MTP_DEVICE_H_MIN_ROWS
+
+    int     half   = 1; // the half the target wrote last
+    int32_t n_rows = 0; // the rows the target's last decode wrote there, 0 when it did not write the store
+
+    // the head finished reading a half; with no events, the target synchronizes the head instead
+    ggml_backend_event_t read_done[2]    = { nullptr, nullptr };
+    bool                 read_pending[2] = { false, false };
+    llama_context *      reader          = nullptr;
+
+    int64_t base(int h) const { return h*(n_batch + n_carry); }
+
+    void wait_read(int h) {
+        if (!read_pending[h]) {
+            return;
+        }
+        read_pending[h] = false;
+        if (read_done[h]) {
+            ggml_backend_event_synchronize(read_done[h]);
+        } else if (reader) {
+            reader->synchronize();
+        }
+    }
+
+    ~llama_nextn_store() {
+        for (auto * e : read_done) {
+            if (e) {
+                ggml_backend_event_free(e);
+            }
+        }
+    }
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -698,6 +743,10 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (nextn_store && nextn_store->reader == this) {
+        nextn_store->reader = nullptr;
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -868,6 +917,16 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+    }
+
+    // bound to an MTP store: the pp graph that writes it, or reads it, too, so that no read grows the buffers
+    if (nextn_store && !model.hparams.no_alloc) {
+        nextn_mode = nextn_is_target ? LLM_GRAPH_NEXTN_WRITE : LLM_GRAPH_NEXTN_READ;
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+        nextn_mode = LLM_GRAPH_NEXTN_NONE;
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute pp buffers for the MTP store");
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -1172,14 +1231,31 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+void llama_context::nextn_refill() {
+    if (!embd_nextn_stale) {
+        return;
+    }
+    embd_nextn_stale = false;
+    synchronize();
+    const auto & st  = *nextn_store;
+    const size_t row = (size_t) st.n_embd*sizeof(float);
+    GGML_ASSERT((size_t) st.n_rows*st.n_embd <= embd_nextn.size);
+    ggml_backend_tensor_get(st.t, embd_nextn.data, st.base(st.half)*row, st.n_rows*row);
+    n_nextn_to_host += st.n_rows;
+}
+
 float * llama_context::get_embeddings_nextn() {
+    nextn_refill();
     output_reorder();
+    nextn_reorder();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    nextn_refill();
     output_reorder();
+    nextn_reorder();
 
     try {
         if (embd_nextn.data == nullptr) {
@@ -1774,6 +1850,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
 int llama_context::encode(const llama_batch & batch_inp) {
     mtp_index.tensor = nullptr;
+    nextn_order.clear();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2109,6 +2186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    nextn_order.clear();
 
     sched_reserve();
 
@@ -2169,6 +2247,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    // the MTP store (llama_set_nextn_source): a target batch of min_rows rows or more writes every hidden row there by
+    // batch index, in place of the copy to embd_nextn; the head reads its rows there when it was given them
+    struct nextn_reset {
+        llama_context & ctx;
+        ~nextn_reset() {
+            ctx.nextn_mode    = LLM_GRAPH_NEXTN_NONE;
+            ctx.nextn_src_set = false;
+        }
+    } nextn_guard{*this};
+    if (nextn_store) {
+        auto & st = *nextn_store;
+        if (nextn_is_target) {
+            st.n_rows        = 0;
+            embd_nextn_stale = false;
+            if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
+                    n_tokens_all >= st.min_rows && (int64_t) n_tokens_all <= st.n_batch) {
+                const int h = 1 - st.half;
+                st.wait_read(h);
+                st.half    = h;
+                nextn_base = st.base(h);
+                nextn_mode = LLM_GRAPH_NEXTN_WRITE;
+            }
+        } else if (nextn_src_set && batch_inp.token && !batch_inp.embd && nextn_src.size() == n_tokens_all) {
+            nextn_base = st.base(st.half);
+            nextn_mode = LLM_GRAPH_NEXTN_READ;
+        }
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2355,15 +2462,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
+                    nextn_mode != LLM_GRAPH_NEXTN_WRITE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_res, t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                const uint32_t n_embd = hparams.n_embd_out();
+                const size_t   n_row  = (size_t) n_embd*sizeof(float);
+
+                n_nextn_to_host += n_rows;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_row);
+
+                if (!masked) {
+                    // unmasked rows belong at their batch index: record where each landed (nextn_order). A row an
+                    // earlier ubatch did not read is -1, and nextn_reorder then moves nothing
+                    nextn_order.resize(offset, -1);
+                    for (int64_t i = 0; i < n_rows; ++i) {
+                        nextn_order.push_back(ubatch.idx ? (int32_t) ubatch.idx[i] : (int32_t) (offset + i));
+                    }
+                }
             }
         }
 
@@ -2380,6 +2499,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (nextn_mode == LLM_GRAPH_NEXTN_WRITE) {
+        nextn_store->n_rows = n_tokens_all;
+        embd_nextn_stale    = true;
+    } else if (nextn_mode == LLM_GRAPH_NEXTN_READ) {
+        // the target may write this half again once the head's reads of it are done
+        auto & st = *nextn_store;
+        ggml_backend_t backend_st = nullptr;
+        for (const auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == st.dev) {
+                backend_st = backend.get();
+            }
+        }
+        if (st.read_done[st.half] && backend_st) {
+            ggml_backend_event_record(st.read_done[st.half], backend_st);
+            st.read_pending[st.half] = true;
+        } else if (st.read_done[st.half]) {
+            // no backend of the store's device here to record on: the reads are done once this context is
+            synchronize();
+        } else {
+            st.read_pending[st.half] = true; // the target synchronizes this context before it writes the half again
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2660,7 +2802,8 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        // only the masked nextn rows follow the outputs; the unmasked ones follow nextn_order (nextn_reorder)
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
@@ -2715,6 +2858,48 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+}
+
+void llama_context::nextn_reorder() {
+    if (nextn_order.empty()) {
+        return;
+    }
+
+    const int64_t n      = (int64_t) nextn_order.size();
+    const int64_t n_embd = model.hparams.n_embd_out();
+    GGML_ASSERT((size_t) (n*n_embd) <= embd_nextn.size);
+
+    // a decode that reads every ubatch's rows reads each batch row once: a permutation of the rows read. A decode that
+    // stopped part way, or a ubatch with no rows, leaves rows that are not valid outputs, and they stay where they are
+    std::vector<uint8_t> done(n, 0);
+    for (int64_t k = 0; k < n; ++k) {
+        const int32_t j = nextn_order[k];
+        if (j < 0 || j >= n || done[j]) {
+            nextn_order.clear();
+            return;
+        }
+        done[j] = 1;
+    }
+    std::fill(done.begin(), done.end(), 0);
+
+    // row k belongs at row nextn_order[k]: follow each cycle of the permutation with one row in hand
+    std::vector<float> row;
+    for (int64_t k = 0; k < n; ++k) {
+        if (done[k] || nextn_order[k] == k) {
+            done[k] = 1;
+            continue;
+        }
+        row.assign(embd_nextn.data + k*n_embd, embd_nextn.data + (k + 1)*n_embd);
+        for (int64_t j = nextn_order[k]; ; j = nextn_order[j]) {
+            std::swap_ranges(row.begin(), row.end(), embd_nextn.data + j*n_embd);
+            done[j] = 1;
+            if (j == k) {
+                break;
+            }
+        }
+    }
+
+    nextn_order.clear();
 }
 
 //
@@ -2925,7 +3110,109 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(sched_gf),
         /*.res         =*/ res,
+        /*.nextn       =*/ nextn_mode == LLM_GRAPH_NEXTN_NONE ? llm_graph_nextn{} : llm_graph_nextn{
+            nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry },
     };
+}
+
+bool llama_context::nextn_bind(llama_context & head) {
+    const auto & hparams = model.hparams;
+    if (&head.model != &model || model.arch != LLM_ARCH_GLM5NEXT || hparams.n_layer_nextn != 1 ||
+            head.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+            !cparams.embeddings_nextn || cparams.embeddings_nextn_masked ||
+            cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || !memory || !head.memory || head.cparams.ctx_other == this) {
+        return false;
+    }
+
+    auto st = std::make_shared<llama_nextn_store>();
+    st->dev     = model.dev_output();
+    st->n_embd  = hparams.n_embd_out();
+    st->n_batch = cparams.n_batch;
+    st->n_carry = std::max<int64_t>(1, cparams.n_seq_max);
+    if (const char * env = getenv("LLAMA_MTP_DEVICE_H_MIN_ROWS")) {
+        // above the decode steps' graph slots (graph_slot_max_tokens), which a verification keeps
+        st->min_rows = std::max<uint32_t>(graph_slot_max_tokens + 1, (uint32_t) atoi(env));
+    }
+
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
+    st->ctx.reset(ggml_init(params));
+    st->t = ggml_new_tensor_2d(st->ctx.get(), GGML_TYPE_F32, st->n_embd, 2*(st->n_batch + st->n_carry));
+    ggml_set_name(st->t, "mtp_h_store");
+    st->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(st->ctx.get(), ggml_backend_dev_buffer_type(st->dev)));
+    if (!st->buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the MTP store on %s\n", __func__, ggml_backend_dev_name(st->dev));
+        return false;
+    }
+    ggml_backend_buffer_clear(st->buf.get(), 0);
+    for (auto & e : st->read_done) {
+        e = ggml_backend_event_new(st->dev);
+    }
+    st->reader = &head;
+
+    nextn_store     = st;
+    nextn_is_target = true;
+    head.nextn_store     = st;
+    head.nextn_is_target = false;
+    head.nextn_src_set   = false;
+
+    sched_need_reserve      = true;
+    head.sched_need_reserve = true;
+    sched_reserve();
+    head.sched_reserve();
+
+    LLAMA_LOG_INFO("%s: the MTP head reads the target's hidden rows in %s, %.2f MiB, batches of %u rows or more\n",
+            __func__, ggml_backend_buffer_name(st->buf.get()), ggml_backend_buffer_get_size(st->buf.get())/1024.0/1024.0,
+            st->min_rows);
+    return true;
+}
+
+int32_t llama_context::nextn_store_rows() const {
+    return nextn_store && nextn_is_target ? nextn_store->n_rows : 0;
+}
+
+void llama_context::nextn_set_h_rows(const int32_t * src, int32_t n, const float * carry, int32_t n_carry) {
+    GGML_ASSERT(nextn_store && !nextn_is_target && "llama_set_nextn_h_rows: the context is not a bound MTP head");
+    auto & st = *nextn_store;
+    GGML_ASSERT(n_carry >= 0 && n_carry <= st.n_carry);
+    if (n_carry > 0) {
+        const size_t row = (size_t) st.n_embd*sizeof(float);
+        ggml_backend_tensor_set(st.t, carry, (st.base(st.half) + st.n_batch)*row, n_carry*row);
+    }
+    nextn_src.assign(src, src + n);
+    nextn_src_set = true;
+}
+
+bool llama_context::nextn_get_rows(const int32_t * rows, int32_t n, float * dst) {
+    synchronize();
+    const int64_t n_embd = model.hparams.n_embd_out();
+    const size_t  row    = (size_t) n_embd*sizeof(float);
+    if (embd_nextn_stale) {
+        const auto & st = *nextn_store;
+        for (int32_t i0 = 0; i0 < n; ) {
+            int32_t i1 = i0 + 1;
+            while (i1 < n && rows[i1] == rows[i1 - 1] + 1) {
+                ++i1;
+            }
+            if (rows[i0] < 0 || rows[i1 - 1] >= st.n_rows) {
+                return false;
+            }
+            ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, (st.base(st.half) + rows[i0])*row, (i1 - i0)*row);
+            i0 = i1;
+        }
+        n_nextn_to_host += n;
+        return true;
+    }
+    if (embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
+        return false;
+    }
+    nextn_reorder();
+    for (int32_t i = 0; i < n; ++i) {
+        if (rows[i] < 0 || (size_t) (rows[i] + 1)*n_embd > embd_nextn.size) {
+            return false;
+        }
+        std::memcpy(dst + (size_t) i*n_embd, embd_nextn.data + (size_t) rows[i]*n_embd, row);
+    }
+    return true;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4337,6 +4624,29 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
+}
+
+bool llama_set_nextn_source(llama_context * ctx_dft, llama_context * ctx_tgt) {
+    if (ctx_dft == nullptr || ctx_tgt == nullptr || ctx_dft == ctx_tgt) {
+        return false;
+    }
+    return ctx_tgt->nextn_bind(*ctx_dft);
+}
+
+int32_t llama_get_nextn_store_rows(const llama_context * ctx_tgt) {
+    return ctx_tgt->nextn_store_rows();
+}
+
+void llama_set_nextn_h_rows(llama_context * ctx_dft, const int32_t * src, int32_t n, const float * carry, int32_t n_carry) {
+    ctx_dft->nextn_set_h_rows(src, n, carry, n_carry);
+}
+
+bool llama_get_embeddings_nextn_rows(llama_context * ctx_tgt, const int32_t * rows, int32_t n, float * dst) {
+    return ctx_tgt->nextn_get_rows(rows, n, dst);
+}
+
+int64_t llama_get_nextn_rows_to_host(const llama_context * ctx_tgt) {
+    return ctx_tgt->nextn_rows_to_host();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

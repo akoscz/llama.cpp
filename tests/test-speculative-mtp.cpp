@@ -12,6 +12,8 @@
 // When all drafts start landing after two windows capped at m, full depth returns within three windows and stays there.
 // The head's kept hidden row stays the target row that a verification accepted, however the batch is laid out.
 // A request with an image keeps drafting: the head takes the image's rows, so its cells stay consecutive with the target's.
+// With LLAMA_MTP_DEVICE_H=1 the head reads a long target batch's hidden rows where the target left them, in device memory:
+// the same drafts, kept rows and target logits as the host path, byte for byte, and only the kept rows reach the host.
 
 #include "common.h"
 #include "log.h"
@@ -27,6 +29,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -160,13 +163,16 @@ struct server_rig {
     };
     std::vector<seq> seqs = std::vector<seq>(N_SEQ);
 
+    // the target's logits of the last batch's output rows, in batch order
+    std::vector<float> logits;
+
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
-               ggml_type type_idx = GGML_TYPE_F16) : n_max(n_max) {
+               ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512) : n_max(n_max) {
         params.n_ctx      = 8192;
         params.cache_type_idx = type_idx;
         params.n_parallel = N_SEQ;
         params.n_batch    = 512;
-        params.n_ubatch   = 512;
+        params.n_ubatch   = n_ubatch_tgt;
         params.kv_unified = true;
         params.cpuparams.n_threads       = 4;
         params.cpuparams_batch.n_threads = 4;
@@ -214,11 +220,39 @@ struct server_rig {
         }
         const int rc = llama_decode(tgt.get(), batch);
         const bool ok = rc == 0 && common_speculative_process(spec.get(), batch);
+        logits.clear();
+        for (int i = 0; ok && i < batch.n_tokens; ++i) {
+            if (batch.logits[i]) {
+                const float * row = llama_get_logits_ith(tgt.get(), i);
+                logits.insert(logits.end(), row, row + n_vocab);
+            }
+        }
         llama_batch_free(batch);
         if (!ok) {
             throw std::runtime_error("failed to decode a target batch");
         }
         return first;
+    }
+
+    // an image piece of a sequence: n rows of embeddings and no tokens, shown to the drafter as the server's callback does
+    void image(llama_seq_id s, const std::vector<float> & embd, int n) {
+        const int n_embd_inp = llama_model_n_embd_inp(llama_get_model(tgt.get()));
+        llama_batch batch = llama_batch_init(n, n_embd_inp, 1);
+        std::memcpy(batch.embd, embd.data(), (size_t) n*n_embd_inp*sizeof(float));
+        for (int i = 0; i < n; ++i) {
+            batch.pos[i]       = seqs[s].n_past++;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = s;
+            batch.logits[i]    = false;
+        }
+        batch.n_tokens = n;
+        const bool ok = llama_decode(tgt.get(), batch) == 0 && common_speculative_process(spec.get(), batch);
+        llama_batch_free(batch);
+        logits.clear();
+        if (!ok) {
+            throw std::runtime_error("failed to decode an image piece");
+        }
+        seqs[s].prompt.insert(seqs[s].prompt.end(), n, LLAMA_TOKEN_NULL);
     }
 
     llama_tokens tokens(std::mt19937 & rng, int n) const {
@@ -304,6 +338,33 @@ static void log_errors(ggml_log_level level, const char * text, void *) {
 static bool fail(const char * what) {
     fprintf(stderr, "FAIL: %s\n", what);
     return false;
+}
+
+// set or clear an environment variable the drafter reads when it is created
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// a rig made with LLAMA_MTP_DEVICE_H=1: target steps of 64 rows, head steps of 32
+static std::unique_ptr<server_rig> device_rig(llama_model * model) {
+    set_env("LLAMA_MTP_DEVICE_H", "1");
+    std::unique_ptr<server_rig> rig;
+    try {
+        rig = std::make_unique<server_rig>(model, 0.0f, N_MAX, 0, 32, GGML_TYPE_F16, 64);
+    } catch (...) {
+        set_env("LLAMA_MTP_DEVICE_H", nullptr);
+        throw;
+    }
+    set_env("LLAMA_MTP_DEVICE_H", nullptr);
+    return rig;
 }
 
 static std::string str(const std::vector<int> & v) {
@@ -748,6 +809,66 @@ static bool test_kept_row(llama_model * model) {
     return true;
 }
 
+static double nmse(const float * a, const float * b, size_t n) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        num += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        den += (double) a[i] * a[i];
+    }
+    return den > 0.0 ? num / den : num;
+}
+
+// a sequence's hidden rows do not depend on its batch neighbours: a batch carrying a longer prompt of one sequence before
+// a shorter one of another (the hybrid memory's equal split interleaves them) gives every batch row the target row of
+// its own sequence and position, as each prompt read alone does, and each sequence keeps its own last row. Generated:
+// the two lengths and which sequence comes first
+static bool test_rows_in_batch_order(llama_model * model) {
+    const int n_embd = llama_model_n_embd_out(model);
+    std::mt19937 gen(41);
+    for (int trial = 0; trial < 6; ++trial) {
+        const int n_long = 60 + (int) (gen() % 80), n_short = 5 + (int) (gen() % 50);
+        const llama_seq_id s_first = trial % 2, s_second = 1 - s_first;
+        server_rig alone(model, 0.0f), both(model, 0.0f);
+        std::mt19937 rng_a(100 + trial), rng_b(100 + trial);
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            alone.request(s, rng_a, 4 + s);
+            both.request(s, rng_b, 4 + s);
+        }
+        const llama_tokens first = alone.tokens(rng_a, n_long), second = alone.tokens(rng_a, n_short);
+        std::vector<float> h_alone[2];
+        for (const auto & r : { std::make_pair(s_first, first), std::make_pair(s_second, second) }) {
+            alone.decode({ r });
+            for (int i = 0; i < (int) r.second.size(); ++i) {
+                const float * row = llama_get_embeddings_nextn_ith(alone.tgt.get(), i);
+                h_alone[r.first].insert(h_alone[r.first].end(), row, row + n_embd);
+            }
+        }
+        const auto at = both.decode({{ s_first, first }, { s_second, second }});
+        for (const llama_seq_id s : { s_first, s_second }) {
+            const int n = s == s_first ? n_long : n_short;
+            std::vector<float> h;
+            for (int i = 0; i < n; ++i) {
+                const float * row = llama_get_embeddings_nextn_ith(both.tgt.get(), at.at(s) + i);
+                h.insert(h.end(), row, row + n_embd);
+            }
+            if (nmse(h_alone[s].data(), h.data(), h.size()) > 1e-6) {
+                fprintf(stderr, "trial %d: %d rows then %d rows, seq %d: nmse %.3g\n", trial, n_long, n_short, s,
+                        nmse(h_alone[s].data(), h.data(), h.size()));
+                return fail("a batch row holds another row's hidden state when a longer prompt comes first");
+            }
+            std::vector<uint8_t> st_alone, st_both;
+            if (!common_speculative_get_state(alone.spec.get(), s, st_alone) ||
+                !common_speculative_get_state(both.spec.get(), s, st_both) || st_alone.size() != st_both.size() ||
+                std::memcmp(st_alone.data(), st_both.data(), sizeof(llama_pos)) != 0 ||
+                nmse((const float *) (st_alone.data() + sizeof(llama_pos)), (const float *) (st_both.data() + sizeof(llama_pos)),
+                     (size_t) n_embd) > 1e-6) {
+                return fail("a sequence's kept row is not its own last row when a longer prompt comes first");
+            }
+        }
+    }
+    return true;
+}
+
 // a request with an image: the target reads text, the image's rows (embeddings and no tokens, cut at n_batch as mtmd cuts
 // a chunk, each piece shown to the drafter by the server's post-decode callback), then the text after it. The head takes
 // every row, so its cells end where the target's end, the kept row is the last target row read, and the head drafts at
@@ -833,6 +954,165 @@ static bool test_media(llama_model * model) {
     return true;
 }
 
+// LLAMA_MTP_DEVICE_H=1: the head reads a long target batch's hidden rows where the target left them. On the served
+// GLM-5.3 Flash each 2,048-row prefill step copied the target's 32 MiB of hidden rows from card 0 to the host, shifted
+// them there and copied them to each card again for the head (the host-gap trace of Nov 1, 2026). With the switch, a
+// target batch of 64 rows or more leaves every row in the store and the head gathers its rows there. Against a rig
+// without it: after every batch the store holds that batch's rows exactly when it has 64 or more, the target's logits
+// and every sequence's kept row are the same bytes, and every draft is the same, through prompts longer than the
+// target's step, a batch carrying a longer prompt before a shorter one, an image piece, and rounds of drafts,
+// verifications and partial acceptance
+static bool test_device_h(llama_model * model) {
+    server_rig host(model, 0.0f, N_MAX, 0, 32, GGML_TYPE_F16, 64);
+    auto dev_rig = device_rig(model);
+    server_rig & dev = *dev_rig;
+    std::mt19937 rng_h(5), rng_d(5);
+
+    const auto same = [&](const char * what, int n_rows) {
+        const int want = n_rows >= 64 ? n_rows : 0;
+        const int got  = llama_get_nextn_store_rows(dev.tgt.get());
+        if (got != want || llama_get_nextn_store_rows(host.tgt.get()) != 0) {
+            fprintf(stderr, "%s: %d rows, the store holds %d (want %d), the host rig's %d (want 0)\n", what, n_rows, got,
+                    want, llama_get_nextn_store_rows(host.tgt.get()));
+            return fail("the store does not hold exactly the rows of a target batch of 64 rows or more");
+        }
+        if (host.logits != dev.logits) {
+            fprintf(stderr, "%s: %d rows\n", what, n_rows);
+            return fail("the target's logits moved with the hidden rows on the device");
+        }
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            // a sequence with no row yet keeps none in either rig
+            std::vector<uint8_t> st_h, st_d;
+            const bool kept_h = common_speculative_get_state(host.spec.get(), s, st_h);
+            const bool kept_d = common_speculative_get_state(dev.spec.get(), s, st_d);
+            if (kept_h != kept_d || st_h != st_d) {
+                fprintf(stderr, "%s: %d rows, seq %d, kept %d and %d\n", what, n_rows, s, kept_h, kept_d);
+                return fail("a sequence kept another row with the hidden rows on the device");
+            }
+            // the head read the same rows, so each sequence's cells in it are the same bytes
+            const auto cells = [s](server_rig & rig) {
+                llama_context * head = rig.init->context();
+                std::vector<uint8_t> out(llama_state_seq_get_size(head, s));
+                out.resize(llama_state_seq_get_data(head, out.data(), out.size(), s));
+                return out;
+            };
+            const auto c_h = cells(host), c_d = cells(dev);
+            if (c_h != c_d) {
+                size_t i = 0;
+                while (i < std::min(c_h.size(), c_d.size()) && c_h[i] == c_d[i]) ++i;
+                fprintf(stderr, "%s: %d rows, seq %d, the head's cells %zu and %zu bytes, first difference at byte %zu\n",
+                        what, n_rows, s, c_h.size(), c_d.size(), i);
+                return fail("the head's cells differ with the hidden rows on the device");
+            }
+        }
+        return true;
+    };
+
+    const int n_prompt[N_SEQ] = { 150, 70, 200 };
+    for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+        host.request(s, rng_h, n_prompt[s]);
+        dev.request(s, rng_d, n_prompt[s]);
+        if (!same("a prompt", n_prompt[s])) return false;
+    }
+    // two sequences' prompt rows in one batch, the longer first: the equal split interleaves them
+    const auto more = host.tokens(rng_h, 90), other = host.tokens(rng_h, 40);
+    dev.tokens(rng_d, 130);
+    for (server_rig * rig : { &host, &dev }) {
+        rig->decode({{ 0, more }, { 1, other }});
+        rig->seqs[0].prompt.insert(rig->seqs[0].prompt.end(), more.begin(), more.end());
+        rig->seqs[1].prompt.insert(rig->seqs[1].prompt.end(), other.begin(), other.end());
+    }
+    if (!same("two prompts, the longer first", 130)) return false;
+    // an image piece, then the text after it; its rows come from a generator of their own, so both rigs' streams stay
+    // in step
+    std::vector<float> embd((size_t) 100*llama_model_n_embd_inp(model));
+    std::mt19937 rng_img(11);
+    std::normal_distribution<float> embd_dis(0.0f, 1.0e-2f);
+    for (auto & v : embd) v = embd_dis(rng_img);
+    host.image(2, embd, 100);
+    dev.image(2, embd, 100);
+    if (!same("an image piece", 100)) return false;
+    const auto after = host.tokens(rng_h, 6);
+    dev.tokens(rng_d, 6);
+    host.decode({{ 2, after }});
+    dev.decode({{ 2, after }});
+    if (!same("the text after an image", 6)) return false;
+    for (server_rig * rig : { &host, &dev }) {
+        rig->seqs[2].prompt.insert(rig->seqs[2].prompt.end(), after.begin(), after.end());
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            common_speculative_begin(rig->spec.get(), s, rig->seqs[s].prompt);
+        }
+    }
+
+    const acceptance acc[N_SEQ] = { {1.0f, 1.0f}, {1.0f, 0.0f}, {0.5f, 0.5f} };
+    for (int round = 0; round < 2*WINDOW; ++round) {
+        host.draft({0, 1, 2});
+        dev.draft({0, 1, 2});
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            if (host.seqs[s].draft != dev.seqs[s].draft) {
+                fprintf(stderr, "round %d, seq %d: drafts", round, s);
+                for (const auto t : host.seqs[s].draft) fprintf(stderr, " %d", t);
+                fprintf(stderr, " /");
+                for (const auto t : dev.seqs[s].draft) fprintf(stderr, " %d", t);
+                fprintf(stderr, "\n");
+                return fail("the head drafted other tokens with the hidden rows on the device");
+            }
+        }
+        host.verify({2, 0, 1});
+        dev.verify({2, 0, 1});
+        int n_rows = 0;
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) n_rows += 1 + (int) host.seqs[s].draft.size();
+        if (!same("a verification", n_rows)) return false;
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            const int n = acc[s]((int) host.seqs[s].draft.size(), rng_h);
+            acc[s]((int) dev.seqs[s].draft.size(), rng_d);
+            host.accept(s, n, rng_h);
+            dev.accept(s, n, rng_d);
+        }
+    }
+    return true;
+}
+
+// with LLAMA_MTP_DEVICE_H=1 only the rows the drafter keeps reach the host: after three sequences' prompts in one
+// 200-row batch, at most n_max + 3 rows a sequence (its first n_max + 2 and its last), where the host path copies all
+// 200; a 3-row verification, which keeps the host path, reads its 3 rows in both
+static bool test_device_h_rows(llama_model * model) {
+    server_rig host(model, 0.0f, N_MAX, 0, 32, GGML_TYPE_F16, 64);
+    auto dev_rig = device_rig(model);
+    server_rig & dev = *dev_rig;
+    std::mt19937 rng(6);
+    const std::vector<std::pair<llama_seq_id, llama_tokens>> prompts = {
+        { 0, host.tokens(rng, 80) }, { 1, host.tokens(rng, 70) }, { 2, host.tokens(rng, 50) } };
+    const auto read = [&](server_rig & rig, const std::function<void()> & step) {
+        const int64_t before = llama_get_nextn_rows_to_host(rig.tgt.get());
+        step();
+        return llama_get_nextn_rows_to_host(rig.tgt.get()) - before;
+    };
+    const int64_t n_host = read(host, [&] { host.decode(prompts); });
+    const int64_t n_dev  = read(dev,  [&] { dev.decode(prompts); });
+    if (n_host != 200 || n_dev > N_SEQ*(N_MAX + 3)) {
+        fprintf(stderr, "a 200-row batch: the host rig read %lld rows (want 200), the device rig %lld (want at most %d)\n",
+                (long long) n_host, (long long) n_dev, N_SEQ*(N_MAX + 3));
+        return fail("the device rig's target read more than the kept rows back to the host");
+    }
+    for (server_rig * rig : { &host, &dev }) {
+        for (const auto & p : prompts) {
+            rig->seqs[p.first].prompt = p.second;
+            common_speculative_begin(rig->spec.get(), p.first, p.second);
+            rig->seqs[p.first].id_last = 1;
+        }
+        rig->draft({0});
+    }
+    const int64_t v_host = read(host, [&] { host.verify({0}); });
+    const int64_t v_dev  = read(dev,  [&] { dev.verify({0}); });
+    if (v_host != 1 + N_MAX || v_dev != 1 + N_MAX) {
+        fprintf(stderr, "a %d-row verification: the host rig read %lld rows, the device rig %lld\n", 1 + N_MAX,
+                (long long) v_host, (long long) v_dev);
+        return fail("a verification did not read its rows back to the host");
+    }
+    return true;
+}
+
 int main(void) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
@@ -849,9 +1129,12 @@ int main(void) {
             { "histories", test_histories },
             { "n-min",     test_n_min     },
             { "kept-row",  test_kept_row  },
+            { "row-order", test_rows_in_batch_order },
             { "media",     test_media     },
             { "ubatch",    test_draft_ubatch },
             { "indexer",   test_draft_indexer_type },
+            { "device-h",  test_device_h  },
+            { "device-h-rows", test_device_h_rows },
         };
         for (const auto & t : tests) {
             const bool pass = t.second(model.get());

@@ -1522,6 +1522,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_MTP_DEVICE_H=1: a target batch the target left in its MTP store (llama_set_nextn_source) is read there by the
+    // head, row k from the target's row k - 1 and a sequence's first row from its carry, and only the kept rows reach the
+    // host; any other batch takes the host path
+    bool                 device_h = false;
+    std::vector<int32_t> device_src;
+    std::vector<float>   device_carry;
+    std::vector<int32_t> device_rows;
+    std::vector<float>   device_kept;
+
     std::vector<common_mtp_depth> depth; // per seq, with --spec-draft-mtp-adaptive
     std::vector<int32_t>          n_draft_max;
 
@@ -1593,6 +1602,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        {
+            const char * env = getenv("LLAMA_MTP_DEVICE_H");
+            device_h = env && atoi(env) != 0 && n_mtp_layers == 1 && !is_mem_shared && !chain_heads && !decode_only &&
+                llama_set_nextn_source(ctx_dft, ctx_tgt);
+            if (env && atoi(env) != 0) {
+                SPC_INF("- the head reads the target's hidden rows %s\n", device_h ? "in device memory" : "through the host (no store)");
+            }
+        }
 
         // a media row takes one position, so it can enter the head in place, under the vocabulary's image placeholder
         // when it has one, else token 0; the target verifies every draft, so the choice moves acceptance, never output
@@ -1740,6 +1758,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // the device path: the target left this batch's rows in the store, and every row is of a tracked sequence
+        bool device = device_h && !is_mem_shared && !decode_only && llama_get_nextn_store_rows(ctx_tgt) == n_tokens;
+        for (int k = 0; device && k < n_tokens; ++k) {
+            device = batch_in.seq_id[k][0] >= 0 && batch_in.seq_id[k][0] < (llama_seq_id) n_seq;
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1760,6 +1784,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h, row_bytes);
                     }
                 }
+            } else if (device) {
+            for (int k = 0; k < n_tokens; ++k) {
+                common_batch_add(batch, token_at(k), batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+            }
+
+            // the target's rows stay where it wrote them: row k reads the target's row k - 1, a sequence's first row the
+            // row before it (the kept row, or zeros), sent as a carry row
+            llama_synchronize(ctx_tgt);
+            device_src.resize(n_tokens);
+            for (int k = 0; k < n_tokens; ++k) {
+                device_src[k] = k - 1;
+            }
+            device_carry.clear();
+            int32_t n_carry = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const float * h = h_before(seq_id, batch_in.pos[i_batch_beg[seq_id]]);
+                device_src[i_batch_beg[seq_id]] = -(++n_carry);
+                device_carry.insert(device_carry.end(), h, h + n_embd);
+            }
+            llama_set_nextn_h_rows(ctx_dft, device_src.data(), n_tokens, device_carry.data(), n_carry);
             } else {
             for (int k = 0; k < n_tokens; ++k) {
                 common_batch_add(batch, token_at(k), batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
@@ -1807,7 +1854,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                // the device path's head batch carries tokens only: the head reads its hidden rows in the store
+                float * embd = batch.embd;
+                if (device) {
+                    batch.embd = nullptr;
+                }
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                batch.embd = embd;
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1824,9 +1877,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // the target's rows are dense in batch order: one read of the base, one copy per sequence
-        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+        // the target's rows are dense in batch order: one read of the base, one copy per sequence. On the device path only
+        // the kept rows come back: each sequence's first n_keep rows, then its last
+        const float * h_tgt = nullptr;
+        if (device) {
+            device_rows.clear();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t n_keep = std::min(i_batch_end[seq_id] - i_batch_beg[seq_id] + 1, verify_h_keep);
+                for (int32_t i = 0; i < n_keep; ++i) {
+                    device_rows.push_back(i_batch_beg[seq_id] + i);
+                }
+                device_rows.push_back(i_batch_end[seq_id]);
+            }
+            device_kept.resize(device_rows.size() * n_embd);
+            if (!llama_get_embeddings_nextn_rows(ctx_tgt, device_rows.data(), (int32_t) device_rows.size(), device_kept.data())) {
+                SPC_ERR("%s: the target's kept rows could not be read\n", __func__);
+                return false;
+            }
+        } else {
+            h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+        }
 
+        size_t i_kept = 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1834,11 +1909,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const int32_t n_keep = std::min(n_rows, verify_h_keep);
-            const float * h_beg  = h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
+            const float * h_beg  = device ? device_kept.data() + i_kept * n_embd : h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
+            const float * h_end  = device ? h_beg + (size_t) n_keep * n_embd : h_tgt + (size_t) i_batch_end[seq_id] * n_embd;
+            i_kept += n_keep + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].assign(h_beg, h_beg + (size_t) n_keep * n_embd);
 
-            std::memcpy(pending_h[seq_id].data(), h_tgt + (size_t) i_batch_end[seq_id] * n_embd, row_bytes);
+            std::memcpy(pending_h[seq_id].data(), h_end, row_bytes);
             pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
             verify_pos[seq_id]  = batch_in.pos[i_batch_beg[seq_id]];
 

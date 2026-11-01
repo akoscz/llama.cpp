@@ -27,9 +27,16 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     return n_kv/kpool + 2*n_seqs;
 }
 
-uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t n_kv,
-        uint32_t kpool, uint32_t n_stream, uint32_t indexer_top_k) {
+uint32_t llama_kpool_pool_pad(uint32_t n_pad_kv, uint32_t kpool) {
     GGML_ASSERT(kpool > 0);
+
+    return std::max<uint32_t>(64, n_pad_kv/kpool);
+}
+
+uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const llama_ubatch & ubatch, uint32_t n_kv,
+        uint32_t kpool, uint32_t n_stream, uint32_t indexer_top_k, uint32_t pool_pad) {
+    GGML_ASSERT(kpool > 0);
+    GGML_ASSERT(pool_pad > 0);
     GGML_ASSERT(n_stream > 0 && ubatch.n_seqs_unq > 0 && ubatch.n_seqs_unq % n_stream == 0);
 
     const uint32_t n_ps  = ubatch.n_seqs_unq/n_stream;
@@ -65,10 +72,10 @@ uint32_t llama_kpool_n_pools_ubatch(const llama_kpool_cells_fn & cells_of, const
         }
     }
 
-    // padded so a decode changes its graph's shape once every 64 pools, and never below what select_k takes, so the dump
-    // pools and the sparse attention's width stay as they were
+    // padded so a decode changes its graph's shape once every 64 pools (a prompt step once every pool_pad), and never below
+    // what select_k takes, so the dump pools and the sparse attention's width stay as they were
     const int64_t at_least = std::min<int64_t>(whole, indexer_top_k/kpool);
-    const int64_t own      = GGML_PAD(runs, 64) + 2*(int64_t) n_ps;
+    const int64_t own      = GGML_PAD(runs, (int64_t) pool_pad) + 2*(int64_t) n_ps;
 
     return (uint32_t) std::min<int64_t>(whole, std::max(at_least, own));
 }

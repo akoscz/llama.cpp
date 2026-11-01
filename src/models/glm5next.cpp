@@ -750,6 +750,16 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    if (nextn.mode == LLM_GRAPH_NEXTN_WRITE) {
+        // every row into the MTP store by its batch index, where the head reads it (llama_set_nextn_source)
+        GGML_ASSERT(cur->ne[1] == n_tokens);
+        auto inp_nextn = std::make_unique<llm_graph_input_nextn>(nextn);
+        inp_nextn->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+        ggml_set_input(inp_nextn->rows);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, nextn.store, cur, inp_nextn->rows));
+        res->add_input(std::move(inp_nextn));
+    }
+
     if (inp_out_ids && !mask_early) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -799,11 +809,21 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
-    ggml_tensor * h_embd = inp->h;
+    ggml_tensor * h_embd = nullptr;
+    if (nextn.mode == LLM_GRAPH_NEXTN_READ) {
+        // the target's hidden rows where it left them, in the MTP store (llama_set_nextn_source)
+        auto inp_nextn = std::make_unique<llm_graph_input_nextn>(nextn);
+        inp_nextn->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp_nextn->rows);
+        h_embd = ggml_get_rows(ctx0, nextn.store, inp_nextn->rows);
+        ggml_set_name(h_embd, "mtp_h_input");
+        res->add_input(std::move(inp_nextn));
+    } else {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h_embd = inp->h;
+    }
 
     res->add_input(std::move(inp));
 

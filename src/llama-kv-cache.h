@@ -202,7 +202,10 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    // the cells a graph attends: the cache's used cells padded to 256, or, for a step of at least 256 rows whose pooled
+    // indexer scores, to n_pad_prefill (LLAMA_KV_PAD_PREFILL), so a prompt read in equal steps builds its graph once every
+    // n_pad_prefill cells instead of every step. n_pad_used, when given, receives the padding applied
+    uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0, uint32_t * n_pad_used = nullptr) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -301,6 +304,10 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // a scoring prompt step's padding (get_n_kv): LLAMA_KV_PAD_PREFILL, read when the cache is made, for a model with a
+    // pooled indexer; 0 for any other model or when set to 0
+    uint32_t n_pad_prefill = 0;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -454,6 +461,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // the padding get_n_kv applied for the current ubatch: 256, or the cache's prompt-step padding
+    uint32_t get_n_pad() const;
+
     // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
     uint32_t get_n_stream() const;
 
@@ -538,4 +548,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // the padding n_kv was given (llama_kv_cache::get_n_kv)
+    uint32_t n_pad_kv = 256;
 };

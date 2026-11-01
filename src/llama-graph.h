@@ -194,6 +194,43 @@ public:
     const int64_t n_embd = 0;
 };
 
+// the MTP store (llama_set_nextn_source): F32 [n_embd, 2*(n_batch + n_carry)] in the target's output device memory, two
+// halves of a target batch's hidden rows by batch index, each followed by n_carry rows the head's carry is written to
+enum llm_graph_nextn_mode {
+    LLM_GRAPH_NEXTN_NONE,
+    LLM_GRAPH_NEXTN_WRITE, // the target writes every row of its ubatch into the store
+    LLM_GRAPH_NEXTN_READ,  // the MTP head gathers its hidden rows from the store
+};
+
+struct llm_graph_nextn {
+    llm_graph_nextn_mode mode = LLM_GRAPH_NEXTN_NONE;
+
+    ggml_tensor * store = nullptr;
+
+    const int64_t * base = nullptr; // the store row of batch row 0 in the half this decode writes or reads
+
+    // READ: per batch row, the target batch row it reads, or -(c + 1) for carry row c (store row base + n_batch + c)
+    const std::vector<int32_t> * src = nullptr;
+
+    int64_t n_batch = 0;
+    int64_t n_carry = 0;
+};
+
+// the store row of each ubatch row: where the target writes it, or where the head reads its hidden row
+class llm_graph_input_nextn : public llm_graph_input_i {
+public:
+    llm_graph_input_nextn(const llm_graph_nextn & nextn) : nextn(nextn) {}
+    virtual ~llm_graph_input_nextn() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows = nullptr; // WRITE: I64 [n_tokens], READ: I32 [n_tokens]
+
+    const llm_graph_nextn nextn;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -867,6 +904,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    llm_graph_nextn nextn;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -925,6 +964,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (nextn.mode != other.nextn.mode || nextn.store != other.nextn.store) {
             return false;
         }
 
@@ -1118,6 +1161,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // the MTP store this graph writes or reads, if any
+    const llm_graph_nextn nextn;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

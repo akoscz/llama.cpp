@@ -12,9 +12,11 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
+struct llama_nextn_store;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -236,6 +238,9 @@ private:
 
     void output_reorder();
 
+    // put the last decode's unmasked nextn rows in batch order (nextn_order), once their reads are done
+    void nextn_reorder();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -263,7 +268,17 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // the MTP store (llama-ext.h): this context is the target, head its MTP head
+    bool    nextn_bind(llama_context & head);
+    int32_t nextn_store_rows() const;
+    void    nextn_set_h_rows(const int32_t * src, int32_t n, const float * carry, int32_t n_carry);
+    bool    nextn_get_rows(const int32_t * rows, int32_t n, float * dst);
+    int64_t nextn_rows_to_host() const { return n_nextn_to_host; }
+
 private:
+    // copy the last decode's rows from the MTP store into embd_nextn when they are only there
+    void nextn_refill();
+
     // sched_gf: the scheduler the graph is built for (nullptr: the context's own)
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -324,6 +339,25 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // the MTP store (llama_set_nextn_source), held by the target and its head: a target batch of min_rows rows or more
+    // writes its hidden rows there by batch index instead of to embd_nextn, and the head reads them there
+    std::shared_ptr<llama_nextn_store> nextn_store;
+    bool nextn_is_target = false;
+
+    llm_graph_nextn_mode nextn_mode = LLM_GRAPH_NEXTN_NONE; // the decode in progress writes or reads the store
+    int64_t              nextn_base = 0;                    // the store row of its batch row 0
+    std::vector<int32_t> nextn_src;                         // head: the next decode's rows (llama_set_nextn_h_rows)
+    bool                 nextn_src_set = false;
+
+    bool    embd_nextn_stale = false; // target: the last decode's rows are in the store, not yet in embd_nextn
+
+    // Unmasked nextn rows are read whole, one ubatch after another, and nextn_order[k] is the batch index of the row
+    // read into row k. An equal split interleaves sequences, so a ubatch's rows are not in batch order; nextn_reorder
+    // moves them once the reads are done. Reading each run of rows at its own offset instead would fail where a backend
+    // reads a tensor asynchronously only whole (the meta backend, under -sm tensor). Empty: nothing to move
+    std::vector<int32_t> nextn_order;
+    int64_t n_nextn_to_host  = 0;     // hidden rows copied to host memory
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
