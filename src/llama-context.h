@@ -238,6 +238,9 @@ private:
 
     void output_reorder();
 
+    // put the last decode's unmasked nextn rows in batch order (nextn_order), once their reads are done
+    void nextn_reorder();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -348,6 +351,12 @@ private:
     bool                 nextn_src_set = false;
 
     bool    embd_nextn_stale = false; // target: the last decode's rows are in the store, not yet in embd_nextn
+
+    // Unmasked nextn rows are read whole, one ubatch after another, and nextn_order[k] is the batch index of the row
+    // read into row k. An equal split interleaves sequences, so a ubatch's rows are not in batch order; nextn_reorder
+    // moves them once the reads are done. Reading each run of rows at its own offset instead would fail where a backend
+    // reads a tensor asynchronously only whole (the meta backend, under -sm tensor). Empty: nothing to move
+    std::vector<int32_t> nextn_order;
     int64_t n_nextn_to_host  = 0;     // hidden rows copied to host memory
 
     // host buffers for output layer input embeddings, per layer

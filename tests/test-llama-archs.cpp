@@ -46,6 +46,34 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+// rows of n_vocab logits: the mean over rows of KL(softmax(a) || softmax(b)), and the rows whose top token differs
+static double mean_kld(const std::vector<float> & a, const std::vector<float> & b, size_t n_vocab, size_t & n_top_differ) {
+    GGML_ASSERT(a.size() == b.size() && n_vocab > 0 && a.size() % n_vocab == 0);
+    const size_t n_rows = a.size()/n_vocab;
+    double sum = 0.0;
+    n_top_differ = 0;
+    for (size_t r = 0; r < n_rows; ++r) {
+        const float * ra = a.data() + r*n_vocab;
+        const float * rb = b.data() + r*n_vocab;
+        const size_t top_a = std::max_element(ra, ra + n_vocab) - ra;
+        const size_t top_b = std::max_element(rb, rb + n_vocab) - rb;
+        n_top_differ += top_a != top_b;
+        double z_a = 0.0, z_b = 0.0;
+        for (size_t i = 0; i < n_vocab; ++i) {
+            z_a += std::exp((double) ra[i] - ra[top_a]);
+            z_b += std::exp((double) rb[i] - rb[top_b]);
+        }
+        double kld = 0.0;
+        for (size_t i = 0; i < n_vocab; ++i) {
+            const double la = (double) ra[i] - ra[top_a] - std::log(z_a);
+            const double lb = (double) rb[i] - rb[top_b] - std::log(z_b);
+            kld += std::exp(la)*(la - lb);
+        }
+        sum += kld;
+    }
+    return sum/n_rows;
+}
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
     std::hash<std::string> hasher;
@@ -897,7 +925,12 @@ static void set_env(const char * name, const char * value) {
 // of the 555 ms a step took, with both cards idle (the host-gap trace of Nov 1, 2026): the cache length grew by a step's
 // rows each step, and the graph's shapes with it. A step of at least 256 rows whose indexer scores has its cache length
 // padded to LLAMA_KV_PAD_PREFILL cells and its pool count to as many pools, so a read builds a graph once a step of
-// cells. Its logits are the 256-padded read's byte for byte; a step that reads densely, and a decode step, keep 256.
+// cells. A step that reads densely, and a decode step, keep 256. On the CPU its logits are the 256-padded read's byte for
+// byte. On a GPU the attention kernel can depend on the cache length: CUDA's flash attention gathers a row's live cells
+// once the cache holds 4,096 cells or more, and sums them in another order than the dense kernel below that
+// (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse), so a padded step can round differently there. Its logits then meet
+// the plan's bar for a lossless change against the 256-padded read: a mean KL divergence of at most 1e-6, and the same top
+// token on every row.
 static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     struct read_result {
@@ -915,6 +948,10 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
         auto * model = pair.first.get();
         const int n_embd  = llama_model_n_embd(model);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        // byte for byte where every device is a CPU
+        const bool exact = std::all_of(devs.begin(), devs.end(), [](ggml_backend_dev_t dev) {
+            return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        });
 
         // top_k 8: every step scores. top_k 256 (the indexer scores past 259 cells): the first step reads densely
         const int n_read   = top_k == 8 ? 4096 : 1024;
@@ -1014,10 +1051,20 @@ static bool test_glm_prefill_reuse(const size_t seed, const std::vector<ggml_bac
                 const int64_t want_n_kv = GGML_PAD(n_read + 1 + (unified ? n_before : 0), 256);
 
                 bool ok = true;
-                if (fine.logits != coarse.logits) {
+                if (exact && fine.logits != coarse.logits) {
                     LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: logits differ, nmse=%g\n", top_k, mtp,
                             unified, nmse(fine.logits, coarse.logits));
                     ok = false;
+                }
+                if (!exact) {
+                    size_t n_top_differ = 0;
+                    const double kld = mean_kld(fine.logits, coarse.logits, n_vocab, n_top_differ);
+                    if (!(kld <= 1e-6) || n_top_differ > 0) {
+                        LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: mean KLD %g (at most 1e-6), %zu rows' top "
+                                "token differs, nmse=%g\n", top_k, mtp, unified, kld, n_top_differ,
+                                nmse(fine.logits, coarse.logits));
+                        ok = false;
+                    }
                 }
                 if (fine.n_reused != want_fine || coarse.n_reused != want_coarse) {
                     LOG_ERR("GLM prefill reuse: top_k=%u mtp=%d unified=%d: reused %d graphs padded to 256 (want %d), "

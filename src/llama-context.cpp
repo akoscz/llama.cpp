@@ -1247,6 +1247,7 @@ void llama_context::nextn_refill() {
 float * llama_context::get_embeddings_nextn() {
     nextn_refill();
     output_reorder();
+    nextn_reorder();
 
     return embd_nextn.data;
 }
@@ -1254,6 +1255,7 @@ float * llama_context::get_embeddings_nextn() {
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     nextn_refill();
     output_reorder();
+    nextn_reorder();
 
     try {
         if (embd_nextn.data == nullptr) {
@@ -1848,6 +1850,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
 int llama_context::encode(const llama_batch & batch_inp) {
     mtp_index.tensor = nullptr;
+    nextn_order.clear();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2183,6 +2186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    nextn_order.clear();
 
     sched_reserve();
 
@@ -2468,21 +2472,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 n_nextn_to_host += n_rows;
 
-                if (masked || ubatch.idx == nullptr) {
-                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_row);
-                } else {
-                    // unmasked rows are read by batch index: an equal split interleaves sequences, so each run of
-                    // consecutive batch rows lands where the batch put it
-                    for (int64_t i0 = 0; i0 < n_rows; ) {
-                        int64_t i1 = i0 + 1;
-                        while (i1 < n_rows && ubatch.idx[i1] == ubatch.idx[i1 - 1] + 1) {
-                            ++i1;
-                        }
-                        GGML_ASSERT(((int64_t) ubatch.idx[i0] + (i1 - i0))*n_embd <= (int64_t) embd_nextn.size);
-                        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + (int64_t) ubatch.idx[i0]*n_embd,
-                                i0*n_row, (i1 - i0)*n_row);
-                        i0 = i1;
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_row);
+
+                if (!masked) {
+                    // unmasked rows belong at their batch index: record where each landed (nextn_order). A row an
+                    // earlier ubatch did not read is -1, and nextn_reorder then moves nothing
+                    nextn_order.resize(offset, -1);
+                    for (int64_t i = 0; i < n_rows; ++i) {
+                        nextn_order.push_back(ubatch.idx ? (int32_t) ubatch.idx[i] : (int32_t) (offset + i));
                     }
                 }
             }
@@ -2804,7 +2802,7 @@ void llama_context::output_reorder() {
             }
         }
 
-        // unmasked nextn rows are stored by batch index already; only the masked ones follow the outputs
+        // only the masked nextn rows follow the outputs; the unmasked ones follow nextn_order (nextn_reorder)
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
@@ -2860,6 +2858,48 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+}
+
+void llama_context::nextn_reorder() {
+    if (nextn_order.empty()) {
+        return;
+    }
+
+    const int64_t n      = (int64_t) nextn_order.size();
+    const int64_t n_embd = model.hparams.n_embd_out();
+    GGML_ASSERT((size_t) (n*n_embd) <= embd_nextn.size);
+
+    // a decode that reads every ubatch's rows reads each batch row once: a permutation of the rows read. A decode that
+    // stopped part way, or a ubatch with no rows, leaves rows that are not valid outputs, and they stay where they are
+    std::vector<uint8_t> done(n, 0);
+    for (int64_t k = 0; k < n; ++k) {
+        const int32_t j = nextn_order[k];
+        if (j < 0 || j >= n || done[j]) {
+            nextn_order.clear();
+            return;
+        }
+        done[j] = 1;
+    }
+    std::fill(done.begin(), done.end(), 0);
+
+    // row k belongs at row nextn_order[k]: follow each cycle of the permutation with one row in hand
+    std::vector<float> row;
+    for (int64_t k = 0; k < n; ++k) {
+        if (done[k] || nextn_order[k] == k) {
+            done[k] = 1;
+            continue;
+        }
+        row.assign(embd_nextn.data + k*n_embd, embd_nextn.data + (k + 1)*n_embd);
+        for (int64_t j = nextn_order[k]; ; j = nextn_order[j]) {
+            std::swap_ranges(row.begin(), row.end(), embd_nextn.data + j*n_embd);
+            done[j] = 1;
+            if (j == k) {
+                break;
+            }
+        }
+    }
+
+    nextn_order.clear();
 }
 
 //
@@ -3165,6 +3205,7 @@ bool llama_context::nextn_get_rows(const int32_t * rows, int32_t n, float * dst)
     if (embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
         return false;
     }
+    nextn_reorder();
     for (int32_t i = 0; i < n; ++i) {
         if (rows[i] < 0 || (size_t) (rows[i] + 1)*n_embd > embd_nextn.size) {
             return false;
