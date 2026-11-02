@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "models/templates/GLM-5.3-Flash.jinja"
 DRAFT_VOCAB = ROOT / "scripts/glm53/assets/mtp-draft-vocab-98304.i32"
 DEFAULT_MTP_DEPTH = "2"
+# Inherited engine, profile and diagnostic overrides are removed before the exec; the server's own access controls stay.
+ENGINE_OVERRIDES = ("GGML_", "LLAMA_", "CUDA_", "NVIDIA_")
+SERVER_ACCESS_CONTROLS = frozenset({"LLAMA_API_KEY", "LLAMA_ARG_API_KEY_FILE",
+                                    "LLAMA_ARG_SSL_KEY_FILE", "LLAMA_ARG_SSL_CERT_FILE"})
 ASSET_SHA256 = {
     TEMPLATE: "0bc9a9e2801e8dfbea88403de8523d87cb26cc91d9308e68bce4b50b90708ddb",
     DRAFT_VOCAB: "8e83de6161b0f75c212f7079b00e10af2c03701ae17afe62ee48bca35717e3e6",
@@ -38,9 +42,11 @@ def make_plan(args):
     if not args.host or any(char in args.host for char in "\n\r\0"):
         raise ValueError("host must be a nonempty address without control characters")
     server = args.server.expanduser().resolve()
-    argv = [str(server), "-m", str(args.model.expanduser().resolve())]
+    # The loader finds shards 2 and 3 from the first shard's own name, so a symlinked shard keeps its path (a Hugging
+    # Face cache snapshot links it to a blob whose name carries no split suffix): absolute, the leaf link not followed.
+    argv = [str(server), "-m", own_path(args.model)]
     if args.mmproj:
-        argv += ["--mmproj", str(args.mmproj.expanduser().resolve())]
+        argv += ["--mmproj", own_path(args.mmproj)]
     argv += ["-ngl", "99", "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on",
              "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ctki", "q8_0",
              "-b", "2048", "-ub", "2048", "--prompt-step", str(args.prompt_step),
@@ -63,11 +69,20 @@ def make_plan(args):
     return argv, env
 
 
+def own_path(path):
+    return os.path.abspath(path.expanduser())
+
+
+def removed_overrides(inherited):
+    """The inherited keys the exec removes: engine, profile and diagnostic overrides, never the server's access controls."""
+    return sorted(key for key in inherited if key.startswith(ENGINE_OVERRIDES) and key not in SERVER_ACCESS_CONTROLS)
+
+
 def execution_environment(settings, inherited=None):
     source = os.environ if inherited is None else inherited
-    # Keep unrelated application settings; remove implicit engine/profile/debug overrides.
-    env = {key: value for key, value in source.items()
-           if not key.startswith(("GGML_", "LLAMA_", "CUDA_", "NVIDIA_"))}
+    # Keep unrelated application settings and the server's key/TLS settings; remove implicit engine/profile/debug overrides.
+    removed = set(removed_overrides(source))
+    env = {key: value for key, value in source.items() if key not in removed}
     env.update(settings)
     return env
 
@@ -82,7 +97,7 @@ def main(args):
     argv, settings = make_plan(args)
     verify_assets()
     if args.dry_run:
-        print(json.dumps({"argv": argv, "env": settings}, indent=2))
+        print(json.dumps({"argv": argv, "env": settings, "removed": removed_overrides(os.environ)}, indent=2))
         return 0
     for label, path in [("server", Path(argv[0])), ("model", args.model.expanduser()),
                         ("mmproj", args.mmproj.expanduser() if args.mmproj else None)]:
