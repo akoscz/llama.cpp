@@ -53,6 +53,22 @@ class SessionShapeTest(unittest.TestCase):
             path = json.loads(tool_call["function"]["arguments"])["file_path"]
             self.assertTrue(Path(path).read_text().startswith(result["content"]), path)
 
+    def test_session_never_passes_the_target_when_a_file_tokenizes_denser(self):
+        # between exact counts the builder estimates the next file at the rate seen so far; a file that tokenizes
+        # four times denser than the ones before it must still leave the history at or under the target, since the
+        # server refuses a prompt over the slot
+        def dense_measure(messages, tools=None):
+            size = measured(messages, tools)
+            for m in messages:
+                if m["role"] == "tool" and m["content"].startswith("// dense"):
+                    size += 3 * len(m["content"]) // 4
+            return size
+        for i in (1, 4, 6, 9, 11):
+            self.files[i].write_text("// dense\n" + self.files[i].read_text())
+        for seed in range(8):
+            messages = dp_longctx.build_session(self.files, 20000, dense_measure, dp_longctx.TOOLS, seed=seed)
+            self.assertLessEqual(dense_measure(messages, dp_longctx.TOOLS), 20000, seed)
+
     def test_two_seeds_read_the_files_in_different_orders(self):
         a = dp_longctx.build_session(self.files, 12000, measured, dp_longctx.TOOLS, seed=1)
         b = dp_longctx.build_session(self.files, 12000, measured, dp_longctx.TOOLS, seed=2)

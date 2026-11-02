@@ -163,6 +163,7 @@ def build_session(files, target_tokens, measure, tools, seed=0):
         raise ValueError(f"the system prompt and tools alone measure {size} tokens, over the target {target_tokens}")
     tokens_per_char = None
     index = 0
+    steps = []
     while True:
         path = order[index % len(order)]
         text = path.read_text(errors="replace")
@@ -178,6 +179,14 @@ def build_session(files, target_tokens, measure, tools, seed=0):
         if trial_size > target_tokens:
             break
         messages, size, index = trial, trial_size, index + 1
+        steps.append((path, text))
+    # the count decides what the estimates let through: a history over the target drops its last reads, and the
+    # first read dropped is the one cut to the room left
+    size = measure(messages, tools)
+    while size > target_tokens and steps:
+        path, text = steps.pop()
+        messages, index = messages[:-2], index - 1
+        size = measure(messages, tools)
     # the file that passes the target, cut to the room left: the cut is measured and rescaled by its own rate until
     # it lands between the floor and the target; a room too small for a cut leaves the history as it is
     floor = int(target_tokens * 0.98)
