@@ -13,9 +13,14 @@
 
 // Pack streams by device while sequence s stays on device s % n_devices.
 llama_seq_id llama_seq_to_stream(llama_seq_id seq, uint32_t n_seq_max, uint32_t n_devices);
+std::vector<int64_t> llama_stream_counts(uint32_t n_seq_max, uint32_t n_devices);
 
 // keep this struct lightweight
 struct llama_ubatch {
+    // Counts follow the device-major row order, including ranks with no rows.
+    std::vector<int64_t> device_rows(uint32_t n_devices, bool outputs_only = false) const;
+    std::vector<int64_t> device_seqs(uint32_t n_devices) const;
+
     bool equal_seqs() const {
         return b_equal_seqs != 0;
     }

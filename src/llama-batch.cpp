@@ -15,6 +15,48 @@ llama_seq_id llama_seq_to_stream(llama_seq_id seq, uint32_t n_seq_max, uint32_t 
     return owner*(n_seq_max/n_devices) + std::min(owner, n_seq_max % n_devices) + seq/n_devices;
 }
 
+std::vector<int64_t> llama_stream_counts(uint32_t n_seq_max, uint32_t n_devices) {
+    GGML_ASSERT(n_devices > 0);
+    std::vector<int64_t> counts(n_devices, n_seq_max/n_devices);
+    for (uint32_t d = 0; d < n_seq_max % n_devices; ++d) {
+        ++counts[d];
+    }
+    return counts;
+}
+
+std::vector<int64_t> llama_ubatch::device_rows(uint32_t n_devices, bool outputs_only) const {
+    GGML_ASSERT(n_devices > 0);
+    std::vector<int64_t> counts(n_devices, 0);
+    uint32_t previous = 0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(n_seq_id[i] > 0 && seq_id[i] && seq_id[i][0] >= 0);
+        const uint32_t owner = seq_id[i][0] % n_devices;
+        GGML_ASSERT(owner >= previous);
+        for (int32_t j = 1; j < n_seq_id[i]; ++j) {
+            GGML_ASSERT(seq_id[i][j] >= 0 && uint32_t(seq_id[i][j]) % n_devices == owner);
+        }
+        if (!outputs_only || output[i]) {
+            ++counts[owner];
+        }
+        previous = owner;
+    }
+    return counts;
+}
+
+std::vector<int64_t> llama_ubatch::device_seqs(uint32_t n_devices) const {
+    GGML_ASSERT(n_devices > 0);
+    std::vector<int64_t> counts(n_devices, 0);
+    uint32_t previous = 0;
+    for (uint32_t i = 0; i < n_seqs_unq; ++i) {
+        GGML_ASSERT(seq_id_unq[i] >= 0);
+        const uint32_t owner = seq_id_unq[i] % n_devices;
+        GGML_ASSERT(owner >= previous);
+        ++counts[owner];
+        previous = owner;
+    }
+    return counts;
+}
+
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devices) : n_pos_per_embd(n_pos_per_embd), n_devices(n_devices) {
     GGML_ASSERT(n_devices > 0);
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -528,7 +570,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     std::vector<seq_set_t> cur_seq_set;
 
-    llama_seq_id last_seq_id = -1;
+    std::vector<llama_seq_id> last_seq_id(n_devices, -1);
 
     std::vector<int32_t> candidates;
     if (n_devices > 1 && sequential) {
@@ -557,17 +599,18 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             }
         }
 
-        // Non-unified caches need consecutive physical streams.
+        // Each device needs consecutive local streams; gaps between devices are valid.
         if (sequential) {
-            add = add && (cur_seq_set.empty() ||
-                llama_seq_to_stream(batch.seq_id[i][0], n_seq_max, n_devices) ==
-                llama_seq_to_stream(last_seq_id, n_seq_max, n_devices) + 1);
+            const llama_seq_id seq = batch.seq_id[i][0];
+            const uint32_t owner = seq % n_devices;
+            add = add && (last_seq_id[owner] < 0 || seq == last_seq_id[owner] + (llama_seq_id) n_devices);
         }
 
         if (add) {
             cur_seq_set.push_back(seq_set[i]);
 
-            last_seq_id = batch.seq_id[i][0];
+            const llama_seq_id seq = batch.seq_id[i][0];
+            last_seq_id[seq % n_devices] = seq;
 
             if (cur_seq_set.size() >= n_ubatch) {
                 break;

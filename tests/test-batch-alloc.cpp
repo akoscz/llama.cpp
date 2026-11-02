@@ -655,6 +655,30 @@ static void test_device_order(testing & t) {
     const llama_seq_id input[] = {7, 0, 5, 2, 4, 1, 6, 3};
     const llama_seq_id ordered[] = {0, 4, 1, 5, 2, 6, 3, 7};
     const int32_t original[] = {1, 4, 5, 2, 3, 6, 7, 0};
+    t.test("device_counts_include_empty_owners", [&](testing & t) {
+        const auto capacity = llama_stream_counts(10, 4);
+        const int64_t expected_capacity[] = {3, 3, 2, 2};
+        for (size_t d = 0; d < 4; ++d) { t.assert_equal(expected_capacity[d], capacity[d]); }
+        batch_builder bb;
+        bb.add(0, {6}, true);
+        bb.add(0, {0}, false);
+        bb.add(1, {6}, false);
+        bb.add(0, {2}, true);
+        llama_batch_allocr ba(1, 4);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        const auto ub = ba.split_simple(4);
+        const auto rows = ub.device_rows(4);
+        const auto outputs = ub.device_rows(4, true);
+        const auto seqs = ub.device_seqs(4);
+        const int64_t expected_rows[] = {1, 0, 3, 0};
+        const int64_t expected_outputs[] = {0, 0, 2, 0};
+        const int64_t expected_seqs[] = {1, 0, 2, 0};
+        for (size_t d = 0; d < 4; ++d) {
+            t.assert_equal(expected_rows[d], rows[d]);
+            t.assert_equal(expected_outputs[d], outputs[d]);
+            t.assert_equal(expected_seqs[d], seqs[d]);
+        }
+    });
     t.test("rows_and_output_mapping", [&](testing & t) {
         batch_builder bb;
         for (int pos = 0; pos < 3; ++pos) {
@@ -727,6 +751,28 @@ static void test_device_order(testing & t) {
         t.assert_equal(4u, ba.split_equal(4, true, 0).n_tokens);
         t.assert_equal(4u, ba.split_equal(4, true, 0).n_tokens);
         t.assert_equal(0u, ba.split_equal(4, true, 0).n_tokens);
+    });
+    t.test("partly_occupied_devices_share_a_ubatch", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id seq = 0; seq < 12; ++seq) { bb.add(0, {seq}, true); }
+        llama_batch_allocr ba(1, 4);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 40, false));
+        const auto ub = ba.split_equal(40, true, 0);
+        t.assert_equal(12u, ub.n_tokens);
+        for (auto count : ub.device_seqs(4)) { t.assert_equal(int64_t(3), count); }
+    });
+    t.test("local_stream_gap_defers_only_that_device", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id seq : {0, 8, 1, 5, 2, 3}) { bb.add(0, {seq}, true); }
+        llama_batch_allocr ba(1, 4);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 40, false));
+        const auto ub = ba.split_equal(40, true, 0);
+        t.assert_equal(5u, ub.n_tokens);
+        const llama_seq_id expected[] = {0, 1, 5, 2, 3};
+        for (uint32_t i = 0; i < ub.n_tokens && i < 5; ++i) { t.assert_equal(expected[i], ub.seq_id_unq[i]); }
+        const auto next = ba.split_equal(40, true, 0);
+        t.assert_equal(1u, next.n_tokens);
+        if (next.n_tokens) { t.assert_equal(llama_seq_id(8), next.seq_id_unq[0]); }
     });
 }
 
