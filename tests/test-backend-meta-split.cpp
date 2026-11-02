@@ -24,12 +24,16 @@ static constexpr int64_t n_cols = 64;
 static constexpr int64_t n_rows = 8;
 
 static int captured = 0;
+static unsigned long long expert_hits = 0;
 static ggml_backend_dev_t peer = nullptr;
 
 static ggml_backend_dev_t second_device(ggml_backend_dev_t first) { return peer ? peer : first; }
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
     if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++captured; }
+    int device, first;
+    unsigned long long total;
+    if (sscanf(text, "dp_experts device=%d first=%d total=%llu", &device, &first, &total) == 3) { expert_hits += total; }
     if (level != GGML_LOG_LEVEL_DEBUG) { fputs(text, stderr); }
 }
 
@@ -319,6 +323,7 @@ static bool test_stream_view(ggml_backend_dev_t device, ggml_type type) {
 
 static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32) {
     const int captured_before = captured;
+    const auto hits_before = expert_hits;
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
     ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 4, split_rows, nullptr), nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -333,6 +338,7 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
             tensor = ggml_new_tensor_3d(weights, type, 256, 256, 8);
             if (partition) { ggml_backend_meta_split_input(tensor, 2, counts, 4); }
         }
+        ggml_set_name(w[1], "blk.0.ffn_up_exps.weight");
         ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(weights, backend);
         GGML_ASSERT(buffer);
         std::vector<float> data(ggml_nelements(w[0]));
@@ -409,6 +415,11 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     printf("%s %s expert partition against unsplit CPU, NMSE %.9g, %d captures\n", ok ? "ok  " : "FAIL", ggml_type_name(type), error/norm, captured - captured_before);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
+    if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0) {
+        const auto hits = expert_hits - hits_before;
+        printf("%s expert telemetry: %llu hits in six routes, expected 60\n", hits == 60 ? "ok  " : "FAIL", hits);
+        ok = ok && hits == 60;
+    }
     return ok;
 }
 
@@ -620,8 +631,10 @@ int main(int argc, char ** argv) {
     // Isolate partition correctness from the optional BF16 collective round trip.
 #ifdef _WIN32
     _putenv_s("GGML_CUDA_AR_BF16_THRESHOLD", "0");
+    _putenv_s("GGML_CUDA_DP_EXPERT_STATS", "1");
 #else
     setenv("GGML_CUDA_AR_BF16_THRESHOLD", "0", 1);
+    setenv("GGML_CUDA_DP_EXPERT_STATS", "1", 1);
 #endif
     ggml_log_set(log_cb, nullptr);
     ggml_backend_dev_t gpu = nullptr;
