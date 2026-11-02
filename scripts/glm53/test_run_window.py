@@ -376,17 +376,17 @@ class WindowProcessTest(unittest.TestCase):
         for failed_ctx in (2048, 4096, None):
             with self.subTest(context=failed_ctx), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
-                rig = root / "rig.py"
-                rig.write_text(f"#!{sys.executable}\n" +
-                               "import json, sys\n"
-                               "ctx = int(sys.argv[sys.argv.index('--ctx')+1])\n"
-                               f"failed = {failed_ctx!r}\n"
-                               "if failed is not None and ctx > failed: raise SystemExit(99)\n"
-                               "print(json.dumps({'summary': {'meanKld': 0.001 if ctx == failed else 0.0, "
-                               "'sameTopP': 100.0}}))\n")
-                rig.chmod(0o755)
-                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630, rig=rig,
-                                run_id="quality-test", rig_root=root, fixtures=root))
+                perplexity = root / "llama-perplexity"
+                perplexity.write_text(f"#!{sys.executable}\n" +
+                                      "import sys\n"
+                                      "ctx = int(sys.argv[sys.argv.index('-c')+1])\n"
+                                      f"failed = {failed_ctx!r}\n"
+                                      "if failed is not None and ctx > failed: raise SystemExit(99)\n"
+                                      "print('Mean    KLD:   0.001000 +/-   0.000000' if ctx == failed else 'Mean    KLD:   0.000000 +/-   0.000000')\n"
+                                      "print('Same top p: 100.000 +/- 0.000 %')\n")
+                perplexity.chmod(0o755)
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630, llama_bin_dir=root,
+                                run_id="quality-test", fixtures=root))
                 window.out.mkdir()
                 window.model, window.profile_env = root / "model.gguf", {}
                 window.stage = "quality"
@@ -409,6 +409,40 @@ class WindowProcessTest(unittest.TestCase):
                 receipts = json.loads((window.out / "commands.json").read_text())
                 self.assertEqual([row["name"] for row in receipts],
                                  [f"kld-{arm}-{ctx}" for ctx in expected_contexts for arm in ("baseline", "candidate")])
+
+    def test_direct_kld_receives_each_arms_profile_and_context_settings(self):
+        # The direct binary replaced the wrapper's --env argument. The same settings
+        # must now reach the subprocess environment, including the 4K probe.
+        for external_binary in (False, True):
+            with self.subTest(external_binary=external_binary), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                binary_dir = root / "external" if external_binary else None
+                window = Window(SimpleNamespace(root=root, stop_at=time.time()+630,
+                                llama_bin_dir=binary_dir, run_id="env-test", fixtures=root))
+                window.out.mkdir()
+                window.model = root / "model.gguf"
+                window.profile_env = {"GGML_CUDA_Q8_SPLIT": "1", "GGML_CUDA_Q8_TMA": "1"}
+                calls = []
+
+                def command(name, argv, env, limit):
+                    calls.append((name, argv, env))
+                    return "Mean    KLD: 0.000000 +/- 0.000000\nSame top p: 100.000 +/- 0.000 %\n"
+
+                window.command = command
+                window.quality()
+                self.assertEqual(len(calls), 6)
+                for name, argv, env in calls:
+                    _, arm, ctx = name.split("-")
+                    self.assertEqual(argv[0], (binary_dir or root / arm) / "llama-perplexity")
+                    self.assertEqual(argv[argv.index("--kl-divergence-base") + 1],
+                                     window.out / f"env-test-baseline-{ctx}.kld")
+                    self.assertEqual("--kl-divergence" in argv, arm == "candidate")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
+                    self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
+                    self.assertEqual(env["LD_LIBRARY_PATH"], f"{root}/{arm}:{root}/cuda-runtime")
+                    for key, value in window.profile_env.items():
+                        self.assertEqual(env.get(key), value if arm == "candidate" else None)
+                    self.assertEqual(env.get("LLAMA_KLD_FIRST"), "0" if ctx == "4096" else None)
 
     def test_a_required_line_must_be_a_whole_line_of_the_programs_output(self):
         # "OK" inside another word or line, or only among the diagnostics, is not the program saying OK.
