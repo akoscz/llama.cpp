@@ -306,8 +306,8 @@ struct server_slot {
         return prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id, protect, allow_evict);
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, server_prompt_cache_state * selected) {
-        return prompt_cache.load(prompt, selected, ctx_tgt, ctx_dft, spec, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, server_prompt_cache_state * selected, bool consume = true) {
+        return prompt_cache.load(prompt, selected, ctx_tgt, ctx_dft, spec, id, consume);
     }
 
     void prompt_clear() {
@@ -1776,7 +1776,11 @@ private:
                 const auto saved = ret->prompt_save(*prompt_cache, incoming);
                 SLT_TRC(*ret, "cache_exchange task=%d save=%s incoming=%d\n", task.id,
                         server_prompt_cache_result_name(saved), incoming != nullptr);
-                while (!ret->prompt_load(*prompt_cache, incoming)) {
+                // The snapshot is consumed only when the new prompt keeps all of it (one token may be re-evaluated for
+                // the logits); a partial match restores a copy, and the snapshot stays for its own conversation.
+                const bool consume = incoming == nullptr ||
+                    incoming->prompt.tokens.get_common_prefix(task.tokens) + 1 >= incoming->prompt.tokens.size();
+                while (!ret->prompt_load(*prompt_cache, incoming, consume)) {
                     // Restoring a saved sequence can itself run out of unified
                     // KV cells. Free idle residents before falling back to a
                     // cold prefill; keep the selected host snapshot protected.

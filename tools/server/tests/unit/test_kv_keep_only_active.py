@@ -272,3 +272,75 @@ def test_kv_pressure_preserves_idle_tool_continuation():
     })
     assert resumed.status_code == 200
     assert resumed.body["timings"]["cache_n"] >= 349
+
+
+# A conversation parked in RAM stays recoverable whatever takes its slot next: restoring it for a few shared tokens
+# and then cutting it to that prefix would leave it in neither KV nor RAM.
+def _park_long_prompt_in_ram(log):
+    res = server.make_request("POST", "/completion", data={"prompt": LONG_PROMPT, "id_slot": 0, "cache_prompt": True})
+    assert res.status_code == 200
+    prompt_n = res.body["timings"]["prompt_n"]
+    res = server.make_request("POST", "/completion", data={"prompt": "The quick brown fox", "id_slot": 1, "cache_prompt": True})
+    assert res.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
+    return prompt_n
+
+
+def test_parked_conversation_survives_a_short_shared_prefix():
+    global server
+    server.start()
+    log = LogReader(server.log_path)
+    original_prompt_n = _park_long_prompt_in_ram(log)
+    # a new conversation shares only its first few tokens with the parked one
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Once upon a time there was a small grey cat who liked fish and slept in the sun all day long",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] < original_prompt_n // 4
+    # the parked conversation returns whole
+    res = server.make_request("POST", "/completion", data={"prompt": LONG_PROMPT, "cache_prompt": True})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= original_prompt_n - 2, res.body["timings"]
+
+
+def test_parked_conversation_survives_a_partial_restore():
+    global server
+    server.start()
+    log = LogReader(server.log_path)
+    original_prompt_n = _park_long_prompt_in_ram(log)
+    # a new conversation shares its first half with the parked one: the half is restored, the rest cut
+    half = " ".join(LONG_PROMPT.split()[:28]) + " and then everything changed for the better and nothing was the same again"
+    res = server.make_request("POST", "/completion", data={"prompt": half, "cache_prompt": True})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > original_prompt_n // 4, res.body["timings"]
+    # the parked conversation returns whole
+    res = server.make_request("POST", "/completion", data={"prompt": LONG_PROMPT, "cache_prompt": True})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= original_prompt_n - 2, res.body["timings"]
+
+
+# With no byte limit the context size caps the parked tokens. A save that cannot fit beside the protected incoming
+# snapshot is refused before it evicts anyone: other conversations never pay for a save that stores nothing.
+def test_unlimited_byte_budget_refuses_a_save_that_cannot_fit_before_evicting():
+    global server
+    server.cache_ram = -1
+    server.n_ctx = 256  # the smallest context llama.cpp allows (n_ctx is padded to a multiple of 256)
+    server.start()
+    x = " ".join(["alpha beta gamma delta"] * 8)
+    y = " ".join(["red green blue"] * 3)
+    i = " ".join(["north south east west"] * 12)
+    rx = server.make_request("POST", "/completion", data={"prompt": x, "id_slot": 0, "cache_prompt": True})
+    ry = server.make_request("POST", "/completion", data={"prompt": y, "id_slot": 1, "cache_prompt": True})
+    ri = server.make_request("POST", "/completion", data={"prompt": i, "id_slot": 0, "cache_prompt": True})
+    assert rx.status_code == 200 and ry.status_code == 200 and ri.status_code == 200
+    nx, ny, ni = (r.body["timings"]["prompt_n"] for r in (rx, ry, ri))
+    assert nx + ni > 256, (nx, ny, ni)        # X and I cannot be parked together
+    assert nx + ny <= 256 - 16, (nx, ny, ni)  # X and Y can
+    # X returns to the slot holding I: I cannot be parked beside the protected X; Y must not pay for the attempt
+    res = server.make_request("POST", "/completion", data={"prompt": x, "id_slot": 0, "cache_prompt": True})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= nx - 2, res.body["timings"]
+    res = server.make_request("POST", "/completion", data={"prompt": y, "cache_prompt": True})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= ny - 2, res.body["timings"]

@@ -1784,6 +1784,14 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
                 ((size_t) prompt.n_tokens() > limit_tokens || n_tokens() > limit_tokens - prompt.n_tokens())) {
             return server_prompt_cache_result::no_space;
         }
+        // Nor may an evicting save clear every other conversation and then find no room beside the protected
+        // snapshot: with no byte limit, the pair must fit the token cap before anyone is evicted for it.
+        if (protect && limit_size == 0 && limit_tokens > 0 &&
+                (size_t) protect->prompt.n_tokens() + (size_t) prompt.n_tokens() > limit_tokens) {
+            SRV_TRC("cache_save reason=no_space slot=%d tokens=%d protected=%d limit=%zu\n",
+                    id_slot, prompt.n_tokens(), protect->prompt.n_tokens(), limit_tokens);
+            return server_prompt_cache_result::no_space;
+        }
 
         if (limit_size > 0) {
             const size_t retained = protect ? protect->size() : 0;
@@ -1875,6 +1883,11 @@ server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt &
         const size_t reused = reusable_prefix(state.prompt, tokens_new, state.pos_min, n_swa);
         SRV_TRC("cache_candidate tokens=%d lcp=%zu reusable=%zu bytes=%zu\n", state.prompt.n_tokens(),
                 state.prompt.tokens.get_common_prefix(tokens_new), reused, state.size());
+        // Restoring a snapshot to keep under a quarter of it costs a transfer for little saved computation, and the
+        // slot then cuts the rest: such a candidate is passed over (main's "don't trash large prompts").
+        if (4 * reused < (size_t) state.prompt.n_tokens()) {
+            continue;
+        }
         // Prefer saved computation; avoid a transfer on a tie with resident KV.
         if (reused > best_reuse || (best && reused == best_reuse && state.size() < best->size())) {
             best_reuse = reused;
@@ -1885,7 +1898,7 @@ server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt &
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state * selected,
-        llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot) {
+        llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume) {
     if (!selected) {
         return true;
     }
@@ -1924,9 +1937,15 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         SRV_WRN("cache_restore reason=restore_failed slot=%d bytes=%zu retained=1\n", id_slot, it->size());
         return false;
     }
-    SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu\n", id_slot, it->prompt.n_tokens(), it->size());
-    prompt = std::move(it->prompt);
-    states.erase(it);
+    SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu consumed=%d\n", id_slot, it->prompt.n_tokens(),
+            it->size(), consume);
+    if (consume) {
+        prompt = std::move(it->prompt);
+        states.erase(it);
+    } else {
+        // The slot keeps only the shared prefix; the conversation the snapshot belongs to stays recoverable.
+        prompt = it->prompt.clone();
+    }
     return true;
 }
 

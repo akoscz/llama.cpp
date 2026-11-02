@@ -655,8 +655,10 @@ struct server_prompt_cache {
     server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new,
             llama_pos pos_min, int32_t n_swa);
 
+    // consume: the slot takes the whole snapshot, so the RAM copy goes; otherwise the slot will cut it to the shared
+    // prefix and the copy stays recoverable for the conversation it belongs to
     bool load(server_prompt & prompt, server_prompt_cache_state * selected, llama_context * ctx_tgt,
-            llama_context * ctx_dft, common_speculative * spec, int32_t id_slot);
+            llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume = true);
 
     void update(const server_prompt_cache_state * protect = nullptr);
 };
