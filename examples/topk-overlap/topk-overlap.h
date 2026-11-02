@@ -8,7 +8,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
+
+// the layer of a selection node, "indexer_top_k_pools-<il>" and nothing after it, -1 for any other node: the cell
+// gather's input is that node reshaped to one row, which ggml_reshape_2d names "indexer_top_k_pools-<il> (reshaped)",
+// the same selection seen a second time
+inline int topk_selection_layer(const char * name) {
+    static const char * prefix = "indexer_top_k_pools-";
+    const size_t n = std::strlen(prefix);
+    if (std::strncmp(name, prefix, n) != 0) return -1;
+    char * end = nullptr;
+    const long il = std::strtol(name + n, &end, 10);
+    return end != name + n && *end == '\0' ? (int) il : -1;
+}
 
 struct topk_tile_stats {
     int64_t tiles        = 0;   // tiles counted

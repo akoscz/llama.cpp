@@ -154,7 +154,19 @@ static void test_generated() {
     }
 }
 
+// the selection node by its exact name, never its reshaped view: ggml names the cell gather's input
+// "indexer_top_k_pools-<il> (reshaped)", the same selection as one row, and reading it too doubles every step
+static void test_selection_name() {
+    CHECK(topk_selection_layer("indexer_top_k_pools-7") == 7);
+    CHECK(topk_selection_layer("indexer_top_k_pools-12") == 12);
+    CHECK(topk_selection_layer("indexer_top_k_pools-7 (reshaped)") == -1);
+    CHECK(topk_selection_layer("indexer_top_k_pools-") == -1);
+    CHECK(topk_selection_layer("indexer_top_k_pools") == -1);
+    CHECK(topk_selection_layer("other-7") == -1);
+}
+
 int main() {
+    test_selection_name();
     test_examples();
     test_generated();
     if (failures) {

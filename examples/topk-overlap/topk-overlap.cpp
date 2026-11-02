@@ -29,7 +29,6 @@
 #include <vector>
 
 static const int64_t TILES[] = {2, 4, 8, 16};
-static const char *  NAME    = "indexer_top_k_pools-";
 
 struct layer_total {
     topk_tile_stats st[4];
@@ -56,10 +55,10 @@ static int64_t live_pools(const ggml_tensor * t) {
 
 static bool on_node(ggml_tensor * t, bool ask, void * user_data) {
     auto * st = (overlap_state *) user_data;
-    if (std::strncmp(t->name, NAME, std::strlen(NAME)) != 0) return false;
+    const int il = topk_selection_layer(t->name);
+    if (il < 0) return false;
     if (ask) return true;
 
-    const int il = std::atoi(t->name + std::strlen(NAME));
     if (il <= st->last_il) st->step++;
     st->last_il = il;
 
@@ -133,8 +132,10 @@ int main(int argc, char ** argv) {
     const size_t n_batch = llama_n_batch(ctx);
     std::printf("tokens %zu, batch %zu, ubatch %u\n", tokens.size(), n_batch, llama_n_ubatch(ctx));
 
-    for (size_t i = 0; i < tokens.size(); i += n_batch) {
-        const size_t n = std::min(n_batch, tokens.size() - i);
+    // one graph a decode: llama_decode splits a batch into -ub graphs, and pos0 labels a whole decode
+    const size_t n_step = llama_n_ubatch(ctx);
+    for (size_t i = 0; i < tokens.size(); i += n_step) {
+        const size_t n = std::min(n_step, tokens.size() - i);
         st.pos0 = (int64_t) i;
         if (llama_decode(ctx, llama_batch_get_one(tokens.data() + i, (int32_t) n))) {
             LOG_ERR("%s: decode failed at token %zu\n", __func__, i);
