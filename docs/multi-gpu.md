@@ -19,6 +19,8 @@ Reach for multi-GPU when one of these is true:
 
 Set with `--split-mode` / `-sm`.
 
+This fork also has experimental GLM5NEXT `-sm dp`: sequences stay on one device and routed experts are partitioned across devices. See the [GLM four-card qualification recipe](torad/glm53-dp.md) for its requirements and current validation limits.
+
 | Mode | What it does | When to use |
 |---|---|---|
 | `none` | Use a single GPU only. Pick which one with `--main-gpu`. | You explicitly want to confine the model to one GPU even though more are visible. |
