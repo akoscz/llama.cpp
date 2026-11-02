@@ -285,17 +285,24 @@ def test_anthropic_named_tool_choice_validation(chosen):
         assert res.body["type"] == "message"
 
 
-def test_anthropic_unsupported_content_is_rejected():
+def test_anthropic_unsupported_content_keeps_the_session_going():
+    # Claude Code replays its whole history every turn: a block the server cannot represent (a PDF read as a
+    # document) must not fail every later request of the session. It is kept as a text placeholder instead.
     server.start()
-    res = server.make_request("POST", "/v1/messages", data={
-        "model": "test",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": [
-            {"type": "document", "source": {"type": "text", "data": "must not vanish"}},
-        ]}],
-    })
-    assert res.status_code == 400, res.body
-    assert "Unsupported Anthropic content type" in res.body["error"]["message"]
+    for content in (
+        [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+         {"type": "text", "text": "what does it say"}],
+        [{"type": "tool_result", "tool_use_id": "read-1", "content": [
+            {"type": "text", "text": "PDF file read"},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]}],
+    ):
+        res = server.make_request("POST", "/v1/messages", data={
+            "model": "test",
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": content}],
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["role"] == "assistant"
 
 
 def test_anthropic_tool_use_basic():
