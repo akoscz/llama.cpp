@@ -1916,15 +1916,38 @@ static void test_anthropic_discovery_normalization() {
 }
 
 static void test_anthropic_unsupported_blocks() {
-    for (const auto & block : {R"({"type":"document","source":{"type":"text","data":"important"}})",
-                              R"({"type":"tool_result","tool_use_id":"x","content":[{"type":"document"}]})",
-                              R"({"type":"image","source":{"type":"unknown"}})"}) {
+    // A block the server cannot represent is kept as a text placeholder in its place, so a session that carries one
+    // goes on: Claude Code replays its whole history each turn, and one rejected block would fail every later request.
+    {
         auto request = anthropic_tools_request();
-        request["messages"][0]["content"] = json::array({json::parse(block)});
+        request["messages"][0]["content"] = json::array({
+            json::parse(R"({"type":"text","text":"before"})"),
+            json::parse(R"({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}})"),
+            json::parse(R"({"type":"text","text":"after"})")});
+        auto converted = server_chat_convert_anthropic_to_oai(request);
+        const auto & content = converted.at("messages").at(0).at("content");
+        assert_equals(size_t(3), content.size());
+        assert_equals(std::string("before"), content.at(0).at("text").get<std::string>());
+        assert_equals(std::string("[document omitted: application/pdf]"), content.at(1).at("text").get<std::string>());
+        assert_equals(std::string("after"), content.at(2).at("text").get<std::string>());
+    }
+    {
+        auto request = anthropic_tools_request();
+        request["messages"][0]["content"] = json::array({json::parse(
+            R"({"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"PDF read"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]})")});
+        auto converted = server_chat_convert_anthropic_to_oai(request);
+        const auto & msg = converted.at("messages").at(0);
+        assert_equals(std::string("tool"), msg.at("role").get<std::string>());
+        assert_equals(std::string("PDF read[document omitted: application/pdf]"), msg.at("content").get<std::string>());
+    }
+    // A malformed image source is still an invalid request.
+    {
+        auto request = anthropic_tools_request();
+        request["messages"][0]["content"] = json::array({json::parse(R"({"type":"image","source":{"type":"unknown"}})")});
         bool rejected = false;
         try {
             server_chat_convert_anthropic_to_oai(request);
-        } catch (const std::exception &) {
+        } catch (const std::invalid_argument &) {
             rejected = true;
         }
         assert_equals(true, rejected);

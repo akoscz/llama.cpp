@@ -331,6 +331,16 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 }
 
+// A block the server cannot represent is kept as text in its place, so a session that carries one goes on: a client
+// such as Claude Code replays its whole history every turn, and one rejected block would fail every later request.
+static std::string anthropic_omitted_block(const json & block, const std::string & type) {
+    const json source = json_value(block, "source", json::object());
+    const std::string media_type = source.is_object() ? json_value(source, "media_type", std::string()) : std::string();
+    const std::string note = "[" + type + " omitted" + (media_type.empty() ? "" : ": " + media_type) + "]";
+    SRV_WRN("Anthropic content block kept as text: %s\n", note.c_str());
+    return note;
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
@@ -518,7 +528,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                 has_structured_content = true;
                                 content_parts.push_back({{"type", "tool_reference"}, {"name", c.at("tool_name")}});
                             } else {
-                                throw std::invalid_argument("Unsupported Anthropic tool result content type: " + c_type);
+                                const std::string note = anthropic_omitted_block(c, c_type);
+                                result_text += note;
+                                content_parts.push_back({{"type", "text"}, {"text", note}});
                             }
                         }
 
@@ -547,7 +559,10 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                         throw std::invalid_argument("Anthropic tool result content must be a string or array");
                     }
                 } else {
-                    throw std::invalid_argument("Unsupported Anthropic content type: " + type);
+                    if (!tool_calls.empty()) {
+                        flush_message();
+                    }
+                    converted_content.push_back({{"type", "text"}, {"text", anthropic_omitted_block(block, type)}});
                 }
             }
             flush_message();
