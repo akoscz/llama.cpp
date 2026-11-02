@@ -1441,8 +1441,8 @@ static bool ggml_cuda_ar_try_hc_post(ggml_cuda_ar_pipeline * p, ggml_backend_t *
     for (int rank = 0; rank < 2; ++rank) {
         auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[rank]->context);
         ggml_cuda_set_device(ctx->device);
-        auto * mine = p2p ? p->p2p[1-rank].dev : reinterpret_cast<uint2 *>(p->ll_buf[rank].dev);
-        const auto * other = p2p ? p->p2p[rank].dev : reinterpret_cast<const uint2 *>(p->ll_buf[1-rank].dev);
+        auto * mine = p2p ? p->p2p[1-rank].as<uint2>() : reinterpret_cast<uint2 *>(p->ll_buf[rank].dev);
+        const auto * other = p2p ? p->p2p[rank].as<const uint2>() : reinterpret_cast<const uint2 *>(p->ll_buf[1-rank].dev);
         const int slots = (int) (p2p ? ggml_cuda_ar_p2p_slot_packets(p) : ggml_cuda_ar_ll_slot_packets(p));
         auto * data = (float *) tensors[rank]->data;
         if (bf16) {
