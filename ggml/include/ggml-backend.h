@@ -391,6 +391,7 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        GGML_BACKEND_SPLIT_AXIS_LOCAL    = 12, // full shape, rank-local expert lanes; reduced explicitly
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
@@ -434,6 +435,15 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_backend_meta_scatter(
         struct ggml_context * ctx, struct ggml_tensor * tensor, int axis, const int64_t * counts, size_t n_devices);
     GGML_API struct ggml_tensor * ggml_backend_meta_gather(struct ggml_context * ctx, struct ggml_tensor * tensor);
+    GGML_API struct ggml_tensor * ggml_backend_meta_reduce(struct ggml_context * ctx, struct ggml_tensor * tensor);
+
+    // Owner-local cache indices. Cache rows and request rows may have different per-device counts.
+    // Indices must address the owning device's cache slice; callers validate and translate them before upload.
+    // These nodes require the meta backend and cannot fall back to an unsplit backend.
+    GGML_API struct ggml_tensor * ggml_backend_meta_get_rows_local(
+        struct ggml_context * ctx, struct ggml_tensor * cache, struct ggml_tensor * indices);
+    GGML_API struct ggml_tensor * ggml_backend_meta_set_rows_local(
+        struct ggml_context * ctx, struct ggml_tensor * cache, struct ggml_tensor * rows, struct ggml_tensor * indices);
 
     //
     // Utils

@@ -625,6 +625,8 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if ((op->flags & GGML_TENSOR_FLAG_META) && (op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_SET_ROWS) &&
+            !ggml_backend_buft_is_meta(ggml_backend_dev_buffer_type(device))) { return false; }
     if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) {
         const auto reg = ggml_backend_dev_backend_reg(device);
         const auto supports = reg ? reinterpret_cast<bool (*)(void)>(
@@ -1072,6 +1074,16 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+static ggml_tensor * ggml_backend_sched_dup_input(ggml_context * ctx, const ggml_tensor * src) {
+    ggml_tensor * copy = ggml_dup_tensor_layout(ctx, src);
+    if (src->op == GGML_OP_NONE && (src->flags & GGML_TENSOR_FLAG_META)) {
+        // Host staging and pipeline copies must retain explicit device ownership.
+        copy->flags |= GGML_TENSOR_FLAG_META;
+        memcpy(copy->op_params, src->op_params, sizeof(copy->op_params));
+    }
+    return copy;
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1401,7 +1413,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             if (c == sched->cur_copy) {
                                 tensor_copy = src; // use the original tensor as the current copy
                             } else {
-                                tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                tensor_copy = ggml_backend_sched_dup_input(sched->ctx, src);
                                 ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             }
                             ggml_set_input(tensor_copy);
@@ -1422,7 +1434,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            struct ggml_tensor * tensor_copy = ggml_backend_sched_dup_input(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
