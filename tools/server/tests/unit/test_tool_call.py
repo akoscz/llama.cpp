@@ -30,6 +30,33 @@ class CompletionMode(Enum):
     NORMAL = "normal"
     STREAMED = "streamed"
 
+
+@pytest.mark.parametrize("chosen", ["Read", "Write", "Missing"])
+def test_named_tool_choice_validation_fast(chosen):
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/GLM-4.7-Flash.jinja"
+    server.start()
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "model": "test",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Call one of the tools."}],
+        "tools": [{"type": "function", "function": {
+            "name": name, "description": name,
+            "parameters": {"type": "object", "properties": {}},
+        }} for name in ["Read", "Write"]],
+        "tool_choice": {"type": "function", "function": {"name": chosen}},
+        "parallel_tool_calls": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    if chosen == "Missing":
+        assert res.status_code == 400, res.body
+        assert "tool_choice function is not in tools" in res.body["error"]["message"]
+    else:
+        # The tiny model need not emit a call. test-chat verifies the generated grammar.
+        assert res.status_code == 200, res.body
+        assert res.body["choices"][0]["message"]["role"] == "assistant"
+
+
 class ToolParameters(TypedDict):
     type: str
     properties: dict[str, dict]

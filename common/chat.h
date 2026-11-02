@@ -37,6 +37,7 @@ struct common_chat_tool_call {
 struct common_chat_msg_content_part {
     std::string type;
     std::string text;
+    std::string name = {};
 
     // TODO @ngxson : no known chat templates support reasoning_content in content parts yet
     //                this can be useful for models with interleaved thinking (like Kimi-K2)
@@ -44,7 +45,7 @@ struct common_chat_msg_content_part {
     // std::string reasoning_content;
 
     bool operator==(const common_chat_msg_content_part & other) const {
-        return type == other.type && text == other.text;
+        return type == other.type && text == other.text && name == other.name;
     }
 };
 
@@ -217,6 +218,7 @@ struct common_chat_tool {
     std::string name;
     std::string description;
     std::string parameters;
+    bool defer_loading = false;
 };
 
 enum common_chat_tool_choice {

@@ -349,8 +349,12 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                     auto system_text = json_value(block, "text", std::string());
                     normalize_anthropic_billing_header(system_text);
                     system_content += system_text;
+                } else {
+                    throw std::invalid_argument("Anthropic system content only supports text blocks");
                 }
             }
+        } else {
+            throw std::invalid_argument("Anthropic system content must be a string or array");
         }
 
         oai_messages.push_back({
@@ -364,6 +368,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         throw std::runtime_error("'messages' is required");
     }
     const json & messages = body.at("messages");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("Anthropic messages must be an array");
+    }
     if (messages.is_array()) {
         for (const auto & msg : messages) {
             std::string role = json_value(msg, "role", std::string());
@@ -390,18 +397,42 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
 
             json tool_calls = json::array();
             json converted_content = json::array();
-            json tool_results = json::array();
             std::string reasoning_content;
-            bool has_tool_calls = false;
+
+            auto flush_message = [&]() {
+                if (converted_content.empty() && tool_calls.empty() && reasoning_content.empty()) {
+                    return;
+                }
+                json new_msg = {{"role", role}, {"content", converted_content.empty() ? json("") : converted_content}};
+                if (!tool_calls.empty()) {
+                    new_msg["tool_calls"] = tool_calls;
+                }
+                if (!reasoning_content.empty()) {
+                    new_msg["reasoning_content"] = reasoning_content;
+                }
+                oai_messages.push_back(std::move(new_msg));
+                converted_content = json::array();
+                tool_calls = json::array();
+                reasoning_content.clear();
+            };
 
             for (const auto & block : content) {
                 std::string type = json_value(block, "type", std::string());
 
                 if (type == "text") {
+                    if (!tool_calls.empty()) {
+                        flush_message();
+                    }
                     converted_content.push_back(block);
                 } else if (type == "thinking") {
+                    if (!tool_calls.empty() || !converted_content.empty()) {
+                        flush_message();
+                    }
                     reasoning_content += json_value(block, "thinking", std::string());
                 } else if (type == "image") {
+                    if (!tool_calls.empty()) {
+                        flush_message();
+                    }
                     json source = json_value(block, "source", json::object());
                     std::string source_type = json_value(source, "type", std::string());
 
@@ -425,6 +456,8 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                 {"url", url}
                             }}
                         });
+                    } else {
+                        throw std::invalid_argument("Unsupported Anthropic image source type: " + source_type);
                     }
                 } else if (type == "tool_use") {
                     tool_calls.push_back({
@@ -435,13 +468,13 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                             {"arguments", json_value(block, "input", json::object()).dump()}
                         }}
                     });
-                    has_tool_calls = true;
                 } else if (type == "tool_result") {
+                    flush_message();
                     std::string tool_use_id = json_value(block, "tool_use_id", std::string());
 
                     auto result_content = json_value(block, "content", json());
                     if (result_content.is_string()) {
-                        tool_results.push_back({
+                        oai_messages.push_back({
                             {"role", "tool"},
                             {"tool_call_id", tool_use_id},
                             {"content", result_content.get<std::string>()}
@@ -450,7 +483,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                         // Single-pass: build both text and content_parts, decide format at the end
                         std::string result_text;
                         json content_parts = json::array();
-                        bool has_images = false;
+                        bool has_structured_content = false;
 
                         for (const auto & c : result_content) {
                             std::string c_type = json_value(c, "type", std::string());
@@ -462,7 +495,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                     {"text", text}
                                 });
                             } else if (c_type == "image") {
-                                has_images = true;
+                                has_structured_content = true;
                                 json source = json_value(c, "source", json::object());
                                 std::string source_type = json_value(source, "type", std::string());
                                 if (source_type == "base64") {
@@ -478,54 +511,46 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                                         {"type", "image_url"},
                                         {"image_url", {{"url", json_value(source, "url", std::string())}}}
                                     });
+                                } else {
+                                    throw std::invalid_argument("Unsupported Anthropic tool result image source type: " + source_type);
                                 }
+                            } else if (c_type == "tool_reference") {
+                                has_structured_content = true;
+                                content_parts.push_back({{"type", "tool_reference"}, {"name", c.at("tool_name")}});
+                            } else {
+                                throw std::invalid_argument("Unsupported Anthropic tool result content type: " + c_type);
                             }
                         }
 
-                        if (!has_images) {
+                        if (!has_structured_content) {
                             // Text-only: collapse to a plain string for maximum compatibility
-                            tool_results.push_back({
+                            oai_messages.push_back({
                                 {"role", "tool"},
                                 {"tool_call_id", tool_use_id},
                                 {"content", result_text}
                             });
                         } else {
-                            // Mixed or image-only: use array content parts (OpenAI multimodal tool format)
-                            tool_results.push_back({
+                            // Preserve structured discovery and image content.
+                            oai_messages.push_back({
                                 {"role", "tool"},
                                 {"tool_call_id", tool_use_id},
                                 {"content", content_parts}
                             });
                         }
-                    } else {
-                        tool_results.push_back({
+                    } else if (result_content.is_null()) {
+                        oai_messages.push_back({
                             {"role", "tool"},
                             {"tool_call_id", tool_use_id},
                             {"content", ""}
                         });
+                    } else {
+                        throw std::invalid_argument("Anthropic tool result content must be a string or array");
                     }
+                } else {
+                    throw std::invalid_argument("Unsupported Anthropic content type: " + type);
                 }
             }
-
-            if (!converted_content.empty() || has_tool_calls || !reasoning_content.empty()) {
-                json new_msg = {{"role", role}};
-                if (!converted_content.empty()) {
-                    new_msg["content"] = converted_content;
-                } else if (has_tool_calls || !reasoning_content.empty()) {
-                    new_msg["content"] = "";
-                }
-                if (!tool_calls.empty()) {
-                    new_msg["tool_calls"] = tool_calls;
-                }
-                if (!reasoning_content.empty()) {
-                    new_msg["reasoning_content"] = reasoning_content;
-                }
-                oai_messages.push_back(new_msg);
-            }
-
-            for (const auto & tool_msg : tool_results) {
-                oai_messages.push_back(tool_msg);
-            }
+            flush_message();
         }
     }
 
@@ -534,9 +559,15 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     // Convert tools
     if (body.contains("tools")) {
         const json & tools = body.at("tools");
+        if (!tools.is_array()) {
+            throw std::invalid_argument("Anthropic tools must be an array");
+        }
         if (tools.is_array()) {
             json oai_tools = json::array();
             for (const auto & tool : tools) {
+                if (tool.contains("type") && tool.at("type") != "custom") {
+                    throw std::invalid_argument("Only Anthropic custom tools are supported");
+                }
                 oai_tools.push_back({
                     {"type", "function"},
                     {"function", {
@@ -545,6 +576,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                         {"parameters", tool.contains("input_schema") ? tool.at("input_schema") : json::object()}
                     }}
                 });
+                if (tool.contains("defer_loading")) {
+                    oai_tools.back()["function"]["defer_loading"] = tool.at("defer_loading");
+                }
             }
             oai_body["tools"] = oai_tools;
         }
@@ -555,11 +589,20 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         const json & tc = body.at("tool_choice");
         if (tc.is_object()) {
             std::string type = json_value(tc, "type", std::string());
-            if (type == "auto") {
-                oai_body["tool_choice"] = "auto";
-            } else if (type == "any" || type == "tool") {
+            if (type == "auto" || type == "none") {
+                oai_body["tool_choice"] = type;
+            } else if (type == "any") {
                 oai_body["tool_choice"] = "required";
+            } else if (type == "tool") {
+                oai_body["tool_choice"] = {{"type", "function"}, {"function", {{"name", tc.at("name")}}}};
+            } else {
+                throw std::invalid_argument("Unsupported Anthropic tool_choice type: " + type);
             }
+            if (tc.contains("disable_parallel_tool_use")) {
+                oai_body["parallel_tool_calls"] = !tc.at("disable_parallel_tool_use").get<bool>();
+            }
+        } else {
+            throw std::invalid_argument("Anthropic tool_choice must be an object");
         }
     }
 
