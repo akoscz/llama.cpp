@@ -11,6 +11,9 @@
 #include <memory>
 #include <unordered_map>
 
+// Pack streams by device while sequence s stays on device s % n_devices.
+llama_seq_id llama_seq_to_stream(llama_seq_id seq, uint32_t n_seq_max, uint32_t n_devices);
+
 // keep this struct lightweight
 struct llama_ubatch {
     bool equal_seqs() const {

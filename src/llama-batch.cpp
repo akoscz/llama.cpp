@@ -9,6 +9,12 @@
 #include <algorithm>
 #include <sstream>
 
+llama_seq_id llama_seq_to_stream(llama_seq_id seq, uint32_t n_seq_max, uint32_t n_devices) {
+    GGML_ASSERT(seq >= 0 && uint32_t(seq) < n_seq_max && n_devices > 0);
+    const uint32_t owner = seq % n_devices;
+    return owner*(n_seq_max/n_devices) + std::min(owner, n_seq_max % n_devices) + seq/n_devices;
+}
+
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devices) : n_pos_per_embd(n_pos_per_embd), n_devices(n_devices) {
     GGML_ASSERT(n_devices > 0);
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -524,8 +530,19 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
+    std::vector<int32_t> candidates;
+    if (n_devices > 1 && sequential) {
+        for (int32_t i = 0; i < batch.n_tokens; ++i) { if (!used[i]) { candidates.push_back(i); } }
+        std::stable_sort(candidates.begin(), candidates.end(), [&](int32_t a, int32_t b) {
+            return llama_seq_to_stream(batch.seq_id[a][0], n_seq_max, n_devices) <
+                   llama_seq_to_stream(batch.seq_id[b][0], n_seq_max, n_devices);
+        });
+    }
+
     // determine the non-overlapping sequence sets participating in this ubatch
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+    const int32_t n_candidates = n_devices > 1 && sequential ? candidates.size() : batch.n_tokens;
+    for (int32_t candidate = 0; candidate < n_candidates; ++candidate) {
+        const int32_t i = n_devices > 1 && sequential ? candidates[candidate] : candidate;
         if (used[i]) {
             continue;
         }
@@ -540,9 +557,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             }
         }
 
-        // accept only increasing sequence ids
+        // Non-unified caches need consecutive physical streams.
         if (sequential) {
-            add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
+            add = add && (cur_seq_set.empty() ||
+                llama_seq_to_stream(batch.seq_id[i][0], n_seq_max, n_devices) ==
+                llama_seq_to_stream(last_seq_id, n_seq_max, n_devices) + 1);
         }
 
         if (add) {
@@ -550,7 +569,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
             last_seq_id = batch.seq_id[i][0];
 
-            if (cur_seq_set.size() > n_ubatch) {
+            if (cur_seq_set.size() >= n_ubatch) {
                 break;
             }
         }

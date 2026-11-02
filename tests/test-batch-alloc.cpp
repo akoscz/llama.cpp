@@ -704,6 +704,30 @@ static void test_device_order(testing & t) {
             t.assert_equal(100.0f*ub.idx[row], ub.embd[row*bb.n_embd]);
         }
     });
+    t.test("sequential_streams_follow_device_order", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id seq : input) { bb.add(0, {seq}, true); }
+        llama_batch_allocr ba(1, 4);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        for (int batch = 0; batch < 2; ++batch) {
+            const auto ub = ba.split_equal(4, true, 0);
+            t.assert_equal(4u, ub.n_tokens);
+            for (uint32_t row = 0; row < ub.n_tokens && row < 4; ++row) {
+                t.assert_equal(ordered[4*batch + row], ub.seq_id[row][0]);
+                t.assert_equal(original[4*batch + row], ub.idx[row]);
+            }
+        }
+        t.assert_equal(0u, ba.split_equal(4, true, 0).n_tokens);
+    });
+    t.test("sequence_count_obeys_ubatch_limit", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id seq = 0; seq < 8; ++seq) { bb.add(0, {seq}, true); }
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        t.assert_equal(4u, ba.split_equal(4, true, 0).n_tokens);
+        t.assert_equal(4u, ba.split_equal(4, true, 0).n_tokens);
+        t.assert_equal(0u, ba.split_equal(4, true, 0).n_tokens);
+    });
 }
 
 int main(int argc, char ** argv) {
