@@ -442,7 +442,21 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
             return t;
         };
         ggml_tensor * out;
-        if (variant == 7) {
+        if (variant == 11) {
+            const int64_t first[] = {0, 0, 0, 0};
+            const int64_t one[] = {0, 0, 1, 0};
+            auto * cache = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, 512, 256, n_stream);
+            ggml_set_input(cache);
+            inputs.push_back(cache);
+            if (mode) { ggml_backend_meta_split_input(cache, 2, single_owner ? one : owners, 4); }
+            auto * view = ggml_view_4d(ctx, cache, 512, 1, 256, n_stream, cache->nb[1], cache->nb[1], cache->nb[2], 0);
+            if (mode) { ggml_backend_meta_set_stream_view(view, single_owner ? one : owners, first, 4); }
+            auto * k = ggml_permute(ctx, view, 0, 2, 1, 3);
+            auto * v = ggml_view_4d(ctx, k, k->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+            auto * q = input(GGML_TYPE_F32, {512, 16, 4, 4}, 3);
+            auto * mask = input(GGML_TYPE_F16, {256, 32, 1, 4}, 3);
+            out = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
+        } else if (variant == 7) {
             auto * q = input(GGML_TYPE_F32, {128, 2, 4, 1}, 2);
             auto * positions = input(GGML_TYPE_I32, {4, 1, 1, 1}, 0);
             out = ggml_rope(ctx, q, positions, 64, 0);
@@ -522,6 +536,10 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
                 std::vector<ggml_fp16_t> f16(f32.size());
                 ggml_fp32_to_fp16_row(f32.data(), f16.data(), f16.size());
                 ggml_backend_tensor_set(t, f16.data(), 0, ggml_nbytes(t));
+            } else if (ggml_is_quantized(t->type)) {
+                std::vector<uint8_t> quantized(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, f32.data(), quantized.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, quantized.data(), 0, quantized.size());
             } else {
                 std::vector<int32_t> ids(f32.size());
                 for (size_t i = 0; i < ids.size(); ++i) { ids[i] = variant == 1 ? 2*(i % 32) + (i/32) % 2 : 7*(i % 8) + (i/8) % 8; }
@@ -547,7 +565,7 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
         norm += double(results[0][i])*results[0][i];
     }
     const bool ok = variant == 4 ? results[0] == results[1] : std::isfinite(error) && error < 1e-6*norm;
-    const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots", "RoPE", "SSM convolution", "batched projection", "batched cache gather"};
+    const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots", "RoPE", "SSM convolution", "batched projection", "batched cache gather", "Q8 aliased attention"};
     printf("%s owned %s%s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], single_owner ? " (single owner)" : "", norm ? error/norm : error);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
@@ -624,7 +642,7 @@ int main(int argc, char ** argv) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         bool ok = true;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-        for (int variant = 0; variant < 11; ++variant) {
+        for (int variant = 0; variant < 12; ++variant) {
             ok = test_owned_ops(gpu, variant) && ok;
             ok = test_owned_ops(gpu, variant, true) && ok;
         }
@@ -698,7 +716,7 @@ int main(int argc, char ** argv) {
     ok = test_host_layout(gpu) && ok;
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-    for (int variant = 0; variant < 11; ++variant) {
+    for (int variant = 0; variant < 12; ++variant) {
         ok = test_owned_ops(gpu, variant) && ok;
         ok = test_owned_ops(gpu, variant, true) && ok;
     }

@@ -1865,6 +1865,14 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
                 }
             }
         }
+        if (t_ij->view_src && ggml_backend_meta_has_stream_view(tensor)) {
+            // Preserve alias identity after applying each device's stream offset.
+            while (t_ij->view_src->view_src) {
+                t_ij->view_offs += t_ij->view_src->view_offs;
+                t_ij->view_src = t_ij->view_src->view_src;
+            }
+            if (t_ij->op == GGML_OP_VIEW) { memcpy(t_ij->op_params, &t_ij->view_offs, sizeof(t_ij->view_offs)); }
+        }
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
         } else if (simple_buf != nullptr) {
