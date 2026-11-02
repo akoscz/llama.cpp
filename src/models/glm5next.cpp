@@ -576,7 +576,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,
-                top_k, inp_kp->sel_mask, inp_kp->cand_mask, inp_kp->n_tail, kq_scale, il);
+                top_k, inp_kp->sel_mask, inp_kp->cand_mask, inp_kp->n_tail, kq_scale, il, inp_kp->tail_cells);
     } else {
         cur = build_attn(inp_attn,
                 layer.wo, nullptr, nullptr,
@@ -883,11 +883,13 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    ggml_tensor * h_all = cur;
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
+    // a masked read takes the output rows, an unmasked one every row (llama_set_embeddings_nextn)
+    res->t_h_nextn = cparams.embeddings_nextn_masked ? cur : h_all;
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

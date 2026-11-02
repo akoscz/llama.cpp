@@ -704,6 +704,10 @@ bool llm_graph_input_kpool::shapes_match(const llm_graph_input_kpool_dims & dims
 
     // the sparse attention's n_kv_max is sized on it
     res &= inp.n_tail == dims.n_tail;
+    if (inp.tail_cells) {
+        res &= inp.tail_cells->ne[0] == std::max<int64_t>(1, dims.n_tail);
+        res &= inp.tail_cells->ne[1] == dims.n_tps && inp.tail_cells->ne[2] == dims.n_stream;
+    }
 
     res &= inp.new_pool_cells->ne[0] == (int64_t) inp.kpool*dims.n_new_max;
     res &= inp.new_pool_cells->ne[1] == dims.n_stream;
@@ -2965,7 +2969,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
                 bool   mask_is_prefix,
-             int64_t   n_kv_max) const {
+             int64_t   n_kv_max,
+         ggml_tensor * sparse_indices) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2980,6 +2985,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    GGML_ASSERT(!sparse_indices || use_flash_attn);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2996,8 +3002,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cur = sparse_indices ? ggml_flash_attn_ext_sparse(ctx0, q, k, v, sparse_indices, kq_scale) :
+            ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                               hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -4170,6 +4177,17 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         inp->n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
             return kv->get_cells(s);
         }, ubatch, kpool);
+        static const bool direct_indices = ggml_env_switch("LLAMA_KPOOL_DIRECT_INDICES");
+        const int64_t tail_bound = std::max<int64_t>(1, inp->n_tail);
+        const int64_t direct_bound = llama_kpool_n_kv_max((int64_t) kpool*n_dump, tail_bound);
+        if (direct_indices && !ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY") && inp->mask_cells && cparams.flash_attn && !hparams.use_alibi &&
+                hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
+                (int64_t) hparams.indexer_kpool*n_dump + tail_bound <= GGML_KPOOL_INDICES_MAX &&
+                n_tps <= 65535 && n_stream <= 65535 &&
+                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps, 8)*direct_bound)) {
+            inp->tail_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
+            ggml_set_input(inp->tail_cells);
+        }
 
         inp->pool_reps = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
         ggml_set_input(inp->pool_reps);
@@ -4214,7 +4232,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * cand_mask,
             int64_t   n_tail,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * tail_cells) const {
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
@@ -4242,46 +4261,56 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     GGML_ASSERT(sel_mask->ne[0] >= n_kv);
 
-    // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy. Built on the device, the copy
-    // is the op made again, which writes the mask where the copy would read and write it
-    ggml_tensor * mask_all = sel_mask->op == GGML_OP_KPOOL_MASK ?
-        ggml_kpool_mask(ctx0, sel_mask->src[0], sel_mask->src[1], GGML_KPOOL_MASK_SEL, sel_mask->ne[0] - sel_mask->src[0]->ne[0]) :
-        ggml_dup(ctx0, sel_mask);
-
-    mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
-            mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
-
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
-            top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
-
-    // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
-    // tail. f32 because CUDA only does SET_ROWS for f32
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    ggml_tensor * mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
-
-    // the first n_kv columns are the mask; the dump columns are dropped here
-    mask_top_k = ggml_view_4d(ctx0, mask_top_k, n_kv, mask_top_k->ne[2], 1, mask_top_k->ne[3],
-            mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
-
-    mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
-
-    // ggml_flash_attn_ext asserts an f16 mask, and ggml_add would yield src0's f32
-    if (mask_top_k->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
-        mask_top_k = ggml_cast(ctx0, mask_top_k, GGML_TYPE_F16);
-    }
-
-    // An empty, future or foreign-sequence cell stays masked whatever top-k said: cand_mask keeps only cells of the row's
-    // sequence at or before its position (kpool_mask_row; test-kpool-input checks its zeros against the KQ mask's), so
-    // adding the KQ mask changes nothing while that mask is 0 or -inf on those cells and -inf elsewhere. A window, ALiBi or
-    // 2-D positions make it more than that, and it is added
     static const bool kq_add = ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY");
+    const bool direct = tail_cells && cparams.flash_attn && !kq_b && !kq_add && !hparams.use_alibi &&
+        hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
+        sel_mask->op == GGML_OP_KPOOL_MASK;
+    ggml_tensor * sparse_indices = nullptr;
+    ggml_tensor * mask_top_k = nullptr;
+    if (direct) {
+        sparse_indices = ggml_kpool_indices(ctx0, sel_mask->src[0], sel_mask->src[1], top_k, tail_cells,
+            sel_mask->ne[0] - n_kv, llama_kpool_n_kv_max(top_k->ne[0], tail_cells->ne[0]));
+        cb(sparse_indices, "kpool_indices", il);
+    } else {
+        // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch: scatter into a copy. Built on the device, the copy
+        // is the op made again, which writes the mask where the copy would read and write it
+        ggml_tensor * mask_all = sel_mask->op == GGML_OP_KPOOL_MASK ?
+            ggml_kpool_mask(ctx0, sel_mask->src[0], sel_mask->src[1], GGML_KPOOL_MASK_SEL, sel_mask->ne[0] - sel_mask->src[0]->ne[0]) :
+            ggml_dup(ctx0, sel_mask);
 
-    if (kq_add || hparams.use_alibi || hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_pos_per_embd() != 1) {
-        mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
+        mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
+                mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
+
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
+                top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
+
+        // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
+        // tail. f32 because CUDA only does SET_ROWS for f32
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
+
+        // the first n_kv columns are the mask; the dump columns are dropped here
+        mask_top_k = ggml_view_4d(ctx0, mask_top_k, n_kv, mask_top_k->ne[2], 1, mask_top_k->ne[3],
+                mask_top_k->nb[2], mask_top_k->nb[3], mask_top_k->nb[3], 0);
+
+        mask_top_k = ggml_add(ctx0, mask_top_k, cand_mask);
+
+        // ggml_flash_attn_ext asserts an f16 mask, and ggml_add would yield src0's f32
+        if (mask_top_k->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
+            mask_top_k = ggml_cast(ctx0, mask_top_k, GGML_TYPE_F16);
+        }
+
+        // An empty, future or foreign-sequence cell stays masked whatever top-k said: cand_mask keeps only cells of the row's
+        // sequence at or before its position (kpool_mask_row; test-kpool-input checks its zeros against the KQ mask's), so
+        // adding the KQ mask changes nothing while that mask is 0 or -inf on those cells and -inf elsewhere. A window, ALiBi or
+        // 2-D positions make it more than that, and it is added
+        if (kq_add || hparams.use_alibi || hparams.swa_type != LLAMA_SWA_TYPE_NONE || hparams.n_pos_per_embd() != 1) {
+            mask_top_k = ggml_add(ctx0, mask_top_k, kq_mask);
+        }
+        cb(mask_top_k, "kpool_kq_mask", il);
     }
-    cb(mask_top_k, "kpool_kq_mask", il);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -4292,9 +4321,9 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     // cell is gone), whose tail then has more. n_tail counts the longest tail of this ubatch in the cells, and set_input
     // asserts no row is granted more, so the bound holds every row's live cells; the compaction traps on one it does not
     GGML_ASSERT(n_tail >= (int64_t) hparams.indexer_kpool - 1);
-    const int64_t n_kv_max = llama_kpool_n_kv_max(top_k->ne[0], n_tail);
+    const int64_t n_kv_max = llama_kpool_n_kv_max(top_k->ne[0], direct ? tail_cells->ne[0] : n_tail);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il, /*mask_is_prefix =*/ false,
-            n_kv_max);
+            n_kv_max, sparse_indices);
     cb(cur, "kqv_out", il);
 
     if (wo) {

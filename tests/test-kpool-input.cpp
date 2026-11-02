@@ -325,6 +325,7 @@ struct maps {
     // a device build's facts, in place of sel_mask and cand_mask
     ggml_tensor * mask_cells     = nullptr;
     ggml_tensor * mask_rows      = nullptr;
+    ggml_tensor * tail_cells     = nullptr;
 
     // n_dump: the top-k's dump pools past the n_pools real ones, with their columns in sel_mask (llm_graph_input_kpool);
     // n_pools_of > 0 sizes the maps on that many pools instead of the whole cache's; device: the facts, not the masks
@@ -342,6 +343,7 @@ struct maps {
         if (device) {
             mask_cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 2, n_ps, n_ns);
             mask_rows  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_tps, n_ns);
+            tail_cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, n_tps, n_ns);
         } else {
             sel_mask   = ggml_new_tensor_4d(ctx, tm, n_kv + r*n_dump, n_tps, 1, n_ns);
             cand_mask  = ggml_new_tensor_4d(ctx, tm, n_kv, n_tps, 1, n_ns);
@@ -779,7 +781,7 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
 
         const int64_t tail_dev = llama_kpool_set_input(cells_of, from_views ? &views : nullptr, nullptr, dev.pool_cells, nullptr,
                 dev.pool_bias, nullptr, nullptr, dev.pool_reps, dev.new_pool_cells, dev.new_pool_reps, strm_of.data(),
-                w.v_cells[0].size(), rebuild, ub, cfg.r, dev.mask_cells, dev.mask_rows);
+                w.v_cells[0].size(), rebuild, ub, cfg.r, dev.mask_cells, dev.mask_rows, dev.tail_cells);
 
         std::vector<ggml_fp16_t> sel;
         std::vector<ggml_fp16_t> cand;
@@ -796,9 +798,26 @@ static bool build_both(pool & w, llama_kpool_views & views, const config & cfg, 
                  same(dev, ref, sub, sizeof(sub));
         }
 
-        std::vector<uint8_t> facts(ggml_nbytes(dev.mask_cells) + ggml_nbytes(dev.mask_rows));
+        for (int64_t row = 0; row < n_tokens; ++row) {
+            std::vector<int32_t> got;
+            const int32_t * ids = (const int32_t *) dev.tail_cells->data + row*n_kv;
+            bool padded = false;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (ids[j] == -1) { padded = true; continue; }
+                CHECK(!padded, "tail has a cell after padding");
+                got.push_back(ids[j]);
+            }
+            std::sort(got.begin(), got.end());
+            std::vector<int32_t> want;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (ggml_fp16_to_fp32(sel[row*(n_kv+cfg.r*n_dump)+j]) == 0.0f) { want.push_back((int32_t) j); }
+            }
+            CHECK(got == want, "physical tail differs from SEL at row %lld", (long long) row);
+        }
+        std::vector<uint8_t> facts(ggml_nbytes(dev.mask_cells) + ggml_nbytes(dev.mask_rows) + ggml_nbytes(dev.tail_cells));
         memcpy(facts.data(), dev.mask_cells->data, ggml_nbytes(dev.mask_cells));
         memcpy(facts.data() + ggml_nbytes(dev.mask_cells), dev.mask_rows->data, ggml_nbytes(dev.mask_rows));
+        memcpy(facts.data() + ggml_nbytes(dev.mask_cells) + ggml_nbytes(dev.mask_rows), dev.tail_cells->data, ggml_nbytes(dev.tail_cells));
 
         if (ok && !from_views && facts != facts_views) {
             size_t k = 0;
@@ -1290,9 +1309,88 @@ static void run_draft_rounds(std::mt19937 & rng) {
     CHECK(first_refuses > 0 && last_refuses > 0, "generated no mixed pool boundaries in both row orders");
 }
 
+// Compare compact indices with the old SEL + scatter + CAND route, including dump and duplicate ids.
+static void run_direct_indices(std::mt19937 & rng) {
+    constexpr int64_t nk = 64, np = 2, nr = 16, ns = 2, nt = 24, nd = 8, bound = 96;
+    ggml_init_params gp = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_tensor * cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nk, 2, np, ns);
+    ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nr, ns);
+    ggml_tensor * top = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nt, nr, ns);
+    ggml_tensor * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nk, nr, ns);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    ggml_tensor * sel = ggml_kpool_mask(ctx, cells, rows, GGML_KPOOL_MASK_SEL, nd);
+    ggml_tensor * cand = ggml_kpool_mask(ctx, cells, rows, GGML_KPOOL_MASK_CAND, 0);
+    ggml_tensor * direct = ggml_kpool_indices(ctx, cells, rows, top, tail, nd, bound);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, sel);
+    ggml_build_forward_expand(gf, cand);
+    ggml_build_forward_expand(gf, direct);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    CHECK(ggml_gallocr_alloc_graph(alloc, gf), "direct index graph allocation");
+    std::vector<int32_t> vc(nk*2*np*ns), vr(4*nr*ns), vt(nt*nr*ns), vl(nk*nr*ns);
+    std::vector<int32_t> got(bound*nr*ns);
+    std::vector<ggml_fp16_t> vs((nk+nd)*nr*ns), vm(nk*nr*ns);
+    for (int round = 0; round < 64; ++round) {
+        for (int64_t stream = 0; stream < ns; ++stream) {
+            for (int64_t ps = 0; ps < np; ++ps) {
+                int32_t * pos = vc.data() + (stream*np+ps)*2*nk;
+                for (int64_t j = 0; j < nk; ++j) {
+                    pos[j] = rng()%5 == 0 ? -1 : int32_t(rng()%32);
+                    pos[nk+j] = rng()%6 == 0 ? -1 : int32_t(rng()%8);
+                }
+            }
+        }
+        std::fill(vl.begin(), vl.end(), -1);
+        for (int64_t row = 0; row < nr*ns; ++row) {
+            int32_t * facts = vr.data()+4*row;
+            facts[0] = int32_t(rng()%32);
+            facts[1] = row%7 == 0 ? -1 : int32_t(rng()%np);
+            facts[2] = (facts[0]+1)/4*4;
+            facts[3] = int32_t(rng()%8);
+            for (int64_t j = 0; j < nt; ++j) {
+                vt[row*nt+j] = int32_t(rng()%(nk+nd));
+            }
+            if (facts[1] >= 0) {
+                const int32_t * pos = vc.data()+((row/nr)*np+facts[1])*2*nk;
+                int64_t count = 0;
+                for (int64_t j = 0; j < nk; ++j) {
+                    if (pos[j] >= facts[2] && pos[j] <= facts[0]) { vl[row*nk+count++] = int32_t(j); }
+                }
+            }
+        }
+        ggml_backend_tensor_set(cells, vc.data(), 0, ggml_nbytes(cells));
+        ggml_backend_tensor_set(rows, vr.data(), 0, ggml_nbytes(rows));
+        ggml_backend_tensor_set(top, vt.data(), 0, ggml_nbytes(top));
+        ggml_backend_tensor_set(tail, vl.data(), 0, ggml_nbytes(tail));
+        CHECK(ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS, "direct index graph compute");
+        ggml_backend_tensor_get(sel, vs.data(), 0, ggml_nbytes(sel));
+        ggml_backend_tensor_get(cand, vm.data(), 0, ggml_nbytes(cand));
+        ggml_backend_tensor_get(direct, got.data(), 0, ggml_nbytes(direct));
+        for (int64_t row = 0; row < nr*ns; ++row) {
+            std::vector<int32_t> want;
+            for (int64_t j = 0; j < nk; ++j) {
+                const bool selected = std::find(vt.begin()+row*nt, vt.begin()+(row+1)*nt, j) != vt.begin()+(row+1)*nt;
+                if ((selected || ggml_fp16_to_fp32(vs[row*(nk+nd)+j]) == 0.0f) && ggml_fp16_to_fp32(vm[row*nk+j]) == 0.0f) {
+                    want.push_back(int32_t(j));
+                }
+            }
+            want.resize(bound, -1);
+            CHECK(std::equal(want.begin(), want.end(), got.begin()+row*bound), "direct indices differ at round %d row %lld", round, (long long) row);
+        }
+    }
+    ggml_gallocr_free(alloc);
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+    printf("direct indices: 2048 rows match SEL + scatter + CAND\n");
+}
+
 int main() {
     std::mt19937 rng(20260930);
 
+    run_direct_indices(rng);
     run_draft_rounds(rng);
 
     run_shift_regroups();

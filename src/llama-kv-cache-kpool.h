@@ -180,7 +180,8 @@ int64_t llama_kpool_set_input(
         const llama_ubatch   * ubatch,
               uint32_t         kpool,
               ggml_tensor    * mask_cells = nullptr,
-              ggml_tensor    * mask_rows  = nullptr);
+              ggml_tensor    * mask_rows  = nullptr,
+              ggml_tensor    * tail_cells = nullptr);
 
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 // LLAMA_KPOOL_INPUT_LEGACY=1 builds the maps from the cells every call; LLAMA_KPOOL_INPUT_CHECK=1 builds them both
@@ -212,7 +213,8 @@ int64_t llama_kv_cache_set_input_kpool(
               uint32_t         kpool,
         // the device's mask facts in place of sel_mask and cand_mask (llama_kpool_set_input)
               ggml_tensor    * mask_cells = nullptr,
-              ggml_tensor    * mask_rows  = nullptr);
+              ggml_tensor    * mask_rows  = nullptr,
+              ggml_tensor    * tail_cells = nullptr);
 
 // current decode geometry for the reuse check below, in the same units the
 // builder sizes the tensors with (llm_graph_context::build_inp_kpool)
@@ -297,6 +299,7 @@ public:
     // writes the masks (LLAMA_KPOOL_MASK_HOST_LEGACY=1)
     ggml_tensor * mask_cells = nullptr;   // I32 [n_kv, 2, n_ps, n_stream]
     ggml_tensor * mask_rows  = nullptr;   // I32 [4, n_batch, n_stream]
+    ggml_tensor * tail_cells = nullptr;  // I32 [n_tail, n_batch, n_stream], physical cells or -1
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;

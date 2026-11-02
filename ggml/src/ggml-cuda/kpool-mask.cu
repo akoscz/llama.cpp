@@ -61,7 +61,176 @@ static __global__ void k_kpool_mask(
     }
 }
 
+// One bounded sort per row; physical cell order matches dense-mask compaction.
+static __global__ void k_kpool_indices(
+        const int32_t * cells, const int32_t * rows, const int32_t * selected, const int32_t * tail,
+        int32_t * dst, int nk, int np, int nr, int ntop, int ntail, int extra, int bound, int nsort) {
+    extern __shared__ int32_t ids[];
+    const int row = blockIdx.x;
+    const int stream = blockIdx.y;
+    const int32_t * f = rows + 4*(stream*nr + row);
+    const bool live = f[1] >= 0 && f[1] < np;
+    const int32_t * pos = cells + (int64_t(stream)*np + (live ? f[1] : 0))*2*nk;
+    const int32_t * pool = pos + nk;
+    for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
+        int32_t value = INT32_MAX;
+        if (live && j < ntop+ntail) {
+            const bool from_top = j < ntop;
+            const int32_t cell = from_top ? selected[(int64_t(stream)*nr+row)*ntop+j] : tail[(int64_t(stream)*nr+row)*ntail+j-ntop];
+            if (!from_top && cell == -1) {
+                // Padding in the compact tail.
+            } else if (cell < 0 || cell >= nk + (from_top ? extra : 0)) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                __builtin_trap();
+#else
+                asm("trap;");
+#endif
+            } else if (cell < nk) {
+                const bool visible = uint32_t(pos[cell]) <= uint32_t(f[0]);
+                const bool in_tail = pos[cell] >= f[2];
+                const bool pooled = from_top && uint32_t(pool[cell]) < uint32_t(f[3]);
+                if (visible && (in_tail || pooled)) { value = cell; }
+            }
+        }
+        ids[j] = value;
+    }
+    __syncthreads();
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // The launch uses 256 threads. Keep each warp's compare/exchange stages in registers;
+    // only partners in different warps need shared memory and a block barrier.
+    constexpr int warp_width = 32;
+    constexpr int n_warps = 256/warp_width;
+    for (int base = 0; base < nsort; base += blockDim.x) {
+        const int j = base + threadIdx.x;
+        int32_t value = j < nsort ? ids[j] : INT32_MAX;
+        for (int width = 2; width <= min(nsort, warp_width); width *= 2) {
+            for (int stride = width/2; stride > 0; stride /= 2) {
+                const int32_t other = __shfl_xor_sync(0xffffffff, value, stride, warp_width);
+                const bool take_min = ((j & stride) == 0) == ((j & width) == 0);
+                value = take_min ? min(value, other) : max(value, other);
+            }
+        }
+        if (j < nsort) { ids[j] = value; }
+    }
+    __syncthreads();
+    for (int width = 2*warp_width; width <= nsort; width *= 2) {
+        for (int stride = width/2; stride >= warp_width; stride /= 2) {
+            for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
+                const int other = j ^ stride;
+                if (other > j && ((ids[j] > ids[other]) == ((j & width) == 0))) {
+                    const int32_t tmp = ids[j]; ids[j] = ids[other]; ids[other] = tmp;
+                }
+            }
+            __syncthreads();
+        }
+        for (int base = 0; base < nsort; base += blockDim.x) {
+            const int j = base + threadIdx.x;
+            int32_t value = j < nsort ? ids[j] : INT32_MAX;
+#pragma unroll
+            for (int stride = warp_width/2; stride > 0; stride /= 2) {
+                const int32_t other = __shfl_xor_sync(0xffffffff, value, stride, warp_width);
+                const bool take_min = ((j & stride) == 0) == ((j & width) == 0);
+                value = take_min ? min(value, other) : max(value, other);
+            }
+            if (j < nsort) { ids[j] = value; }
+        }
+        __syncthreads();
+    }
+
+    // Contiguous chunks preserve sorted order after the exclusive prefix sum. Compare
+    // the first entry with its predecessor too, so duplicates spanning chunks vanish.
+    const int chunk = (nsort + blockDim.x - 1)/blockDim.x;
+    const int begin = threadIdx.x*chunk;
+    const int end = min(begin + chunk, nsort);
+    int count = 0;
+    for (int j = begin; j < end; ++j) {
+        count += ids[j] != INT32_MAX && (j == 0 || ids[j] != ids[j-1]);
+    }
+    const int lane = threadIdx.x % warp_width;
+    const int warp = threadIdx.x / warp_width;
+    int prefix = count;
+#pragma unroll
+    for (int offset = 1; offset < warp_width; offset *= 2) {
+        const int other = __shfl_up_sync(0xffffffff, prefix, offset, warp_width);
+        if (lane >= offset) { prefix += other; }
+    }
+    __shared__ int warp_offsets[n_warps];
+    __shared__ int total;
+    if (lane == warp_width-1) { warp_offsets[warp] = prefix; }
+    __syncthreads();
+    if (warp == 0) {
+        const int warp_count = lane < n_warps ? warp_offsets[lane] : 0;
+        int warp_prefix = warp_count;
+#pragma unroll
+        for (int offset = 1; offset < n_warps; offset *= 2) {
+            const int other = __shfl_up_sync(0xffffffff, warp_prefix, offset, warp_width);
+            if (lane >= offset) { warp_prefix += other; }
+        }
+        if (lane < n_warps) { warp_offsets[lane] = warp_prefix - warp_count; }
+        if (lane == n_warps-1) { total = warp_prefix; }
+    }
+    __syncthreads();
+    if (total > bound) { asm("trap;"); }
+    int offset = warp_offsets[warp] + prefix - count;
+    int32_t * out = dst + (int64_t(stream)*nr+row)*bound;
+    for (int j = begin; j < end; ++j) {
+        if (ids[j] != INT32_MAX && (j == 0 || ids[j] != ids[j-1])) {
+            out[offset++] = ids[j];
+        }
+    }
+    for (int64_t j = int64_t(total) + threadIdx.x; j < bound; j += blockDim.x) { out[j] = -1; }
+#else
+    for (int width = 2; width <= nsort; width *= 2) {
+        for (int stride = width/2; stride > 0; stride /= 2) {
+            for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
+                const int other = j ^ stride;
+                if (other > j && ((ids[j] > ids[other]) == ((j & width) == 0))) {
+                    const int32_t tmp = ids[j]; ids[j] = ids[other]; ids[other] = tmp;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (threadIdx.x == 0) {
+        int32_t * out = dst + (int64_t(stream)*nr+row)*bound;
+        int count = 0;
+        for (int j = 0; j < nsort && ids[j] != INT32_MAX; ++j) {
+            if (j == 0 || ids[j] != ids[j-1]) {
+                if (count >= bound) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                __builtin_trap();
+#else
+                asm("trap;");
+#endif
+                }
+                out[count++] = ids[j];
+            }
+        }
+        while (count < bound) { out[count++] = -1; }
+    }
+#endif
+}
+
 void ggml_cuda_op_kpool_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MASK_INDICES) {
+        const ggml_tensor * cells = dst->src[0];
+        const ggml_tensor * rows = dst->src[1];
+        const ggml_tensor * selected = dst->src[2];
+        const ggml_tensor * tail = dst->src[3];
+        const int n = selected->ne[0] + tail->ne[0];
+        GGML_ASSERT(n > 0 && n <= GGML_KPOOL_INDICES_MAX && dst->type == GGML_TYPE_I32);
+        int nsort = 1;
+        while (nsort < n) { nsort *= 2; }
+        const dim3 grid(rows->ne[1], rows->ne[2]);
+        k_kpool_indices<<<grid, 256, nsort*sizeof(int32_t), ctx.stream()>>>(
+            (const int32_t *) cells->data, (const int32_t *) rows->data,
+            (const int32_t *) selected->data, (const int32_t *) tail->data, (int32_t *) dst->data,
+            cells->ne[0], cells->ne[2], rows->ne[1], selected->ne[0], tail->ne[0],
+            ggml_get_op_params_i32(dst, 1), dst->ne[0], nsort);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const ggml_tensor * cells = dst->src[0];
     const ggml_tensor * rows  = dst->src[1];
 

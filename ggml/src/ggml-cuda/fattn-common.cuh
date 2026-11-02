@@ -64,7 +64,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1217,7 +1217,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         b_first, b_last, [](const int) { return false; });
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = rowsum == 0.0f ? 0.0f : dst_val / rowsum;
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -1328,7 +1328,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = rowsum == 0.0f ? 0.0f : dst_val / rowsum;
 }
 
 // The stream-k fixup of the live mode (KV_live): one block per output tile and column, as flash_attn_stream_k_fixup_uniform, combining
@@ -1401,7 +1401,7 @@ static __global__ void flash_attn_stream_k_fixup_live(
             return maybe_empty && int64_t(b)*total_work / nblocks == int64_t(b + 1)*total_work / nblocks;
         });
 
-    *dst = dst_val / rowsum;
+    *dst = rowsum == 0.0f ? 0.0f : dst_val / rowsum;
 }
 
 template<int D> // D == head size
@@ -1459,7 +1459,7 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_denominator == 0.0f ? 0.0f : VKQ_numerator / VKQ_denominator;
 }
 
 // V is K's data: the same tensor, or a view of K's data at K's offset with K's strides and K's cells, as GLM-5.3's absorbed
@@ -1477,6 +1477,8 @@ static bool ggml_cuda_fattn_V_same_as_K(const ggml_tensor * dst) {
 }
 
 // A sparse launch that shares its gather with another (ggml_cuda_flash_attn_ext_mma_f16_sparse_heads).
+void ggml_cuda_flash_attn_ext_sparse_counts(const ggml_tensor * indices, int32_t * counts, cudaStream_t stream);
+
 struct fattn_sparse_launch {
     const int32_t * indices     = nullptr; // the compacted mask rows (ggml_cuda_flash_attn_ext_compact_mask); null: compacted here
     bool            whole_tiles = false;   // one block a tile: no tile split, no fixup
@@ -1490,7 +1492,7 @@ void launch_fattn(
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
     const bool kv_live_ok = false, // the kernel reads KV_live
     const bool use_sparse = false, // the kernel reads K, V and the mask by the indices in KV_max, n_kv_max of them
-    const fattn_sparse_launch & sparse_launch = {}
+    fattn_sparse_launch sparse_launch = {}
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1502,6 +1504,8 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * direct = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5] : nullptr;
+    const ggml_tensor * sparse_shape = direct ? direct : mask;
 
     ggml_tensor * KQV = dst;
 
@@ -1549,9 +1553,16 @@ void launch_fattn(
     static const bool sparse_steps_legacy = ggml_env_switch("GGML_CUDA_FATTN_SPARSE_STEPS_LEGACY");
     const int32_t * sparse_counts = nullptr;
     if (use_sparse) {
-        GGML_ASSERT(mask != nullptr && !mask_packed);
+        GGML_ASSERT(sparse_shape != nullptr && !mask_packed);
         GGML_ASSERT(n_kv_max > 0);
 
+        if (direct && !sparse_launch.indices) {
+            const size_t nrows = size_t(direct->ne[1])*direct->ne[3];
+            KV_max.alloc(nrows);
+            ggml_cuda_flash_attn_ext_sparse_counts(direct, KV_max.ptr, main_stream);
+            sparse_launch.indices = (const int32_t *) direct->data;
+            sparse_launch.counts = KV_max.ptr;
+        }
         if (!sparse_launch.indices) {
             const size_t nrows = size_t(mask->ne[1]) * mask->ne[3];
             KV_max.alloc(size_t(n_kv_max) * nrows + nrows); // the indices, then the counts
@@ -1572,7 +1583,7 @@ void launch_fattn(
     // conversion's bit for bit. GGML_CUDA_FATTN_KGATHER_LEGACY=1: the whole K.
     static const bool kgather_legacy = ggml_env_switch("GGML_CUDA_FATTN_KGATHER_LEGACY");
     const bool gather_K = use_sparse && need_f16_K && !kgather_legacy && K->type == GGML_TYPE_Q8_0 &&
-        (V_is_K_view || !need_f16_V) && K->ne[2] == 1 && K->ne[3] == Q->ne[3] && mask->ne[3] == Q->ne[3] &&
+        (V_is_K_view || !need_f16_V) && K->ne[2] == 1 && K->ne[3] == Q->ne[3] && sparse_shape->ne[3] == Q->ne[3] &&
         K->nb[0] == ggml_type_size(K->type) && K->nb[1] % 2 == 0 && K->ne[0] % ggml_blck_size(K->type) == 0 &&
         2*Q->ne[1]*Q->ne[3]*n_kv_max <= K->ne[1]*K->ne[3];
 
@@ -1580,7 +1591,7 @@ void launch_fattn(
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         ggml_cuda_flash_attn_ext_gather_k_q8_0(K_data, nb11, nb13, K->ne[0], K->ne[1], K_f16,
-            sparse_launch.indices ? sparse_launch.indices : KV_max.ptr, n_kv_max, mask->ne[1], Q->ne[1], Q->ne[3], main_stream);
+            sparse_launch.indices ? sparse_launch.indices : KV_max.ptr, n_kv_max, sparse_shape->ne[1], Q->ne[1], Q->ne[3], main_stream);
 
         nb11 = K->ne[0] * sizeof(half);
         nb12 = K->ne[1] * nb11;
@@ -1891,7 +1902,7 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv,     K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        sparse_shape ? sparse_shape->ne[1] : 0, sparse_shape ? sparse_shape->ne[2] : 0, sparse_shape ? sparse_shape->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         mask_packed ? 1 : 0
     );

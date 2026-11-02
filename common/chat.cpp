@@ -193,7 +193,10 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty()) {
         jmsg["content"] = content;
     } else if (!content_parts.empty()) {
-        if (concat_typed_text || contains_media()) {
+        const bool has_tool_reference = std::any_of(content_parts.begin(), content_parts.end(), [](const common_chat_msg_content_part & part) {
+            return part.type == "tool_reference";
+        });
+        if ((concat_typed_text || contains_media()) && !has_tool_reference) {
             std::string text;
             bool last_was_media_marker = false;
             // join parts with newline, do not add newline before or after media markers
@@ -220,10 +223,11 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
         } else {
             auto & parts = jmsg["content"] = json::array();
             for (const auto & part : content_parts) {
-                parts.push_back({
-                    {"type", part.type},
-                    {"text", part.text},
-                });
+                if (part.type == "tool_reference") {
+                    parts.push_back({{"type", part.type}, {"name", part.name}});
+                } else {
+                    parts.push_back({{"type", part.type}, {"text", part.text}});
+                }
             }
         }
     } else {
@@ -400,12 +404,22 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                             throw std::invalid_argument("Missing content part type: " + part.dump());
                         }
                         const auto & type = part.at("type");
-                        if (type != "text" && type != "media_marker") {
+                        if (type != "text" && type != "media_marker" && type != "tool_reference") {
                             throw std::invalid_argument("Unsupported content part type: " + type.dump());
                         }
                         common_chat_msg_content_part msg_part;
                         msg_part.type = type;
-                        msg_part.text = part.at("text");
+                        if (type == "tool_reference") {
+                            if (msg.role != "tool") {
+                                throw std::invalid_argument("tool_reference requires a tool message");
+                            }
+                            msg_part.name = part.contains("name") ? part.at("name").get<std::string>() : part.at("tool_name").get<std::string>();
+                            if (msg_part.name.empty()) {
+                                throw std::invalid_argument("tool_reference requires a non-empty name");
+                            }
+                        } else {
+                            msg_part.text = part.at("text");
+                        }
                         msg.content_parts.push_back(msg_part);
                     }
                 } else if (!content.is_null()) {
@@ -498,7 +512,13 @@ struct messages_inp_normalizer {
                         }
                     });
                 } else if (only_string && it.is_array()) {
-                    it = concat_content_parts(it);
+                    // Tool discovery is structured content even when the template's text probe prefers strings.
+                    const bool has_tool_reference = std::any_of(it.begin(), it.end(), [](const json & part) {
+                        return part.value("type", "") == "tool_reference";
+                    });
+                    if (!has_tool_reference) {
+                        it = concat_content_parts(it);
+                    }
                 }
             }
             normalized.push_back(std::move(copy));
@@ -569,6 +589,9 @@ json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & t
                 { "parameters", json::parse(tool.parameters) },
             }},
         });
+        if (tool.defer_loading) {
+            result.back()["function"]["defer_loading"] = true;
+        }
     }
     return result;
 }
@@ -598,6 +621,7 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
                     /* .name = */ function.at("name"),
                     /* .description = */ function.value("description", ""),
                     /* .parameters = */ function.value("parameters", json::object()).dump(),
+                    /* .defer_loading = */ function.value("defer_loading", false),
                 });
             }
         }

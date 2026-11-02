@@ -207,22 +207,32 @@ static void kpool_facts_pad(int32_t * dst, int64_t n_rows) {
 // tail_start of the partition's rows, so the cells below every tail are left out
 struct kpool_tails {
     std::vector<llama_pos> pos;
+    std::vector<std::pair<llama_pos, int32_t>> cells;
 
-    void init(const llama_pos * pos_at, int64_t n_kv, llama_pos lo) {
+    void init(const llama_pos * pos_at, int64_t n_kv, llama_pos lo, bool physical) {
         pos.clear();
+        cells.clear();
         for (int64_t j = 0; j < n_kv; ++j) {
             if (pos_at[j] >= lo) {
-                pos.push_back(pos_at[j]);
+                if (physical) { cells.emplace_back(pos_at[j], (int32_t) j); }
+                else { pos.push_back(pos_at[j]); }
             }
         }
-        std::sort(pos.begin(), pos.end());
+        if (physical) { std::sort(cells.begin(), cells.end()); }
+        else { std::sort(pos.begin(), pos.end()); }
     }
 
-    int64_t count(llama_pos tail_start, llama_pos q) const {
-        if (tail_start > q) {
-            return 0;
+    int64_t write(llama_pos tail_start, llama_pos q, int32_t * dst = nullptr, int64_t capacity = 0) const {
+        if (tail_start > q) { return 0; }
+        if (!dst) { return std::upper_bound(pos.begin(), pos.end(), q) - std::lower_bound(pos.begin(), pos.end(), tail_start); }
+        const auto first = std::lower_bound(cells.begin(), cells.end(), std::make_pair(tail_start, INT32_MIN));
+        const auto last = std::upper_bound(cells.begin(), cells.end(), std::make_pair(q, INT32_MAX));
+        const int64_t count = last-first;
+        if (dst) {
+            GGML_ASSERT(count <= capacity);
+            for (auto it = first; it != last; ++it) { *dst++ = it->second; }
         }
-        return std::upper_bound(pos.begin(), pos.end(), q) - std::lower_bound(pos.begin(), pos.end(), tail_start);
+        return count;
     }
 };
 
@@ -282,6 +292,8 @@ struct kpool_stream_out {
     // the device's facts in place of sel_mask and cand_mask (both nullptr then): ggml_kpool_mask's cells and rows
     int32_t * mask_cells = nullptr;
     int32_t * mask_rows  = nullptr;
+    int32_t * tail_cells = nullptr;
+    int64_t n_tail = 0;
 
     int64_t strm_row  = 0; // the stream's first row of the key cache
     int64_t n_kv      = 0;
@@ -397,7 +409,7 @@ static int64_t kpool_stream_from_view(
 
     if (o.mask_rows) {
         kpool_facts_cells(o.mask_cells, v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv);
-        tails.init(v.pos_at.data(), o.n_kv, kpool_tail_lo(ubatch, s, o.n_tps, seq, r));
+        tails.init(v.pos_at.data(), o.n_kv, kpool_tail_lo(ubatch, s, o.n_tps, seq, r), o.tail_cells != nullptr);
     }
 
     std::mutex merge;
@@ -430,7 +442,7 @@ static int64_t kpool_stream_from_view(
             if (o.mask_rows) {
                 kpool_facts_row(o.mask_rows + 4*ii, q, 0, tail_start, bo_vis);
 
-                n_tail = tails.count(tail_start, q);
+                n_tail = tails.write(tail_start, q, o.tail_cells ? o.tail_cells + ii*o.n_tail : nullptr, o.n_tail);
             } else {
                 char * cur_sel  = o.sel_mask  + ii*o.n_sel*o.mask_ts;
                 char * cur_cand = o.cand_mask + ii*o.n_kv *o.mask_ts;
@@ -496,7 +508,8 @@ int64_t llama_kpool_set_input(
         const llama_ubatch   * ubatch,
               uint32_t         kpool,
               ggml_tensor    * mask_cells,
-              ggml_tensor    * mask_rows) {
+              ggml_tensor    * mask_rows,
+              ggml_tensor    * tail_cells) {
     GGML_ASSERT(cells_of != nullptr);
     GGML_ASSERT(kpool > 0);
 
@@ -567,6 +580,13 @@ int64_t llama_kpool_set_input(
 
     GGML_ASSERT(pool_bias->ne[1] == n_tps);
     GGML_ASSERT(n_padq >= n_tps);
+    const int64_t n_tail = tail_cells ? tail_cells->ne[0] : 0;
+    if (tail_cells) {
+        GGML_ASSERT(facts && tail_cells->type == GGML_TYPE_I32 && ggml_is_contiguous(tail_cells));
+        GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
+        GGML_ASSERT(tail_cells->ne[1] == n_padq && tail_cells->ne[2] == n_ns && tail_cells->ne[3] == 1);
+        std::fill_n((int32_t *) tail_cells->data, ggml_nelements(tail_cells), -1);
+    }
 
     if (cell_pool) {
         GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
@@ -655,6 +675,7 @@ int64_t llama_kpool_set_input(
         char    * cur_cand_mask  = facts ? nullptr : dst_cand_mask + s*(n_padq*n_kv)*mask_ts;
         int32_t * cur_mask_cells = facts ? dst_mask_cells + s*(2*n_kv*n_ps) : nullptr;
         int32_t * cur_mask_rows  = facts ? dst_mask_rows  + s*(4*n_padq)    : nullptr;
+        int32_t * cur_tail_cells = tail_cells ? (int32_t *) tail_cells->data + s*n_padq*n_tail : nullptr;
         float   * cur_pool_bias  = dst_pool_bias  + s*(n_tps*n_pools);
 
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
@@ -714,6 +735,8 @@ int64_t llama_kpool_set_input(
                 o.new_reps   = cur_new_reps;
                 o.mask_cells = cur_mask_cells;
                 o.mask_rows  = cur_mask_rows;
+                o.tail_cells = cur_tail_cells;
+                o.n_tail     = n_tail;
                 o.strm_row   = kcache ? (int64_t) strm_of[s]*kv_size : 0;
                 o.n_kv       = n_kv;
                 o.n_sel      = n_sel;
@@ -910,7 +933,7 @@ int64_t llama_kpool_set_input(
 
             if (facts) {
                 kpool_facts_cells(cur_mask_cells + ps*2*n_kv, pos_at.data(), pool_of.data(), 0, n_kv);
-                tails.init(pos_at.data(), n_kv, kpool_tail_lo(ubatch, s, n_tps, seq_of_pool, r));
+                tails.init(pos_at.data(), n_kv, kpool_tail_lo(ubatch, s, n_tps, seq_of_pool, r), tail_cells != nullptr);
             }
 
             std::mutex merge;
@@ -948,7 +971,7 @@ int64_t llama_kpool_set_input(
                     if (facts) {
                         kpool_facts_row(cur_mask_rows + 4*ii, q, ps, tail_start, bo_vis);
 
-                        n_tail = tails.count(tail_start, q);
+                        n_tail = tails.write(tail_start, q, cur_tail_cells ? cur_tail_cells + ii*tail_cells->ne[0] : nullptr, tail_cells ? tail_cells->ne[0] : 0);
                     } else {
                         char * cur_sel  = cur_sel_mask  + ii*n_sel*mask_ts;
                         char * cur_cand = cur_cand_mask + ii*n_kv *mask_ts;
@@ -1319,7 +1342,8 @@ int64_t llama_kv_cache_set_input_kpool(
         const llama_ubatch   * ubatch,
               uint32_t         kpool,
               ggml_tensor    * mask_cells,
-              ggml_tensor    * mask_rows) {
+              ggml_tensor    * mask_rows,
+              ggml_tensor    * tail_cells) {
     GGML_ASSERT(kv != nullptr);
 
     static const bool legacy = ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY");
@@ -1333,7 +1357,7 @@ int64_t llama_kv_cache_set_input_kpool(
 
     const int64_t n_tail = llama_kpool_set_input(cells_of, views,
             cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
-            pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool, mask_cells, mask_rows);
+            pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool, mask_cells, mask_rows, tail_cells);
 
     if (!check || !views) {
         return n_tail;
@@ -1341,7 +1365,7 @@ int64_t llama_kv_cache_set_input_kpool(
 
     // the same maps from the cells; the views must have written the same bytes
     ggml_tensor * outs[] = {
-        cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask, pool_reps, new_pool_cells, new_pool_reps, mask_cells, mask_rows,
+        cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask, pool_reps, new_pool_cells, new_pool_reps, mask_cells, mask_rows, tail_cells,
     };
 
     std::vector<std::vector<uint8_t>> kept;
@@ -1356,7 +1380,7 @@ int64_t llama_kv_cache_set_input_kpool(
 
     llama_kpool_set_input(cells_of, nullptr,
             cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
-            pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool, mask_cells, mask_rows);
+            pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool, mask_cells, mask_rows, tail_cells);
 
     for (size_t i = 0; i < kept.size(); ++i) {
         if (outs[i] == nullptr) {
@@ -1451,7 +1475,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             strm_of.empty() ? nullptr : strm_of.data(),
             pool_reps ? (int64_t) mctx_idx->get_kv()->get_size() : 0,
             rebuild,
-            ubatch, kpool, mask_cells, mask_rows);
+            ubatch, kpool, mask_cells, mask_rows, tail_cells);
 
     // the sparse attention's n_kv_max counts n_tail tail cells a row: a row granted more would lose cells to its compaction
     GGML_ASSERT(n_tail_set <= n_tail && "k-pool: a row's tail holds more cells than the graph's sparse bound");

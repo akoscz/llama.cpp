@@ -509,7 +509,9 @@ static void ggml_compute_forward_dup_from_q(
               ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+    // DUP/CONT (including ggml_cast) have no second operand. CPY's second
+    // operand describes the same destination layout; use dst for every route.
+    const ggml_tensor * src1 = dst;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -8563,6 +8565,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * indices = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5] : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8675,7 +8678,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int32_t * ids = indices ? (const int32_t *) ((const char *) indices->data + iq1*indices->nb[1] + iq3*indices->nb[3]) : nullptr;
+        for (int64_t slot = ic_start; slot < ic_end; ++slot) {
+            const int64_t ic = ids ? ids[slot] : slot;
+            if (ic == -1) { break; }
+            GGML_ASSERT(ic >= 0 && ic < nek1);
+            GGML_ASSERT(!ids || slot == 0 || ids[slot-1] < ic);
             const float mv = mp ? (mask_bits ? ggml_kq_mask_bit((const uint16_t *) mp, ic) : slope*GGML_CPU_FP16_TO_FP32(mp[ic])) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9196,7 +9204,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int nth = params->nth;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    const bool sparse = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE;
+    const bool use_ref = params->use_ref || sparse;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
@@ -9278,7 +9287,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, sparse ? dst->src[5]->ne[0] : nek1, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
@@ -12264,11 +12273,54 @@ void ggml_compute_forward_lightning_indexer(
     }
 }
 
+static void ggml_compute_forward_kpool_indices(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0];
+    const ggml_tensor * rows = dst->src[1];
+    const ggml_tensor * selected = dst->src[2];
+    const ggml_tensor * tail = dst->src[3];
+    const int64_t nk = cells->ne[0], nr = rows->ne[1];
+    const int64_t extra = ggml_get_op_params_i32(dst, 1);
+    std::vector<int32_t> ids;
+    ids.reserve(selected->ne[0] + tail->ne[0]);
+    for (int64_t ir = params->ith; ir < nr*rows->ne[2]; ir += params->nth) {
+        const int64_t row = ir%nr, stream = ir/nr;
+        const int32_t * f = (const int32_t *) ((const char *) rows->data + row*rows->nb[1] + stream*rows->nb[2]);
+        int32_t * out = (int32_t *) ((char *) dst->data + row*dst->nb[1] + stream*dst->nb[3]);
+        ids.clear();
+        if (f[1] >= 0 && f[1] < cells->ne[2]) {
+            const int32_t * pos = (const int32_t *) ((const char *) cells->data + f[1]*cells->nb[2] + stream*cells->nb[3]);
+            const int32_t * pool = pos + nk;
+            for (const ggml_tensor * source : {selected, tail}) {
+                const int32_t * src = (const int32_t *) ((const char *) source->data + row*source->nb[1] + stream*source->nb[2]);
+                for (int64_t j = 0; j < source->ne[0]; ++j) {
+                    const int32_t cell = src[j];
+                    if (source == tail && cell == -1) { continue; }
+                    GGML_ASSERT(cell >= 0 && cell < nk + (source == selected ? extra : 0));
+                    if (cell >= nk) { continue; }
+                    const bool visible = (uint32_t) pos[cell] <= (uint32_t) f[0];
+                    const bool in_tail = pos[cell] >= f[2];
+                    const bool pooled = source == selected && (uint32_t) pool[cell] < (uint32_t) f[3];
+                    if (visible && (in_tail || pooled)) { ids.push_back(cell); }
+                }
+            }
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        }
+        GGML_ASSERT(ids.size() <= (size_t) dst->ne[0]);
+        std::copy(ids.begin(), ids.end(), out);
+        std::fill(out + ids.size(), out + dst->ne[0], -1);
+    }
+}
+
 // ggml_compute_forward_kpool_mask
 
 void ggml_compute_forward_kpool_mask(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MASK_INDICES) {
+        ggml_compute_forward_kpool_indices(params, dst);
+        return;
+    }
     const ggml_tensor * cells = dst->src[0]; // I32 [n_kv, 2, n_ps, n_stream]: a cell's position, then its pool
     const ggml_tensor * rows  = dst->src[1]; // I32 [4, n_rows, n_stream]: q, sequence (-1 padded), tail, pools seen
 

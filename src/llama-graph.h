@@ -1330,7 +1330,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
                    bool   mask_is_prefix = true,  // false: kq_mask selects cells (sparse attention's top-k)
-                int64_t   n_kv_max       = 0) const; // > 0: no mask row has more live cells (ggml_flash_attn_ext_set_n_kv_max)
+                int64_t   n_kv_max       = 0,
+            ggml_tensor * sparse_indices = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1546,7 +1547,8 @@ struct llm_graph_context {
             ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
                 int64_t   n_tail,    // the most cells sel_mask grants a row (llm_graph_input_kpool::n_tail)
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * tail_cells = nullptr) const;
 
     //
     // pooling

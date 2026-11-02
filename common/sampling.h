@@ -76,6 +76,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
 // if the sampler disagrees at some point, we stop and return the accepted tokens up to now
+// also stops after the first EOG token; no subsequent token is sampled or accepted
+// callers replaying checkpoints should exclude EOG and its suffix from drafts before decoding
 //
 //      common_sampler_sample_n(gsmpl, ctx, { idx }, {});
 //

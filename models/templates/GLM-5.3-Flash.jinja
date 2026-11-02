@@ -1,0 +1,274 @@
+[gMASK]<sop>
+{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
+{#- splice cannot forward a tool_reference block to llama-server, so it writes one line in its place for each tool a
+    tool result loads (splice ContentBlock.omissionMarker), while Claude Code adds those tools to the request's list.
+    A tool result made only of such lines, each naming a tool in the list, is read as the tool_reference blocks it
+    stands for: those tools show there, and not in the list at the top, as a deferred tool does, so a load leaves the
+    prompt before it, and the server's cache of it, as they were. The names it loads, each followed by a newline;
+    nothing for any other content. -#}
+{%- macro loaded_by(content) -%}
+    {%- if tools and content is string and content.startswith('[tool loaded: ') -%}
+        {%- set ns_ld = namespace(names='', every=true) -%}
+        {%- for line in content.split('\n') -%}
+            {%- set ns_ln = namespace(name='') -%}
+            {%- for tool in tools -%}
+                {%- set listed = tool['function'] if 'function' in tool else tool -%}
+                {%- if line == '[tool loaded: ' + listed.name + '. It can be called directly.]' -%}
+                    {%- set ns_ln.name = listed.name -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- if ns_ln.name -%}
+                {%- set ns_ld.names = ns_ld.names + ns_ln.name + '\n' -%}
+            {%- else -%}
+                {%- set ns_ld.every = false -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if ns_ld.every -%}{{- ns_ld.names -}}{%- endif -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if tools -%}
+{%- set ns_loaded = namespace(names='\n') -%}
+{%- for m in messages -%}
+    {%- if m.role == 'tool' and m.content is string and m.content.startswith('[tool loaded: ') -%}
+        {%- set ns_loaded.names = ns_loaded.names + loaded_by(m.content) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- macro tool_to_json(tool) -%}
+    {%- set ns_tool = namespace(first=true) -%}
+    {{ '{' -}}
+    {%- for k, v in tool.items() -%}
+        {%- if k != 'defer_loading' and k != 'strict' -%}
+            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}
+            {%- set ns_tool.first = false -%}
+            "{{ k }}": {{ v | tojson(ensure_ascii=False) }}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- '}' -}}
+{%- endmacro -%}
+{%- macro tool_list(refs) -%}
+    {{- '<tools>\n' -}}
+    {%- for tr in refs -%}
+        {%- for tool in tools -%}
+            {%- if 'function' in tool -%}
+                {%- set tool = tool['function'] -%}
+            {%- endif -%}
+            {%- if tool.name == tr.name -%}
+                {{- tool_to_json(tool) + '\n' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endfor -%}
+    {{- '</tools>' -}}
+{%- endmacro -%}
+{%- macro tool_references_to_response(refs) -%}
+    {{- '<tool_response>' + tool_list(refs) + '</tool_response>' -}}
+{%- endmacro -%}
+<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{% for tool in tools %}
+{%- if 'function' in tool -%}
+    {%- set tool = tool['function'] -%}
+{%- endif -%}
+{% if (tool.defer_loading is not defined or not tool.defer_loading) and ('\n' + tool.name + '\n') not in ns_loaded.names %}
+{{ tool_to_json(tool) }}
+{% endif %}
+{% endfor %}
+</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- macro emit_image() -%}<|begin_of_image|><|image|><|end_of_image|>{%- endmacro -%}
+{%- macro emit_video() -%}<|begin_of_video|><|video|><|end_of_video|>{%- endmacro -%}
+{%- macro emit_audio() -%}<|begin_of_audio|><|end_of_audio|>{%- endmacro -%}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type in ['text', 'media_marker'] -%}
+                {{- item.text -}}
+            {%- elif item is string -%}
+                {{- item -}}
+            {%- elif item is mapping and item.type in ['image', 'image_url'] -%}
+                {{- emit_image() -}}
+            {%- elif item is mapping and item.type in ['video', 'video_url'] -%}
+                {{- emit_video() -}}
+            {%- elif item is mapping and item.type in ['audio', 'audio_url', 'input_audio'] -%}
+                {{- emit_audio() -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro tool_response(text) -%}
+{{- '<tool_response>' + text + '</tool_response>' -}}
+{%- endmacro -%}
+{#- One result is one <tool_response>, whatever parts make it up: the model pairs results with calls by position.
+    Its text parts come first, in order, then the tools its tool_reference parts load. -#}
+{%- macro render_tool_content(content) -%}
+{%- if content is iterable and content is not string and content is not mapping -%}
+    {%- set parts = namespace(refs=[], text='') -%}
+    {%- for part in content -%}
+        {%- if part is mapping and part.type == 'tool_reference' -%}
+            {%- set _ = parts.refs.append(part) -%}
+        {%- else -%}
+            {%- set parts.text = parts.text + visible_text([part]) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if parts.refs -%}
+        {{- tool_response(parts.text + tool_list(parts.refs)) -}}
+    {%- else -%}
+        {{- tool_response(parts.text) -}}
+    {%- endif -%}
+{%- else -%}
+    {{- tool_response(visible_text(content)) -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_tool_response(m) -%}
+{%- set loaded = loaded_by(m.content) if m.content is string and m.content.startswith('[tool loaded: ') else '' -%}
+{%- if loaded -%}
+    {%- set ns_refs = namespace(refs=[]) -%}
+    {%- for name in loaded.split('\n') -%}
+        {%- if name -%}{%- set ns_refs.refs = ns_refs.refs + [{'type': 'tool_reference', 'name': name}] -%}{%- endif -%}
+    {%- endfor -%}
+    {{- tool_references_to_response(ns_refs.refs) -}}
+{%- elif m.content is string -%}
+    {{- tool_response(m.content) -}}
+{%- elif is_list_of_outputs(m) -%}
+    {%- for tr in m.content -%}
+        {{- render_tool_content(tr.output) -}}
+    {%- endfor -%}
+{%- else -%}
+    {{- render_tool_content(m.content) -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro id_of(obj) -%}
+    {%- if obj.tool_call_id -%}
+        {{- obj.tool_call_id -}}
+    {%- elif obj.id -%}
+        {{- obj.id -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro is_list_of_outputs(m) -%}
+    {%- if m.content and m.content[0].output is defined -%}1{%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1) -%}
+{%- for m in messages %}
+    {%- if m.role == 'user' %}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+{#- A block of tool results renders once, at its last result, from the start kept when the loop reached its first.
+    llama.cpp's Jinja builds a scope for every item of a for loop's range before it runs the loop, so a scan from a
+    block's first result to the conversation's end, broken at the block's end, paid for the whole rest of the
+    conversation at every block, and rendering a request grew with the square of its messages. For the same reason the
+    block's id checks run over its ids sorted, one pass each: checked result by result over the whole block, they grew
+    with the square of the block. The sorts are case-sensitive, as ids are compared, where Jinja's default is not;
+    llama.cpp sorts that way whatever it is asked (common/jinja/value.cpp, sort). -#}
+{%- set ns_tb = namespace(start=0) -%}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}
+{%- elif m.role == 'assistant' -%}
+<|assistant|>
+{#- llama.cpp runs every pass of this loop in one scope, where Python's Jinja starts each pass fresh, so without this
+    a message with no reasoning shows the reasoning of the one before it. GLM-4.7's official template resets it too. -#}
+{%- set reasoning_content = '' %}
+{%- set content = visible_text(m.content) %}
+{%- if m.reasoning_content is string %}
+    {%- set reasoning_content = m.reasoning_content %}
+{%- elif '</think>' in content %}
+    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
+    {%- set content = content.split('</think>')[-1] %}
+{%- endif %}
+{%- if (not clear_thinking or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+{{ '<think>' + reasoning_content +  '</think>'}}
+{%- else -%}
+{{ '<think></think>' }}
+{%- endif -%}
+{%- if content.strip() -%}
+{{ content.strip() }}
+{%- endif -%}
+{% if m.tool_calls %}
+{% for tc in m.tool_calls %}
+{%- if tc.function %}
+    {%- set tc = tc.function %}
+{%- endif %}
+{{- '<tool_call>' + tc.name -}}
+{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}
+{% endif %}
+{%- elif m.role == 'tool' -%}
+{%- if loop.first or (messages[loop.index0 - 1].role != "tool") -%}
+    {%- set ns_tb.start = loop.index0 -%}
+{%- endif -%}
+{%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+    {{- '<|observation|>' -}}
+    {%- set block_start = ns_tb.start -%}
+    {%- set block_end = loop.index0 -%}
+    {%- set ns_a = namespace(tool_calls=none) -%}
+    {%- if block_start > 0 and messages[block_start - 1].role == 'assistant' and messages[block_start - 1].tool_calls -%}
+        {%- set ns_a.tool_calls = messages[block_start - 1].tool_calls -%}
+    {%- endif -%}
+    {%- set ns_chk = namespace(can_sort=true, calls=[], results=[], placed=[], at=0) -%}
+    {%- if not ns_a.tool_calls -%}
+        {%- set ns_chk.can_sort = false -%}
+    {%- else -%}
+        {%- for tc in ns_a.tool_calls -%}
+            {%- set _ = ns_chk.calls.append({"id": id_of(tc), "at": loop.index0}) -%}
+        {%- endfor -%}
+        {%- for k in range(block_start, block_end + 1) -%}
+            {%- if is_list_of_outputs(messages[k]) -%}
+                {%- for entry in messages[k].content -%}
+                    {%- set _ = ns_chk.results.append({"id": id_of(entry), "k": k, "entry": loop.index0}) -%}
+                {%- endfor -%}
+            {%- else -%}
+                {%- set _ = ns_chk.results.append({"id": id_of(messages[k]), "k": k, "entry": none}) -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set results = ns_chk.results | sort(attribute="id", case_sensitive=true) -%}
+        {%- for r in results -%}
+            {%- if not r.id or (not loop.first and r.id == results[loop.index0 - 1].id) -%}
+                {%- set ns_chk.can_sort = false -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set calls = ns_chk.calls | sort(attribute="id", case_sensitive=true) -%}
+        {%- for c in calls -%}
+            {%- if not c.id or (not loop.first and c.id == calls[loop.index0 - 1].id) -%}
+                {%- set ns_chk.can_sort = false -%}
+            {%- elif ns_chk.at < (results | length) and results[ns_chk.at].id == c.id -%}
+                {%- set _ = ns_chk.placed.append({"at": c.at, "k": results[ns_chk.at].k, "entry": results[ns_chk.at].entry}) -%}
+                {%- set ns_chk.at = ns_chk.at + 1 -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if ns_chk.at < (results | length) -%}
+            {%- set ns_chk.can_sort = false -%}
+        {%- endif -%}
+    {%- endif -%}
+    {%- if ns_chk.can_sort -%}
+        {%- for r in ns_chk.placed | sort(attribute="at") -%}
+            {%- if r.entry is none -%}
+                {{- render_tool_response(messages[r.k]) -}}
+            {%- else -%}
+                {%- set entry = messages[r.k].content[r.entry] -%}
+                {{- render_tool_content(entry.output) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {%- for k in range(block_start, block_end + 1) -%}
+            {{- render_tool_response(messages[k]) -}}
+        {%- endfor -%}
+    {%- endif -%}
+{% endif -%}
+{%- elif m.role == 'system' -%}
+<|system|>{{ visible_text(m.content) }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    <|assistant|>{{- '<think>' -}}
+{%- endif -%}

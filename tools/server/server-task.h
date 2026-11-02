@@ -602,6 +602,8 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    // The beginning of the restorable memory, including recurrent/SWA state.
+    llama_pos pos_min = 0;
 
     size_t size() const {
         size_t res = data.size();
@@ -614,6 +616,17 @@ struct server_prompt_cache_state {
     }
 };
 
+enum class server_prompt_cache_result {
+    saved,
+    already_cached,
+    empty,
+    too_large,
+    no_space,
+    failed,
+};
+
+const char * server_prompt_cache_result_name(server_prompt_cache_result result);
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -625,19 +638,29 @@ struct server_prompt_cache {
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
-    // in tokens, 0 = no limit
+    // fallback when limit_size is 0; in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_result save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+            common_speculative * spec, int32_t id_slot, const server_prompt_cache_state * protect = nullptr,
+            bool allow_evict = true);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft,
-              common_speculative * spec, int32_t id_slot);
+    static size_t reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
+            llama_pos pos_min, int32_t n_swa);
 
-    void update();
+    server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new,
+            llama_pos pos_min, int32_t n_swa);
+
+    // consume: the slot takes the whole snapshot, so the RAM copy goes; otherwise the slot will cut it to the shared
+    // prefix and the copy stays recoverable for the conversation it belongs to
+    bool load(server_prompt & prompt, server_prompt_cache_state * selected, llama_context * ctx_tgt,
+            llama_context * ctx_dft, common_speculative * spec, int32_t id_slot, bool consume = true);
+
+    void update(const server_prompt_cache_state * protect = nullptr);
 };
 
 // used exclusively by router mode

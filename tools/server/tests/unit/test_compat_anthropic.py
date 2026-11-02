@@ -261,6 +261,50 @@ def test_anthropic_count_tokens_no_max_tokens():
 
 # Tool use tests
 
+@pytest.mark.parametrize("chosen", ["Read", "Write", "Missing"])
+def test_anthropic_named_tool_choice_validation(chosen):
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/GLM-4.7-Flash.jinja"
+    server.start()
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Call one of the tools."}],
+        "tools": [{"name": name, "description": name,
+                   "input_schema": {"type": "object", "properties": {}}}
+                  for name in ["Read", "Write"]],
+        "tool_choice": {"type": "tool", "name": chosen, "disable_parallel_tool_use": True},
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    if chosen == "Missing":
+        assert res.status_code == 400, res.body
+        assert "tool_choice function is not in tools" in res.body["error"]["message"]
+    else:
+        # The tiny model need not emit a call. test-chat verifies the generated grammar.
+        assert res.status_code == 200, res.body
+        assert res.body["type"] == "message"
+
+
+def test_anthropic_unsupported_content_keeps_the_session_going():
+    # Claude Code replays its whole history every turn: a block the server cannot represent (a PDF read as a
+    # document) must not fail every later request of the session. It is kept as a text placeholder instead.
+    server.start()
+    for content in (
+        [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+         {"type": "text", "text": "what does it say"}],
+        [{"type": "tool_result", "tool_use_id": "read-1", "content": [
+            {"type": "text", "text": "PDF file read"},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]}],
+    ):
+        res = server.make_request("POST", "/v1/messages", data={
+            "model": "test",
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": content}],
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["role"] == "assistant"
+
+
 def test_anthropic_tool_use_basic():
     """Test basic tool use"""
     server.jinja = True

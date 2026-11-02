@@ -942,11 +942,13 @@ void llama_context::sched_reserve() {
 
     // the most one graph slot's scheduler allocates (process_ubatch): a graph of graph_slot_max_tokens rows over every
     // sequence, with as many outputs as a batch of it can have, measured and not allocated; a slot's buffers grow to
-    // the graphs it holds, so graph_slots_max of these bound what the slots add to the buffers above
+    // the graphs it holds, so graph_slots_max of these bound what the slots add to the buffers above. The graph keeps
+    // every sequence (graph_reserve rounds the rows up to one per sequence): the full memory context views every
+    // stream of the cache, and a graph over fewer sequences than streams has no row count the streams divide
     std::vector<size_t> slot_buf_size(backend_ptrs.size(), 0);
     if (!graph_reuse_disable && !model.hparams.no_alloc) {
         const uint32_t n_tokens_slot = std::min(graph_slot_max_tokens, n_tokens);
-        graph_reserve(n_tokens_slot, std::min(n_seqs, n_tokens_slot), std::min(n_tokens_slot, cparams.n_outputs_max),
+        graph_reserve(n_tokens_slot, n_seqs, std::min(n_tokens_slot, cparams.n_outputs_max),
                 mctx.get(), true, slot_buf_size.data());
     }
 

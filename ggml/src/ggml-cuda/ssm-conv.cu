@@ -125,18 +125,10 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
 // Qwen3.5's alpha/beta pair folded into the conv-state update (u.ab_rows > 0, ggml_cuda_try_ssm_conv_ab): the block takes
 // rows blockIdx.x, blockIdx.x + gridDim.x, ... of the two matrices laid end to end, at most
-// GGML_CUDA_SSM_CONV_AB_MAX_ROWS, and computes each as mul_mat_vec_f does at its 256 threads, a thread here being two of
-// its threads (tid and tid + 128): each one's column pairs strided by 256 in order, one warp reduction for each, then
-// warp 0 over the eight partials and 24 zeros, so each value is the pair launch's bit for bit. The results wait in
-// ab_res for the writes after the dependency wait. Everything here is read before that wait: the weights, which no
-// kernel writes, and the activation, once its writer's release reaches the block (ssm_conv_ab_acquire), through L2
-// (ld.global.cg), where that kernel's writes are, not through this SM's L1.
-// The fold's handoff (ggml_cuda_ssm_conv_ab_slots): thread 0 acquires the slot until every one of the activation's
-// writer's blocks has released to it, the barrier orders the block's reads after that, and thread 0 takes a ticket; the
-// block with the grid's last sets the slot back to 0, after every block's acquire. The wait costs one load: the group
-// launch writing this conv's inputs, which comes after the writer, lets the kernels after it launch only after its own
-// wait (ggml_cuda_ssm_conv_ab_enabled), when the writer has ended. A slot that never fills would be a planning fault:
-// the block traps.
+// GGML_CUDA_SSM_CONV_AB_MAX_ROWS, and computes each as mul_mat_vec_f_vec does at its 256 threads, a thread here being two of
+// its threads (tid and tid + 128): each one's four column pairs strided by 256 in order, one warp reduction for each, then
+// warp 0 sums the eight partials in order, so each value is the pair launch's bit for bit. The results wait in
+// ab_res for the writes after the dependency wait. The activation's writer releases the block before this read.
 static __device__ __forceinline__ void ssm_conv_ab_acquire(const ggml_cuda_ssm_conv_state_update & u) {
     if (threadIdx.x == 0) {
         for (int i = 0; (ggml_cuda_ld_acquire(u.ab_slot) & 0xffffu) < (unsigned int) u.ab_writers; ++i) {
@@ -159,10 +151,10 @@ static __device__ __forceinline__ int ssm_conv_ab_rows(const ggml_cuda_ssm_conv_
     static_assert(2*half == block, "a thread here is two of mul_mat_vec_f's");
     __shared__ float part[block/WARP_SIZE][max_n_t];
 
-    const int warp   = threadIdx.x / WARP_SIZE;
-    const int lane   = threadIdx.x % WARP_SIZE;
-    const int ncols2 = u.ab_ncols / 2;
-    const int rows   = 2*u.ab_rows;
+    const int warp    = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int nchunks = u.ab_ncols / 8;
+    const int rows    = 2*u.ab_rows;
 
     // the block's rows into L2 first: their loads below then wait on L2, not DRAM
     if (threadIdx.x == 0) {
@@ -187,24 +179,30 @@ static __device__ __forceinline__ int ssm_conv_ab_rows(const ggml_cuda_ssm_conv_
             hi[j] = 0.0f;
         }
 #pragma unroll 5
-        for (int col2 = threadIdx.x; col2 < ncols2; col2 += block) {
-            const nv_bfloat162 tmpx = x2[col2];
+        for (int c = threadIdx.x; c < nchunks; c += block) {
 #pragma unroll
-            for (int j = 0; j < max_n_t; ++j) {
-                if (j < n_t) {
-                    const float2 tmpy = __ldcg(y2 + j*(u.ab_stride_y/2) + col2);
-                    ggml_cuda_mad(lo[j], tmpx.x, tmpy.x);
-                    ggml_cuda_mad(lo[j], tmpx.y, tmpy.y);
-                }
-            }
-            if (col2 + half < ncols2) {
-                const nv_bfloat162 tmpx_hi = x2[col2 + half];
+            for (int q = 0; q < 4; ++q) {
+                const nv_bfloat162 tmpx = x2[4*c + q];
 #pragma unroll
                 for (int j = 0; j < max_n_t; ++j) {
                     if (j < n_t) {
-                        const float2 tmpy = __ldcg(y2 + j*(u.ab_stride_y/2) + col2 + half);
-                        ggml_cuda_mad(hi[j], tmpx_hi.x, tmpy.x);
-                        ggml_cuda_mad(hi[j], tmpx_hi.y, tmpy.y);
+                        const float2 tmpy = __ldcg(y2 + j*(u.ab_stride_y/2) + 4*c + q);
+                        ggml_cuda_mad(lo[j], tmpx.x, tmpy.x);
+                        ggml_cuda_mad(lo[j], tmpx.y, tmpy.y);
+                    }
+                }
+            }
+            if (c + half < nchunks) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const nv_bfloat162 tmpx_hi = x2[4*(c + half) + q];
+#pragma unroll
+                    for (int j = 0; j < max_n_t; ++j) {
+                        if (j < n_t) {
+                            const float2 tmpy = __ldcg(y2 + j*(u.ab_stride_y/2) + 4*(c + half) + q);
+                            ggml_cuda_mad(hi[j], tmpx_hi.x, tmpy.x);
+                            ggml_cuda_mad(hi[j], tmpx_hi.y, tmpy.y);
+                        }
                     }
                 }
             }
@@ -221,15 +219,16 @@ static __device__ __forceinline__ int ssm_conv_ab_rows(const ggml_cuda_ssm_conv_
             }
         }
         __syncthreads();
-        if (warp == 0) {
+        if (warp == 0 && lane == 0) {
 #pragma unroll
             for (int j = 0; j < max_n_t; ++j) {
                 if (j < n_t) {
-                    float v = lane < block/WARP_SIZE ? part[lane][j] : 0.0f;
-                    v = warp_reduce_sum<WARP_SIZE>(v);
-                    if (lane == 0) {
-                        ab_res[n][j] = v;
+                    float v = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < block/WARP_SIZE; ++w) {
+                        v += part[w][j];
                     }
+                    ab_res[n][j] = v;
                 }
             }
         }
@@ -273,10 +272,12 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
                                                  const bool prewait, const bool state_prefetch) {
     ggml_cuda_pdl_lc();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    // Extra blocks participate in the alpha/beta fold and its handoff, but own no conv channels.
+    const bool conv_block = blockIdx.x < (uint32_t) u.conv_blocks;
 
     // state_prefetch: the block's columns of the cache row into L2 before the wait, so their DRAM latency is paid under
     // the matmul before this kernel (a hint: no result depends on it, ggml_cuda_prefetch_l2)
-    if (state_prefetch && threadIdx.x == 0) {
+    if (conv_block && state_prefetch && threadIdx.x == 0) {
         ggml_cuda_prefetch_l2(u.cache + (int64_t) u.ids[0] * u.row_stride + (int64_t) blockIdx.x * blockDim.x * (d_conv - 1),
                               (int64_t) blockDim.x * (d_conv - 1) * sizeof(float));
     }
@@ -286,16 +287,16 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
     if (u.ab_rows > 0) {
         n_ab = ssm_conv_ab_rows<max_n_t>(u, n_t, ab_res);
     } else if (u.ab_slot != nullptr) {
-        ssm_conv_ab_acquire(u); // released to, but not folded: the slot still goes back to 0
+        ssm_conv_ab_acquire(u);
     }
 
     float x[d_conv - 1 + max_n_t];
     float wc[d_conv];
-    const float * w_row = ssm_conv_w_row(u, w, w_stride, c);
+    const float * w_row = conv_block ? ssm_conv_w_row(u, w, w_stride, c) : nullptr;
 
     // prewait: w is a model weight, which no kernel writes, so it is requested before the dependency wait and arrives
     // while the qkv matmul before this kernel streams (its blocks leave this one room beside them: PQ2_MMA_LAUNCH_BOUNDS)
-    if (prewait) {
+    if (conv_block && prewait) {
 #pragma unroll
         for (int j = 0; j < d_conv; ++j) {
             wc[j] = w_row[j];
@@ -308,6 +309,9 @@ static __global__ void ssm_conv_state_update_f32(const ggml_cuda_ssm_conv_state_
             const int r = blockIdx.x + k*gridDim.x;
             u.ab_dst[(r / u.ab_rows)*u.ab_s2 + threadIdx.x*u.ab_stride_dst + r % u.ab_rows] = ab_res[k][threadIdx.x];
         }
+    }
+    if (!conv_block) {
+        return;
     }
     const float * state = u.cache + (int64_t) u.ids[0] * u.row_stride + (int64_t) c * (d_conv - 1);
 #pragma unroll
@@ -465,7 +469,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         constexpr int threads = GGML_CUDA_SSM_CONV_UPDATE_THREADS;
         GGML_ASSERT(!fuse_bias && nc == GGML_CUDA_SSM_CONV_UPDATE_D_CONV && n_s == 1 && nr % threads == 0 &&
                     n_t <= GGML_CUDA_SSM_CONV_UPDATE_MAX_N_T);
-        const ggml_cuda_kernel_launch_params launch_params(dim3(nr / threads), dim3(threads), 0, stream);
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const ggml_cuda_kernel_launch_params launch_params(dim3(std::max((int) (nr / threads), nsm)), dim3(threads), 0, stream);
         const int w_stride   = src1->nb[1] / sizeof(float);
         const int dst_stride = out->nb[1] / sizeof(float);
         // GGML_CUDA_SSM_CONV_PREWAIT_LEGACY=1: the weights after the dependency wait, as everything else
@@ -474,11 +479,9 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                              ggml_backend_buffer_get_usage(src1->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS));
         // GGML_CUDA_SSM_CONV_STATE_PREFETCH_LEGACY=1: no L2 prefetch of the cache row before the wait
         static const bool state_prefetch = !ggml_env_switch("GGML_CUDA_SSM_CONV_STATE_PREFETCH_LEGACY");
-        // the alpha/beta pair folds in only if its activation's writer released to the plan's slot and the PQ2_0 group
-        // launch writing this conv's inputs came after it, set up for the fold (ggml_cuda_try_ssm_conv_ab); then the
-        // pair's own nodes, which come later, are skipped. A slot released to is acquired either way, which sets it
-        // back to 0
+        // the pair folds in after its writer releases and the PQ2 group feeds the conv's inputs
         ggml_cuda_ssm_conv_state_update     uab = *u;
+        uab.conv_blocks = (int) (nr / threads);
         const ggml_cuda_ssm_conv_ab_plan * ab  = ctx.ssm_conv_updates().ab_plan_of(dst);
         if (ab != nullptr && ab->writers > 0) {
             uab.ab_slot    = ctx.ssm_conv_ab_slots.ptr + ab->slot;
