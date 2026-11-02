@@ -56,6 +56,19 @@ static ggml_backend_meta_split_state split_rows(const ggml_tensor * tensor, void
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
+// -sm tensor: the device's callback splits the tensors of a weights buffer by name, and nothing owns rows. q, k and v
+// ([d, n_tokens]) are cut in halves along axis 0, as a fused projection's heads are; q_heads ([d, n_head, n_batch]) in
+// halves along axis 1; everything else is mirrored, as a latent cache and a mask are.
+static ggml_backend_meta_split_state split_columns(const ggml_tensor * tensor, void * /*userdata*/) {
+    if (strcmp(tensor->name, "q") == 0 || strcmp(tensor->name, "k") == 0 || strcmp(tensor->name, "v") == 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_0, {tensor->ne[0]/2, tensor->ne[0] - tensor->ne[0]/2}, {1}, 1};
+    }
+    if (strcmp(tensor->name, "q_heads") == 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_1, {tensor->ne[1]/2, tensor->ne[1] - tensor->ne[1]/2}, {1}, 1};
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
 static bool test_rows(ggml_backend_dev_t gpu, bool explicit_layout) {
     std::array<int64_t, 4> rows = {1, 0, 2, 5};
     ggml_backend_dev_t devs[4] = {gpu, second_device(gpu), gpu, second_device(gpu)};
@@ -583,6 +596,95 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owne
     return ok;
 }
 
+// A graph of rig's two-card profile (-sm tensor), computed by the meta backend over two ranks against the CPU: the
+// weights buffer's tensors are split by split_columns, nothing owns rows, and the compute buffer's tensors take their
+// splits from them. Variant 0 is glm5next's KDA: the q, k and v projections, split by heads, concatenated for one short
+// convolution and read back as three views of the fused tensor; with one token the fused tensor's dims above the split
+// axis are 1. Variant 1 is glm5next's DSA: K and V are two permuted views of the one q8_0 latent cache at the same
+// offset, as the kv cache hands them to the attention, with the q heads split and the cache and the mask mirrored.
+static bool test_tensor_mode(ggml_backend_dev_t gpu, int variant, int64_t n_tokens) {
+    ggml_backend_dev_t devs[] = {gpu, second_device(gpu)};
+    ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 2, split_columns, nullptr), nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    std::vector<float> results[2];
+    for (int mode = 0; mode < 2; ++mode) {
+        ggml_backend_t backend = mode ? meta : cpu;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        ggml_context * weights = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
+        ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        std::vector<ggml_tensor *> inputs;
+        auto input = [&](ggml_type type, std::array<int64_t, 4> ne, const char * name) {
+            ggml_tensor * t = ggml_new_tensor(weights, type, 4, ne.data());
+            ggml_set_name(t, name);
+            inputs.push_back(t);
+            return t;
+        };
+        ggml_tensor * out;
+        if (variant == 0) {
+            const int64_t d = 64;
+            ggml_tensor * q = input(GGML_TYPE_F32, {d, n_tokens, 1, 1}, "q");
+            ggml_tensor * k = input(GGML_TYPE_F32, {d, n_tokens, 1, 1}, "k");
+            ggml_tensor * v = input(GGML_TYPE_F32, {d, n_tokens, 1, 1}, "v");
+            ggml_tensor * qkv = ggml_concat(ctx, ggml_concat(ctx, q, k, 0), v, 0);
+            ggml_tensor * Qcur = ggml_view_2d(ctx, qkv, d, n_tokens, qkv->nb[1], 0);
+            ggml_tensor * Kcur = ggml_view_2d(ctx, qkv, d, n_tokens, qkv->nb[1], d*sizeof(float));
+            ggml_tensor * Vcur = ggml_view_2d(ctx, qkv, d, n_tokens, qkv->nb[1], 2*d*sizeof(float));
+            out = ggml_add(ctx, ggml_mul(ctx, Qcur, Kcur), Vcur);
+        } else {
+            ggml_tensor * cache = input(GGML_TYPE_Q8_0, {512, 256, 1, 1}, "cache");
+            ggml_tensor * q_in = input(GGML_TYPE_F32, {512, 16, n_tokens, 1}, "q_heads");
+            ggml_tensor * mask = input(GGML_TYPE_F16, {256, 64, 1, 1}, "mask");
+            ggml_tensor * view_k = ggml_view_4d(ctx, cache, 512, 1, 256, 1, cache->nb[1], cache->nb[1], cache->nb[2], 0);
+            ggml_tensor * view_v = ggml_view_4d(ctx, cache, 512, 1, 256, 1, cache->nb[1], cache->nb[1], cache->nb[2], 0);
+            ggml_tensor * q = ggml_permute(ctx, q_in, 0, 2, 1, 3);
+            ggml_tensor * k = ggml_permute(ctx, view_k, 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(ctx, view_v, 0, 2, 1, 3);
+            out = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
+        }
+        ggml_backend_buffer_t weights_buf = ggml_backend_alloc_ctx_tensors_from_buft(weights, buft);
+        GGML_ASSERT(weights_buf != nullptr);
+        for (auto t : inputs) {
+            std::vector<float> f32(ggml_nelements(t));
+            for (size_t i = 0; i < f32.size(); ++i) { f32[i] = float(int(i % 23) - 11)/32; }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, f32.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> f16(f32.size());
+                ggml_fp32_to_fp16_row(f32.data(), f16.data(), f16.size());
+                ggml_backend_tensor_set(t, f16.data(), 0, ggml_nbytes(t));
+            } else {
+                std::vector<uint8_t> quantized(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, f32.data(), quantized.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, quantized.data(), 0, quantized.size());
+            }
+        }
+        ggml_set_output(out);
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_gallocr_t alloc = ggml_gallocr_new(buft);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        results[mode].resize(ggml_nelements(out));
+        ggml_backend_tensor_get(out, results[mode].data(), 0, ggml_nbytes(out));
+        ggml_gallocr_free(alloc);
+        ggml_backend_buffer_free(weights_buf);
+        ggml_free(ctx);
+        ggml_free(weights);
+    }
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < results[0].size(); ++i) {
+        const double delta = results[1][i] - results[0][i];
+        error += delta*delta;
+        norm += double(results[0][i])*results[0][i];
+    }
+    const bool ok = std::isfinite(error) && error < 1e-6*norm;
+    const char * names[] = {"fused projection views", "aliased q8_0 attention"};
+    printf("%s tensor mode %s, %lld tokens, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], (long long) n_tokens, norm ? error/norm : error);
+    ggml_backend_free(meta);
+    ggml_backend_free(cpu);
+    return ok;
+}
+
 static bool test_sequence_axis(ggml_backend_dev_t gpu) {
     const int captured_before = captured;
     std::array<int64_t, 4> rows = {1, 0, 2, 5};
@@ -651,6 +753,9 @@ int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--owned-op-cpu") == 0) {
         return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2])) ? 0 : 1;
     }
+    if (argc == 4 && strcmp(argv[1], "--tensor-cpu") == 0) {
+        return test_tensor_mode(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2]), atoll(argv[3])) ? 0 : 1;
+    }
     if (argc > 1 && strcmp(argv[1], "--cpu") == 0) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         bool ok = true;
@@ -659,6 +764,8 @@ int main(int argc, char ** argv) {
             ok = test_owned_ops(gpu, variant) && ok;
             ok = test_owned_ops(gpu, variant, true) && ok;
         }
+        for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
+        ok = test_tensor_mode(gpu, 1, 8) && ok;
         ok = test_scatter_views(gpu) && ok;
         ok = test_host_layout(gpu) && ok;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
@@ -672,6 +779,9 @@ int main(int argc, char ** argv) {
     if (gpu == nullptr) {
         printf("no GPU for the meta backend, skipped\n");
         return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "--tensor") == 0) {
+        return test_tensor_mode(gpu, atoi(argv[2]), atoll(argv[3])) ? 0 : 1;
     }
     if (argc > 1 && strcmp(argv[1], "--two-gpu") == 0) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -733,6 +843,8 @@ int main(int argc, char ** argv) {
         ok = test_owned_ops(gpu, variant) && ok;
         ok = test_owned_ops(gpu, variant, true) && ok;
     }
+    for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
+    ok = test_tensor_mode(gpu, 1, 8) && ok;
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

@@ -683,11 +683,26 @@ static bool ggml_backend_meta_has_stream_view(const ggml_tensor * tensor) {
     return false;
 }
 
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+
+// Whether a tensor holds rows the devices own (-sm dp): its split was declared with ggml_backend_meta_split_input, a
+// scatter or a stream view, or it was computed from a tensor that was. Each device then holds a contiguous run of the
+// tensor's bytes along the split axis. A tensor split by the device's callback (-sm tensor) holds no such run: the
+// output of a fused projection, concatenated from head-split parts, holds every device's q, then every device's k, and
+// a view of it can't be cut by byte intervals.
+static bool ggml_backend_meta_owns_rows(const ggml_tensor * tensor) {
+    if (!tensor || !ggml_backend_buffer_is_meta(tensor->buffer)) { return false; }
+    ggml_backend_meta_get_split_state(tensor, true);
+    const auto * ctx = (const ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = ctx->split_state_cache.find({tensor, true});
+    return it != ctx->split_state_cache.end() && it->second.owned_rows;
+}
+
 static bool ggml_backend_meta_slice_view(const ggml_tensor * tensor, const ggml_backend_meta_split_state & source,
         size_t n_devices, ggml_backend_meta_view_layout & layout) {
     const ggml_tensor * root = ggml_backend_meta_view_base(tensor);
     if (tensor->op != GGML_OP_VIEW || root == nullptr || !ggml_is_contiguous(root) ||
-            source.axis < 0 || source.axis >= GGML_MAX_DIMS) {
+            source.axis < 0 || source.axis >= GGML_MAX_DIMS || !ggml_backend_meta_owns_rows(root)) {
         return false;
     }
     for (int d = source.axis + 1; d < GGML_MAX_DIMS; ++d) { if (root->ne[d] != 1) { return false; } }
@@ -773,13 +788,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
-    auto owned_rows = [](const ggml_tensor * source) {
-        if (!source || !ggml_backend_buffer_is_meta(source->buffer)) { return false; }
-        ggml_backend_meta_get_split_state(source, true);
-        const auto * source_ctx = (const ggml_backend_meta_buffer_context *) source->buffer->context;
-        const auto it = source_ctx->split_state_cache.find({source, true});
-        return it != source_ctx->split_state_cache.end() && it->second.owned_rows;
-    };
+    const auto owned_rows = ggml_backend_meta_owns_rows;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -1873,14 +1882,21 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
                 }
             }
         }
-        if (t_ij->view_src && ggml_backend_meta_has_stream_view(tensor)) {
-            // Preserve alias identity after applying each device's stream offset.
+        if (t_ij->view_src) {
+            // Fold the device's view onto its root, after each device's stream offset where there is one. A permute of a
+            // cache view points at the view's device tensor above; left there, two permuted views of one cache at one
+            // offset, K and V of an absorbed attention, no longer alias on the device while the meta tensors that sized
+            // its buffers do.
             while (t_ij->view_src->view_src) {
                 t_ij->view_offs += t_ij->view_src->view_offs;
                 t_ij->view_src = t_ij->view_src->view_src;
             }
             if (t_ij->op == GGML_OP_VIEW) { memcpy(t_ij->op_params, &t_ij->view_offs, sizeof(t_ij->view_offs)); }
         }
+        // A device tensor of a view points at its root with the folded offset, whatever views it came through: the
+        // backends tell two views of one tensor apart by view_src and view_offs, as the CUDA attention does to read V
+        // from K's rows (ggml_cuda_fattn_V_same_as_K), and the meta tensor that sized their buffers has the root.
+        GGML_ASSERT(t_ij->view_src == nullptr || t_ij->view_src->view_src == nullptr);
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
         } else if (simple_buf != nullptr) {
