@@ -9736,7 +9736,16 @@ struct test_kpool_mask : public test_case {
         ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_rows, ns);
         ggml_set_name(rows, "rows");
 
-        ggml_tensor * out = ggml_kpool_mask(ctx, cells, rows, (ggml_kpool_mask_mode) mode, n_extra);
+        ggml_tensor * out;
+        if (mode == GGML_KPOOL_MASK_INDICES) {
+            ggml_tensor * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 64, n_rows, ns);
+            ggml_tensor * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, n_rows, ns);
+            ggml_set_name(selected, "selected");
+            ggml_set_name(tail, "tail");
+            out = ggml_kpool_indices(ctx, cells, rows, selected, tail, n_extra, 96);
+        } else {
+            out = ggml_kpool_mask(ctx, cells, rows, (ggml_kpool_mask_mode) mode, n_extra);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9774,6 +9783,11 @@ struct test_kpool_mask : public test_case {
                     data[k + 1] = ten(rng) == 0 ? -1 : seq(rng); // a padded row now and then
                     data[k + 2] = (q + 1)/r*r;
                     data[k + 3] = ten(rng) == 0 ? 0 : vis(rng);
+                }
+            } else if (strcmp(t->name, "selected") == 0 || strcmp(t->name, "tail") == 0) {
+                const bool selected = strcmp(t->name, "selected") == 0;
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = !selected && i%5 == 0 ? -1 : int32_t(rng()%(n_kv + (selected ? n_extra : 0)));
                 }
             } else {
                 continue;
@@ -13209,7 +13223,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // kpool_mask: a tail and pools, one and three sequences a stream, streams, dump columns, a row past a block of 32
-    for (int mode : { GGML_KPOOL_MASK_SEL, GGML_KPOOL_MASK_CAND }) {
+    for (int mode : { GGML_KPOOL_MASK_SEL, GGML_KPOOL_MASK_CAND, GGML_KPOOL_MASK_INDICES }) {
         for (int r : { 1, 4, 8 }) {
             for (auto [n_kv, n_rows] : { std::pair{256, 1}, std::pair{256, 7}, std::pair{1000, 33}, std::pair{4096, 64} }) {
                 for (auto [n_ps, ns] : { std::pair{1, 1}, std::pair{3, 1}, std::pair{1, 4} }) {
@@ -14021,6 +14035,80 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// Rebuild metadata at the same addresses while output sizes change. Check allocations before running kernels:
+// an optimizer must not retain a smaller external buffer just because a tensor address matches an older graph.
+static bool test_ssm_conv_buffer_reuse(ggml_backend_t backend, ggml_backend_t backend_cpu, const char * op_names_filter) {
+    if (op_names_filter != nullptr && strstr(op_names_filter, "SSM_CONV") == nullptr) {
+        return true;
+    }
+
+    constexpr size_t graph_size = 32;
+    std::vector<uint8_t> arena(ggml_tensor_overhead()*graph_size + ggml_graph_overhead_custom(graph_size, false));
+    ggml_init_params params = { arena.size(), arena.data(), true };
+    ggml_init_params weight_params = { ggml_tensor_overhead()*3, nullptr, true };
+    ggml_context_ptr weights(ggml_init(weight_params));
+    ggml_tensor * conv_w = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, 4, 128);
+    ggml_tensor * a_w = ggml_new_tensor_2d(weights.get(), GGML_TYPE_BF16, 32, 32);
+    ggml_tensor * b_w = ggml_new_tensor_2d(weights.get(), GGML_TYPE_BF16, 32, 32);
+    ggml_backend_buffer_ptr weight_buffer(ggml_backend_alloc_ctx_tensors(weights.get(), backend));
+    if (!weight_buffer) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_backend_t backends[] = { backend, backend_cpu };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, graph_size, false, false));
+    uintptr_t previous_a = 0;
+    for (int64_t n_t : { 1, 2048, 1, 2048 }) {
+        ggml_backend_sched_reset(sched.get());
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_t + 3, 128, 1);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 32, n_t);
+        ggml_tensor * conv = ggml_silu(ctx.get(), ggml_ssm_conv(ctx.get(), x, conv_w));
+        ggml_tensor * a = ggml_mul_mat(ctx.get(), a_w, y);
+        ggml_tensor * b = ggml_mul_mat(ctx.get(), b_w, y);
+        ggml_build_forward_expand(graph, conv);
+        ggml_build_forward_expand(graph, a);
+        ggml_build_forward_expand(graph, b);
+        ggml_set_output(a);
+        ggml_set_output(b);
+
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (!ggml_backend_supports_op(backend, node)) {
+                return true;
+            }
+            ggml_backend_sched_set_tensor_backend(sched.get(), node, backend);
+        }
+        const uintptr_t address = reinterpret_cast<uintptr_t>(a);
+        if (previous_a != 0 && address != previous_a) {
+            printf("  SSM_CONV buffer reuse: metadata address was not reused\n");
+            return false;
+        }
+        previous_a = address;
+        if (!ggml_backend_sched_alloc_graph(sched.get(), graph)) {
+            printf("  SSM_CONV buffer reuse: allocation failed\n");
+            return false;
+        }
+        for (ggml_tensor * out : { a, b }) {
+            if (out->buffer == nullptr || out->data == nullptr) {
+                return false;
+            }
+            const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(out->buffer));
+            const uintptr_t data = reinterpret_cast<uintptr_t>(out->data);
+            const size_t capacity = ggml_backend_buffer_get_size(out->buffer);
+            const size_t size = ggml_nbytes(out);
+            if (data < base || data - base > capacity || size > capacity - (data - base)) {
+                printf("  SSM_CONV buffer reuse: output exceeds buffer at n_t=%" PRId64 "\n", n_t);
+                return false;
+            }
+        }
+    }
+    printf("  SSM_CONV buffer reuse: decode/prefill allocation bounds OK\n");
+    return true;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -14159,8 +14247,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         output_printer->print_failed_tests(failed_tests);
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
+        const bool ssm_buffers_ok = test_ssm_conv_buffer_reuse(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        return n_ok == tests_run && slice_ok && ssm_buffers_ok;
     }
 
     if (mode == MODE_GRAD) {

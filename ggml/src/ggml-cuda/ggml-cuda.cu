@@ -1325,7 +1325,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
     size_t size = ggml_nbytes(tensor);
-    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) {
         size = ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor);
     } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
         size = ggml_cuda_gdn_get_alloc_size(tensor); // + the chunked prefill scratch when eligible
@@ -3735,6 +3735,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -4316,8 +4317,7 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
 // launch where there were two, and one boundary fewer on the chain from the qkv group to the recurrence. The conv's
 // blocks compute the rows before their dependency wait and write them after it (ssm_conv_ab_rows), so:
 // - the normed input reaches them by a release/acquire handoff on the plan's slot (ggml_cuda_ssm_conv_ab_slots): the
-//   kernel that writes it releases to the slot, and the conv's launch folds the pair in only if it did this evaluation
-//   (rms_norm_fwht_cuda, the only writer that releases; any other leaves the pair its own launch);
+//   writer or the PQ2 group after it releases to the slot, and the conv folds the pair in only after that release;
 // - the PQ2_0 group launch writing the conv's new inputs must come after that writer (checked when the group is
 //   dispatched: ggml_cuda_ssm_conv_ab_plan); it then lets the kernels after it launch only after its own wait
 //   (ggml_cuda_ssm_conv_ab_enabled), so the writer has ended when the conv starts and the conv's blocks never wait on
@@ -4344,14 +4344,17 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
         return;
     }
 
-    // the pair: the first nodes after the SSM_CONV but its SILU, the folded L2_NORM and views, up to 4 views apart
+    // the pair: the first computed nodes after the SSM_CONV but its SILU and the folded L2_NORM, up to 4 skipped nodes apart
     const ggml_tensor * silu = cgraph->nodes[conv_idx + 1];
+    const auto skipped = [](const ggml_tensor * t) {
+        return ggml_cuda_is_view_or_noop(t) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+    };
     int ia = conv_idx + 2;
-    while (ia < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[ia]) || cgraph->nodes[ia] == l2)) {
+    while (ia < cgraph->n_nodes && (skipped(cgraph->nodes[ia]) || cgraph->nodes[ia]->op == GGML_OP_L2_NORM)) {
         ++ia;
     }
     int ib = ia + 1;
-    while (ib < cgraph->n_nodes && ib - ia <= 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[ib])) {
+    while (ib < cgraph->n_nodes && ib - ia <= 4 && skipped(cgraph->nodes[ib])) {
         ++ib;
     }
     if (ib >= cgraph->n_nodes) {
@@ -4394,7 +4397,9 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
         return;
     }
 
-    // memory: the outputs are written when the conv runs; every kernel before it has completed by then
+    // The graph allocator owns these outputs. Fuse only if its allocation is safe for the early writes;
+    // a tensor address can be reused for a different shape when graph metadata is rebuilt.
+    // The outputs are written when the conv runs; every kernel before it has completed by then.
     const ggml_tensor * conv       = cgraph->nodes[conv_idx];
     const ggml_tensor * no_touch[] = { y, x, ids, conv, silu, l2, concat };
     for (const ggml_tensor * m : mm) {
@@ -4405,7 +4410,7 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
         }
         for (int j = conv_idx; j < ia; ++j) {
             const ggml_tensor * n = cgraph->nodes[j];
-            if (ggml_cuda_is_view_or_noop(n)) {
+            if (skipped(n)) {
                 continue;
             }
             if (ggml_cuda_ranges_overlap(m, n)) {
@@ -4423,7 +4428,7 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
     }
     for (int j = conv_idx; j < ia; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_ranges_overlap(n, y)) {
+        if (!skipped(n) && ggml_cuda_ranges_overlap(n, y)) {
             return;
         }
     }
@@ -4664,7 +4669,7 @@ static bool ggml_cuda_try_ssm_conv_state_update(ggml_backend_cuda_context & ctx,
                 ggml_cuda_try_ssm_conv_ab(ctx, cgraph, j, concat, x, ids, ctx.ssm_conv_updates().l2_norm_of(n), u);
 
                 auto & reg = ctx.ssm_conv_updates();
-                reg.updates[n] = u;
+                reg.updates.emplace(n, u);
                 reg.skipped.insert(concat);
                 reg.skipped.insert(cpys.begin(), cpys.end());
                 if (w_fused) {
@@ -6402,16 +6407,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int n = ggml_cuda_pq2_mma_group_size(*cuda_ctx, cgraph, i); n > 1) {
-        // a group writing the new inputs of a conv whose alpha/beta fold's activation is released feeds that fold
+        // a group releases the conv that folds the alpha/beta pair after its stores
         bool feeds_fold = false;
+        ggml_cuda_ssm_conv_ab_plan * fed = nullptr;
         for (auto & [conv, ab] : cuda_ctx->ssm_conv_updates().ab_plans) {
-            for (int g = 0; g < n && ab.writers > 0 && !ab.fed; ++g) {
+            for (int g = 0; g < n && !ab.fed; ++g) {
                 if (ggml_cuda_ranges_overlap(cgraph->nodes[i + g], ab.x)) {
                     ab.fed = feeds_fold = true;
+                    fed = &ab;
                 }
             }
         }
-        ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n, feeds_fold);
+        unsigned int * release_to = fed != nullptr ? cuda_ctx->ssm_conv_ab_slots.ptr + fed->slot : nullptr;
+        const int writers = ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n, feeds_fold, release_to);
+        if (fed != nullptr) {
+            fed->writers = writers;
+        }
         return n - 1;
     }
 
@@ -6950,6 +6961,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->ssm_conv_updates().reset();
             cuda_ctx->fattn_kv_live().reset();
 
+            for (int j = 0; j < cgraph->n_nodes; ++j) {
+                ggml_cuda_try_ssm_conv_state_update(*cuda_ctx, cgraph, j);
+            }
             const std::vector<ggml_cuda_pq2_prefetch> pq2_plan = ggml_cuda_pq2_prefetch_plan(*cuda_ctx, cgraph);
 
             // the paced L2 issuer beside the graph (ggml_cuda_l2_issue_plan_of): an issue starts once its heavy launch has
@@ -8562,9 +8576,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_KPOOL_MASK:
+            if (ggml_get_op_params_i32(op, 0) == GGML_KPOOL_MASK_INDICES) {
+                return op->type == GGML_TYPE_I32 && op->src[2] && op->src[3] &&
+                    op->src[2]->ne[0] + op->src[3]->ne[0] <= GGML_KPOOL_INDICES_MAX &&
+                    op->ne[1] <= 65535 && op->ne[3] <= 65535;
+            }
             // two columns a thread
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F16 &&
                 op->ne[0] % 2 == 0 && op->ne[1] <= 65535 && op->ne[3] <= 65535;
+        case GGML_OP_FLASH_ATTN_EXT_SPARSE:
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

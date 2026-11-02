@@ -1917,6 +1917,7 @@ struct ggml_cuda_ssm_conv_state_update {
     int64_t             ab_stride_dst = 0; // between an output's tokens, in floats
     int                 ab_rows       = 0;
     int                 ab_ncols      = 0;
+    int                 conv_blocks   = 0;
     // the fold's handoff slot (ggml_cuda_ssm_conv_ab_slots) and the blocks of the activation's writer that release
     // to it; set whenever that writer released to it, fold or not, since the conv's blocks are what set it back to 0
     unsigned int *      ab_slot       = nullptr;
@@ -1934,9 +1935,8 @@ static bool ggml_cuda_ssm_conv_ab_enabled() {
 }
 
 // The alpha/beta pair an SSM_CONV's update may fold in (ggml_cuda_try_ssm_conv_ab): its two MUL_MATs, the pair's
-// activation, the conv's new inputs, the fold's handoff slot, the blocks of the kernel that wrote the activation and
-// released to the slot this evaluation (0: none did), and whether the PQ2_0 group launch writing the new inputs came
-// after that release, set up for the fold (ggml_cuda_ssm_conv_ab_enabled). The conv folds the pair in only with both.
+// activation, the conv's new inputs, the fold's handoff slot, the blocks released by the writer or the PQ2 group after it,
+// and whether that group launched (ggml_cuda_ssm_conv_ab_enabled). The conv folds the pair in only with both.
 struct ggml_cuda_ssm_conv_ab_plan {
     const ggml_tensor * pair[2] = { nullptr, nullptr };
     const ggml_tensor * y       = nullptr;
@@ -1947,7 +1947,7 @@ struct ggml_cuda_ssm_conv_ab_plan {
 };
 
 // The alpha/beta folds' handoff slots, one unsigned int a fold of an evaluation, in the order the folds are planned.
-// The kernel writing a fold's activation releases to its slot, a block at a time (the low 16 bits, rms_norm_fwht_cuda);
+// The activation's writer or the PQ2 group after it releases to the slot, a block at a time (the low 16 bits);
 // every block of the conv acquires it until all the writer's blocks have, then takes a ticket (the high 16 bits), and
 // the block with the grid's last ticket sets it back to 0 (ssm_conv_ab_acquire). A slot is released to and acquired once
 // an evaluation, so every slot is 0 between two evaluations, and a reset reaches the slot's next use across the boundary

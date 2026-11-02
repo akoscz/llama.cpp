@@ -219,8 +219,8 @@ static __device__ __forceinline__ void mmvq_pq2_mma_body(
 
     // lc_after_wait: the block lets the next kernel launch only once its consumers have passed the dependency wait, so
     // that kernel's launch means every kernel before this one has ended (each waited on the one before it): the conv
-    // that folds the alpha/beta pair in then never waits on its handoff slot beside the writer's blocks
-    // (ssm_conv_ab_acquire; the handoff, not this, makes the writer's stores visible to it)
+    // that folds the alpha/beta pair in then never waits on its handoff slot beside the writer's blocks. The release to
+    // the slot makes the writer's stores visible to it (ssm_conv_ab_acquire)
     if (!lc_after_wait) {
         ggml_cuda_pdl_lc();
     }
@@ -474,9 +474,15 @@ PQ2_MMA_GROUP_LAUNCH_BOUNDS
 static __global__ void mmvq_pq2_mma_group(
         const __grid_constant__ pq2_mma_group grp, const block_q8_1 * y, const int ncols, const int nb, const int n_tiles,
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const ggml_cuda_pq2_prefetch next,
-        const bool lc_after_wait) {
+        const bool lc_after_wait, unsigned int * release_to) {
     mmvq_pq2_mma_body<M, 1, false, true>(nullptr, nullptr, &grp, y, nullptr, nullptr, 0, ncols, nb, n_tiles, nkb, nslots,
         evict_first, stride_col_y, 0, next, lc_after_wait);
+    if (release_to != nullptr) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            ggml_cuda_red_release_add(release_to, 1);
+        }
+    }
 }
 
 template <int M>
@@ -484,9 +490,15 @@ __launch_bounds__((PQ2_MMA_NW + 1)*32, 1)
 static __global__ void mmvq_pq2_mma_group_168(
         const __grid_constant__ pq2_mma_group grp, const block_q8_1 * y, const int ncols, const int nb, const int n_tiles,
         const int nkb, const int nslots, const int evict_first, const int stride_col_y, const ggml_cuda_pq2_prefetch next,
-        const bool lc_after_wait) {
+        const bool lc_after_wait, unsigned int * release_to) {
     mmvq_pq2_mma_body<M, 1, false, true>(nullptr, nullptr, &grp, y, nullptr, nullptr, 0, ncols, nb, n_tiles, nkb, nslots,
         evict_first, stride_col_y, 0, next, lc_after_wait);
+    if (release_to != nullptr) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            ggml_cuda_red_release_add(release_to, 1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -645,8 +657,9 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 }
 
 template <int M>
-static void pq2_mma_launch_group(const pq2_mma_plan & p, const pq2_mma_group & grp, const block_q8_1 * y, int ncols,
-        int nb, int n_tiles, int stride_col_y, const ggml_cuda_pq2_prefetch & next, bool fold_beside, cudaStream_t stream) {
+static int pq2_mma_launch_group(const pq2_mma_plan & p, const pq2_mma_group & grp, const block_q8_1 * y, int ncols,
+        int nb, int n_tiles, int stride_col_y, const ggml_cuda_pq2_prefetch & next, bool fold_beside,
+        unsigned int * release_to, cudaStream_t stream) {
     const int nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int nblocks = std::min(nsm, n_tiles);
     const ggml_cuda_kernel_launch_params params(dim3(nblocks), dim3((PQ2_MMA_NW + 1)*32),
@@ -655,18 +668,19 @@ static void pq2_mma_launch_group(const pq2_mma_plan & p, const pq2_mma_group & g
     if (regs_legacy || !fold_beside) {
         CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_pq2_mma_group_168<M>), PQ2_MMA_SMEM_MAX);
         ggml_cuda_kernel_launch(mmvq_pq2_mma_group_168<M>, params, grp, y, ncols, nb, n_tiles, p.nkb, p.nslots,
-            (int) pq2_mma_get_config().evict_first, stride_col_y, next, fold_beside);
-        return;
+            (int) pq2_mma_get_config().evict_first, stride_col_y, next, fold_beside, release_to);
+        return nblocks;
     }
     CUDA_SET_SHARED_MEMORY_LIMIT((mmvq_pq2_mma_group<M>), PQ2_MMA_SMEM_MAX);
     ggml_cuda_kernel_launch(mmvq_pq2_mma_group<M>, params, grp, y, ncols, nb, n_tiles, p.nkb, p.nslots,
-        (int) pq2_mma_get_config().evict_first, stride_col_y, next, fold_beside);
+        (int) pq2_mma_get_config().evict_first, stride_col_y, next, fold_beside, release_to);
+    return nblocks;
 }
 
-void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
+int ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
                                   int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
-                                  const ggml_cuda_pq2_prefetch & next, bool fold_beside, cudaStream_t stream) {
+                                  const ggml_cuda_pq2_prefetch & next, bool fold_beside, unsigned int * release_to, cudaStream_t stream) {
     GGML_ASSERT(n >= 2 && n <= PQ2_MMA_MAX_GROUP);
     const pq2_mma_plan p = pq2_mma_make_plan(ncols_x, 1);
     GGML_ASSERT(p.m > 0 && "ggml_cuda_mmvq_pq2_mma_usable holds a plan");
@@ -689,8 +703,8 @@ void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const 
 
     const block_q8_1 * y = (const block_q8_1 *) vy;
     switch (p.m) {
-#define PQ2_MMA_CASE(M) case M: pq2_mma_launch_group<M>(p, grp, y, (int) ncols_dst, nb, (int) n_tiles, (int) stride_col_y, \
-                                    next, fold_beside, stream); break;
+#define PQ2_MMA_CASE(M) case M: return pq2_mma_launch_group<M>(p, grp, y, (int) ncols_dst, nb, (int) n_tiles, (int) stride_col_y, \
+                                    next, fold_beside, release_to, stream);
         PQ2_MMA_CASE(1)
         PQ2_MMA_CASE(2)
         PQ2_MMA_CASE(3)

@@ -1116,9 +1116,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "FLASH_ATTN_EXT_SPARSE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1233,9 +1234,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "flash_attn_ext_sparse(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5501,10 +5503,28 @@ struct ggml_tensor * ggml_flash_attn_ext(
 }
 
 
+struct ggml_tensor * ggml_flash_attn_ext_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * indices,
+        float                 scale) {
+    GGML_ASSERT(indices && indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[0] > 0 && indices->ne[0] <= INT32_MAX);
+    GGML_ASSERT(indices->ne[1] == q->ne[1] && indices->ne[2] == 1 && indices->ne[3] == q->ne[3]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && q->ne[2] % k->ne[2] == 0 && q->ne[2] % v->ne[2] == 0);
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, NULL, scale, 0.0f, 0.0f);
+    result->op = GGML_OP_FLASH_ATTN_EXT_SPARSE;
+    result->src[5] = indices;
+    ggml_set_op_params_i32(result, 5, (int32_t) indices->ne[0]);
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -5513,7 +5533,7 @@ void ggml_flash_attn_ext_set_prec(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
@@ -5528,7 +5548,7 @@ void ggml_flash_attn_ext_add_sinks(
         return;
     }
 
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
     GGML_ASSERT(a->src[4] == NULL);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
@@ -5539,14 +5559,14 @@ void ggml_flash_attn_ext_add_sinks(
 void ggml_flash_attn_ext_set_mask_prefix(
         struct ggml_tensor * a,
         bool                 mask_prefix) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     ggml_set_op_params_i32(a, 4, mask_prefix ? 1 : 0); // after scale, max_bias, logit_softcap and prec
 }
 
 bool ggml_flash_attn_ext_get_mask_prefix(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     return ggml_get_op_params_i32(a, 4) != 0;
 }
@@ -5554,15 +5574,16 @@ bool ggml_flash_attn_ext_get_mask_prefix(
 void ggml_flash_attn_ext_set_n_kv_max(
         struct ggml_tensor * a,
         int32_t              n_kv_max) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
     GGML_ASSERT(n_kv_max >= 0);
+    GGML_ASSERT(a->op != GGML_OP_FLASH_ATTN_EXT_SPARSE || n_kv_max == a->src[5]->ne[0]);
 
     ggml_set_op_params_i32(a, 5, n_kv_max); // after the mask_prefix hint
 }
 
 int32_t ggml_flash_attn_ext_get_n_kv_max(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     return ggml_get_op_params_i32(a, 5);
 }
@@ -6770,6 +6791,34 @@ struct ggml_tensor * ggml_kpool_mask(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+struct ggml_tensor * ggml_kpool_indices(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * selected,
+        struct ggml_tensor  * tail,
+        int64_t               n_extra,
+        int64_t               bound) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && ggml_is_contiguous(cells) && cells->ne[1] == 2);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && rows->ne[0] == 4);
+    GGML_ASSERT(rows->ne[2] == cells->ne[3] && rows->ne[3] == 1);
+    GGML_ASSERT(selected->type == GGML_TYPE_I32 && tail->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(selected) && ggml_is_contiguous(tail));
+    GGML_ASSERT(selected->ne[1] == rows->ne[1] && selected->ne[2] == rows->ne[2] && selected->ne[3] == 1);
+    GGML_ASSERT(tail->ne[1] == rows->ne[1] && tail->ne[2] == rows->ne[2] && tail->ne[3] == 1);
+    GGML_ASSERT(bound >= selected->ne[0] + tail->ne[0] && bound <= INT32_MAX);
+    GGML_ASSERT(n_extra >= 0 && cells->ne[0] <= INT32_MAX - n_extra);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, bound, rows->ne[1], 1, rows->ne[2]);
+    result->op = GGML_OP_KPOOL_MASK;
+    result->src[0] = cells;
+    result->src[1] = rows;
+    result->src[2] = selected;
+    result->src[3] = tail;
+    ggml_set_op_params_i32(result, 0, GGML_KPOOL_MASK_INDICES);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_extra);
+    return result;
+}
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
     size = ggml_hash_size(size);

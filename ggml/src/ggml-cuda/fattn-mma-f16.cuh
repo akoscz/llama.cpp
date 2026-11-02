@@ -511,7 +511,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
                 const int i = i0 + threadIdx.x;
 
                 const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                tile_mask[i] = index >= 0 ? mask_base[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
+                tile_mask[i] = index >= 0 ? (mask_base ? mask_base[int64_t(j_vram)*stride_mask + index] : half(0.0f)) : half(-INFINITY);
             }
         }
         return;
@@ -2264,8 +2264,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            dstk_val.x = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.x / KQ_rowsum_j;
+                            dstk_val.y = KQ_rowsum_j == 0.0f ? 0.0f : dstk_val.y / KQ_rowsum_j;
                         }
 
                         if (is_fixup) {
@@ -2481,7 +2481,7 @@ static __global__ void flash_attn_ext_f16(
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+        const half   * mask_h = !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
@@ -2616,16 +2616,23 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_heads(ggml_backend_cuda_cont
         shared_memory_limit_raised[id] = true;
     }
 
+    const ggml_tensor * direct = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5] : nullptr;
+    const ggml_tensor * shape = direct ? direct : mask;
     const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
-    const size_t  nrows    = size_t(mask->ne[1]) * mask->ne[3];
-    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), size_t(n_kv_max) * nrows + nrows); // the indices, then the counts
-    const int32_t * counts = indices.ptr + size_t(n_kv_max) * nrows;
-    ggml_cuda_flash_attn_ext_compact_mask(mask, indices.ptr, indices.ptr + size_t(n_kv_max) * nrows, n_kv_max, ctx.stream());
+    const size_t nrows = size_t(shape->ne[1])*shape->ne[3];
+    ggml_cuda_pool_alloc<int32_t> storage(ctx.pool(), direct ? nrows : size_t(n_kv_max)*nrows+nrows);
+    const int32_t * indices = direct ? (const int32_t *) direct->data : storage.ptr;
+    int32_t * counts = direct ? storage.ptr : storage.ptr + size_t(n_kv_max)*nrows;
+    if (direct) {
+        ggml_cuda_flash_attn_ext_sparse_counts(direct, counts, ctx.stream());
+    } else {
+        ggml_cuda_flash_attn_ext_compact_mask(mask, storage.ptr, counts, n_kv_max, ctx.stream());
+    }
 
     launch_fattn<DV, 1, ncols2_heads>(ctx, dst, kernel_heads, geom_heads.nwarps, geom_heads.nbytes_shared, geom_heads.nbatch_fa,
-        !deq_K, !deq_K, true, warp_size, true, true, {indices.ptr, true, nullptr, counts});
+        !deq_K, !deq_K, true, warp_size, true, true, {indices, true, nullptr, counts});
     launch_fattn<DV, 1, ncols2>(ctx, dst, kernel_seams, geom_tile.nwarps, geom_tile.nbytes_shared, geom_tile.nbatch_fa,
-        !deq_K, !deq_K, true, warp_size, true, true, {indices.ptr, false, kernel_tile, counts});
+        !deq_K, !deq_K, true, warp_size, true, true, {indices, false, kernel_tile, counts});
     return true;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

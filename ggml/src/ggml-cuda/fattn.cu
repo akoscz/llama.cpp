@@ -284,6 +284,24 @@ void ggml_cuda_flash_attn_ext_gather_k_q8_0(
 // GGML_CUDA_FATTN_SPARSE_HEADS_SWITCHOVER=1: where the 32-head tile takes the launch (sparse_heads_take), the gather reads a
 // query's cells once for 32 heads, so it wins from 2 queries' cells, 4160 for GLM's 2080. Between that and the 8-head
 // tile's switch-over it replaces the masked dense kernel, a different summation: not bit for bit.
+static __global__ void flash_attn_sparse_counts(const int32_t * indices, int32_t * counts, int bound, int64_t nrows) {
+    const int64_t row = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (row >= nrows) { return; }
+    const int32_t * ids = indices + row*bound;
+    int lo = 0, hi = bound;
+    while (lo < hi) {
+        const int mid = lo + (hi-lo)/2;
+        if (ids[mid] >= 0) { lo = mid+1; } else { hi = mid; }
+    }
+    counts[row] = lo;
+}
+
+void ggml_cuda_flash_attn_ext_sparse_counts(const ggml_tensor * indices, int32_t * counts, cudaStream_t stream) {
+    const int64_t nrows = indices->ne[1]*indices->ne[3];
+    flash_attn_sparse_counts<<<(nrows+255)/256, 256, 0, stream>>>((const int32_t *) indices->data, counts, indices->ne[0], nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int device, const ggml_tensor * dst, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(device, dst, ncols2);
@@ -305,6 +323,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int device, const g
     const int32_t n_kv_max = ggml_flash_attn_ext_get_n_kv_max(dst);
     const int ncols2_gather = heads_switchover && ncols2 == 8 && ggml_cuda_flash_attn_ext_mma_f16_sparse_heads_take(device, dst) ? 32 : ncols2;
     const int64_t n_gather = std::min<int64_t>(Q->ne[1], 64/ncols2_gather) * n_kv_max;
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && n_kv_max > 0;
+    }
     return !sparse_legacy && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && mask->type == GGML_TYPE_F16 && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
@@ -401,7 +422,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = (mask || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -544,10 +565,11 @@ static bool ggml_cuda_fattn_mma_sparse_deq(const int device, const ggml_tensor *
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
-    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 || Q->ne[2] / K->ne[2] <= 4) {
+    if ((!mask && dst->op != GGML_OP_FLASH_ATTN_EXT_SPARSE) || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 || Q->ne[2] / K->ne[2] <= 4) {
         return false;
     }
     for (const ggml_tensor * t : {Q, mask}) {
+        if (!t) { continue; }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
             if (t->nb[i] % 16 != 0) {
                 return false; // use_gqa_opt's alignment
@@ -899,6 +921,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        return BEST_FATTN_KERNEL_NONE;
+#else
+        const ggml_tensor * ids = dst->src[5];
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) || Q->type != GGML_TYPE_F32 ||
+                Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 || K->ne[2] != 1 || V->ne[2] != 1 ||
+                K->ne[1] % FATTN_KQ_STRIDE != 0 || gqa_ratio <= 4 || !ids ||
+                ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[0] % 32 != 0 ||
+                ids->ne[1] != Q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != Q->ne[3]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        for (const ggml_tensor * t : {Q, K, V}) {
+            if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (!ggml_is_quantized(t->type)) {
+                for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                    if (t->nb[i] % 16 != 0) { return BEST_FATTN_KERNEL_NONE; }
+                }
+            }
+        }
+        return BEST_FATTN_KERNEL_MMA_F16;
+#endif
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -1047,7 +1094,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
