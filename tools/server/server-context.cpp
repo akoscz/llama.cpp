@@ -523,6 +523,19 @@ struct server_slot {
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
+        if (!spec_draft.empty()) {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+            const auto eog = std::find_if(spec_draft.begin(), spec_draft.end(), [&](llama_token token) {
+                return llama_vocab_is_eog(vocab, token);
+            });
+            if (eog != spec_draft.end()) {
+                // Leave EOG as the final sample, never an evaluated/cached draft.
+                // This also lets a checkpoint replay finish instead of restoring at the same EOG again.
+                spec_draft.erase(eog, spec_draft.end());
+                spec_is_replay = false; // the replay's extra terminal sample is no longer a draft token
+            }
+        }
+
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding

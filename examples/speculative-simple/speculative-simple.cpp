@@ -218,6 +218,12 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // EOG must remain the terminal sample, including when replaying a checkpoint:
+        // evaluating it as a draft would stop verification at the same EOG on every replay.
+        draft.erase(std::find_if(draft.begin(), draft.end(), [&](llama_token token) {
+            return llama_vocab_is_eog(vocab, token);
+        }), draft.end());
+
         // always have a token to evaluate from before - id_last
         common_batch_clear(batch_tgt);
         common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
