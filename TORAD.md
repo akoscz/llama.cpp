@@ -215,8 +215,9 @@ audits. The org's required checks (secret scan, workflow lint, PR title) run fro
 from files here. When a merge from `prism` brings workflows back, delete them again in the
 merge commit. Builds of this fork are made and verified per GPU.
 
-`.gitleaks.toml` narrows three false-positive classes found in the full 10,688-commit upstream
+`.gitleaks.toml` narrows five false-positive classes: three found in the full 10,688-commit upstream
 history (Actions cache-key names, xxhash's `data_key_lo/hi`, a README placeholder), each opened
-at its commit on 2026-09-20 and none live. Proven on gitleaks v8.21.2 with canaries: control 15
+at its commit on 2026-09-20 and none live, and two added on 2026-11-02 (the glm53 asset hashes
+torad's own `scripts/glm53/README.md` records, and the PNG fixture in upstream's server tests). Proven on gitleaks v8.21.2 with canaries: control 15
 (12 findings + 3 canaries, no config), red 3 of 3 canaries still firing with the config — two of
 them on the same line as an allowlisted value — and green 0 on `main`.
