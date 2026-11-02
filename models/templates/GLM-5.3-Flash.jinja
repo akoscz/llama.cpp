@@ -47,8 +47,8 @@
     {%- endfor -%}
     {{- '}' -}}
 {%- endmacro -%}
-{%- macro tool_references_to_response(refs) -%}
-    {{- '<tool_response><tools>\n' -}}
+{%- macro tool_list(refs) -%}
+    {{- '<tools>\n' -}}
     {%- for tr in refs -%}
         {%- for tool in tools -%}
             {%- if 'function' in tool -%}
@@ -59,7 +59,10 @@
             {%- endif -%}
         {%- endfor -%}
     {%- endfor -%}
-    {{- '</tools></tool_response>' -}}
+    {{- '</tools>' -}}
+{%- endmacro -%}
+{%- macro tool_references_to_response(refs) -%}
+    {{- '<tool_response>' + tool_list(refs) + '</tool_response>' -}}
 {%- endmacro -%}
 <|system|>
 # Tools
@@ -107,31 +110,23 @@ For each function call, output the function name and arguments within the follow
 {%- macro tool_response(text) -%}
 {{- '<tool_response>' + text + '</tool_response>' -}}
 {%- endmacro -%}
+{#- One result is one <tool_response>, whatever parts make it up: the model pairs results with calls by position.
+    Its text parts come first, in order, then the tools its tool_reference parts load. -#}
 {%- macro render_tool_content(content) -%}
-{%- set parts = namespace(has_refs=false, refs=[], text='') -%}
 {%- if content is iterable and content is not string and content is not mapping -%}
+    {%- set parts = namespace(refs=[], text='') -%}
     {%- for part in content -%}
-        {%- if part.type == 'tool_reference' -%}{%- set parts.has_refs = true -%}{%- endif -%}
-    {%- endfor -%}
-{%- endif -%}
-{%- if parts.has_refs -%}
-    {%- for part in content -%}
-        {%- if part.type == 'tool_reference' -%}
-            {%- if parts.text -%}
-                {{- tool_response(parts.text) -}}
-                {%- set parts.text = '' -%}
-            {%- endif -%}
+        {%- if part is mapping and part.type == 'tool_reference' -%}
             {%- set _ = parts.refs.append(part) -%}
         {%- else -%}
-            {%- if parts.refs -%}
-                {{- tool_references_to_response(parts.refs) -}}
-                {%- set parts.refs = [] -%}
-            {%- endif -%}
             {%- set parts.text = parts.text + visible_text([part]) -%}
         {%- endif -%}
     {%- endfor -%}
-    {%- if parts.refs -%}{{- tool_references_to_response(parts.refs) -}}{%- endif -%}
-    {%- if parts.text -%}{{- tool_response(parts.text) -}}{%- endif -%}
+    {%- if parts.refs -%}
+        {{- tool_response(parts.text + tool_list(parts.refs)) -}}
+    {%- else -%}
+        {{- tool_response(parts.text) -}}
+    {%- endif -%}
 {%- else -%}
     {{- tool_response(visible_text(content)) -}}
 {%- endif -%}
