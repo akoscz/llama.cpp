@@ -854,6 +854,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[1];
         }
+        if (tensor->op == GGML_OP_MUL_MAT && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis < GGML_MAX_DIMS) {
+            GGML_ASSERT(tensor->src[0]->ne[src_ss[1].axis] == 1);
+            return src_ss[1];
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
@@ -1014,6 +1019,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_get_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_ASSERT(tensor->src[0]->ne[2] == tensor->src[1]->ne[1]);
+            return src_ss[0];
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
                 tensor->src[0]->ne[2] == 1 && tensor->src[0]->ne[3] == 1) {
             ggml_backend_meta_split_state ret = src_ss[1];
@@ -1034,6 +1043,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_rope = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(tensor->src[0]->ne[2] == tensor->src[1]->ne[0]);
+            return src_ss[0];
+        }
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return src_ss[0];
     };
@@ -1101,6 +1114,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};

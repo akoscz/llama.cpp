@@ -342,7 +342,23 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant) {
             return t;
         };
         ggml_tensor * out;
-        if (variant >= 5) {
+        if (variant == 7) {
+            auto * q = input(GGML_TYPE_F32, {128, 2, 4, 1}, 2);
+            auto * positions = input(GGML_TYPE_I32, {4, 1, 1, 1}, 0);
+            out = ggml_rope(ctx, q, positions, 64, 0);
+        } else if (variant == 8) {
+            auto * x = input(GGML_TYPE_F32, {6, 128, 4, 1}, 2);
+            auto * w = input(GGML_TYPE_F32, {4, 128, 1, 1}, -1);
+            out = ggml_ssm_conv(ctx, x, w);
+        } else if (variant == 9) {
+            auto * x = input(GGML_TYPE_F32, {128, 3, 2, 4}, 3);
+            auto * w = input(GGML_TYPE_F32, {128, 64, 2, 1}, -1);
+            out = ggml_mul_mat(ctx, w, x);
+        } else if (variant == 10) {
+            auto * cache = input(GGML_TYPE_F32, {128, 64, 4, 1}, 2);
+            auto * indices = input(GGML_TYPE_I32, {8, 4, 1, 1}, 1);
+            out = ggml_get_rows(ctx, cache, indices);
+        } else if (variant >= 5) {
             const int snapshots = variant == 5 ? 1 : 3;
             ggml_tensor * q = input(GGML_TYPE_F32, {128, 2, 3, 4}, 3);
             ggml_tensor * k = input(GGML_TYPE_F32, {128, 2, 3, 4}, 3);
@@ -431,7 +447,7 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant) {
         norm += double(results[0][i])*results[0][i];
     }
     const bool ok = variant == 4 ? results[0] == results[1] : std::isfinite(error) && error < 1e-6*norm;
-    const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots"};
+    const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots", "RoPE", "SSM convolution", "batched projection", "batched cache gather"};
     printf("%s owned %s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], norm ? error/norm : error);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
@@ -491,11 +507,14 @@ int main(int argc, char ** argv) {
 #endif
     ggml_log_set(log_cb, nullptr);
     ggml_backend_dev_t gpu = nullptr;
+    if (argc == 3 && strcmp(argv[1], "--owned-op-cpu") == 0) {
+        return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2])) ? 0 : 1;
+    }
     if (argc > 1 && strcmp(argv[1], "--cpu") == 0) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         bool ok = true;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-        for (int variant = 0; variant < 7; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
+        for (int variant = 0; variant < 11; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
         ok = test_scatter_views(gpu) && ok;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && ok; }
         return ok ? 0 : 1;
@@ -564,7 +583,7 @@ int main(int argc, char ** argv) {
     ok = test_scatter_views(gpu) && ok;
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && ok; }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-    for (int variant = 0; variant < 7; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
+    for (int variant = 0; variant < 11; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
