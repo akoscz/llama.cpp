@@ -132,13 +132,22 @@ static gguf_context_ptr glm_gguf() {
     return ret;
 }
 
-static llama_model_ptr glm_model(size_t seed) {
+static llama_model_ptr glm_model(size_t seed, std::vector<ggml_backend_dev_t> devices = {},
+        llama_split_mode split = LLAMA_SPLIT_MODE_LAYER) {
     auto gguf = glm_gguf();
+    if (!devices.empty()) {
+        llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+        ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    }
     llama_model_params mparams = llama_model_default_params();
     mparams.progress_callback = [](float, void *) { return true; };
     mparams.load_mtp = true;
-    ggml_backend_dev_t no_devs[1] = { nullptr };
-    mparams.devices = no_devs;
+    devices.push_back(nullptr);
+    mparams.devices = devices.data();
+    mparams.split_mode = split;
     llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &seed, mparams));
     if (!model) {
         throw std::runtime_error("failed to create the GLM model");
@@ -167,13 +176,18 @@ struct server_rig {
     std::vector<float> logits;
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
-               ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512) : n_max(n_max) {
+               ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
+               bool private_streams = false, bool q8_cache = false) : n_max(n_max) {
         params.n_ctx      = 8192;
         params.cache_type_idx = type_idx;
         params.n_parallel = N_SEQ;
         params.n_batch    = 512;
         params.n_ubatch   = n_ubatch_tgt;
-        params.kv_unified = true;
+        params.kv_unified = !private_streams;
+        if (private_streams) {
+            params.n_ctx = N_SEQ*1024;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
         params.cpuparams.n_threads       = 4;
         params.cpuparams_batch.n_threads = 4;
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -181,6 +195,10 @@ struct server_rig {
         params.speculative.draft.n_min = n_min;
         params.speculative.draft.n_ubatch = n_ubatch_dft;
         params.speculative.draft.mtp_adaptive = adaptive;
+        if (q8_cache) {
+            params.cache_type_k = params.cache_type_v = params.cache_type_s = params.cache_type_idx = GGML_TYPE_Q8_0;
+            params.speculative.draft.cache_type_k = params.speculative.draft.cache_type_v = GGML_TYPE_Q8_0;
+        }
         const auto limits = common_speculative_get_output_limits(params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
         params.n_outputs_max         = limits.total;
         params.n_outputs_max_per_seq = limits.per_seq;
@@ -1113,7 +1131,79 @@ static bool test_device_h_rows(llama_model * model) {
     return true;
 }
 
-int main(void) {
+static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cache) {
+    auto baseline = glm_model(1234, {devices.front()});
+    auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
+    set_env("LLAMA_MTP_DEVICE_H", "1");
+    server_rig ref(baseline.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
+    server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
+    set_env("LLAMA_MTP_DEVICE_H", nullptr);
+    std::mt19937 rng_ref(5), rng_dp(5);
+    for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
+        ref.request(seq, rng_ref, 150 + 17*seq);
+        dp.request(seq, rng_dp, 150 + 17*seq);
+    }
+    size_t greedy_accepted = 0;
+    size_t forced_counts[N_MAX + 1] = {};
+    for (int round = 0; round < 16; ++round) {
+        const std::vector<llama_seq_id> order = round % 2 ? std::vector<llama_seq_id>{1, 2, 0} : std::vector<llama_seq_id>{2, 0, 1};
+        ref.draft(order);
+        dp.draft(order);
+        std::vector<llama_pos> before;
+        for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
+            before.push_back(ref.seqs[seq].n_past);
+            if (ref.seqs[seq].draft.size() != N_MAX || dp.seqs[seq].draft.size() != N_MAX) {
+                return fail("DP draft round did not produce n_max tokens");
+            }
+            if (ref.seqs[seq].draft != dp.seqs[seq].draft) { return fail("DP draft tokens differ from the unsplit model"); }
+        }
+        const auto first = ref.verify(order);
+        dp.verify(order);
+        const auto top = [](const server_rig & rig, int row) {
+            const float * start = rig.logits.data() + row*rig.n_vocab;
+            return llama_token(std::max_element(start, start + rig.n_vocab) - start);
+        };
+        for (llama_seq_id seq : order) {
+            int accepted = 0;
+            const auto & draft = ref.seqs[seq].draft;
+            for (int i = 0; i <= int(draft.size()); ++i) {
+                const auto a = top(ref, first.at(seq) + i), b = top(dp, first.at(seq) + i);
+                if (a != b) { return fail("DP verification token differs from the unsplit model"); }
+                if (i == int(draft.size()) || draft[i] != a) { break; }
+                ++accepted;
+            }
+            greedy_accepted += accepted;
+            if (round >= 8) {
+                accepted = (round + seq) % (N_MAX + 1);
+                ++forced_counts[accepted];
+                if (top(ref, first.at(seq) + accepted) != top(dp, first.at(seq) + accepted)) {
+                    return fail("DP correction after controlled acceptance differs");
+                }
+            }
+            for (auto * rig : {&ref, &dp}) {
+                common_speculative_accept(rig->spec.get(), seq, accepted);
+                rig->seqs[seq].n_past = before[seq] + 1 + accepted;
+                rig->seqs[seq].id_last = top(*rig, first.at(seq) + accepted);
+                if (!llama_memory_seq_rm(llama_get_memory(rig->tgt.get()), seq, rig->seqs[seq].n_past, -1)) {
+                    return fail("DP verification rollback failed");
+                }
+                if (!llama_memory_seq_rm(llama_get_memory(rig->init->context()), seq, rig->seqs[seq].n_past, -1)) {
+                    return fail("DP draft cache rollback failed");
+                }
+            }
+        }
+        if (round == 7) {
+            ref.request(1, rng_ref, 83);
+            dp.request(1, rng_dp, 83);
+        }
+    }
+    for (auto count : forced_counts) { if (count == 0) { return fail("DP acceptance coverage is incomplete"); } }
+    printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
+        devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
+    return true;
+}
+
+int main(int argc, char ** argv) {
     common_init();
     common_log_set_verbosity_thold(LOG_LEVEL_WARN);
     llama_log_set(log_errors, nullptr);
@@ -1121,6 +1211,24 @@ int main(void) {
 
     bool ok = true;
     try {
+        if (argc == 3 && strcmp(argv[1], "--dp-device") == 0) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> devices;
+            for (const auto & name : string_split(argv[2], ",")) {
+                auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) { throw std::runtime_error("unknown DP device " + name); }
+                devices.push_back(device);
+            }
+            if (devices.empty()) { throw std::runtime_error("DP devices are empty"); }
+            for (size_t count : {2u, 4u}) {
+                std::vector<ggml_backend_dev_t> ranks;
+                for (size_t i = 0; i < count; ++i) { ranks.push_back(devices[i % devices.size()]); }
+                for (const bool q8 : {false, true}) { ok = test_dp(ranks, q8) && ok; }
+            }
+            llama_backend_free();
+            return ok ? 0 : 1;
+        }
+        if (argc != 1) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,...]"); }
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
             { "baseline",  test_baseline  },

@@ -1215,6 +1215,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (tensor->op == GGML_OP_PAD && ggml_is_empty(tensor->src[0])) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         if (tensor->op == GGML_OP_VIEW && (tensor->flags & GGML_TENSOR_FLAG_META)) {
             const auto source = ggml_backend_meta_get_split_state(tensor->src[0], true);
             GGML_ASSERT(source.axis == GGML_BACKEND_SPLIT_AXIS_2 && source.n_segments == 1 && source.nr[0] == 1);
@@ -1281,7 +1284,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                GGML_ABORT("unknown split for %s (%s) source %zu %s (%s) [%lld,%lld,%lld,%lld]",
+                    tensor->name, ggml_op_name(tensor->op), i, tensor->src[i]->name, ggml_op_name(tensor->src[i]->op),
+                    (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1],
+                    (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3]);
+            }
         }
 
         if ((tensor->flags & GGML_TENSOR_FLAG_META) && (tensor->op == GGML_OP_GET_ROWS || tensor->op == GGML_OP_SET_ROWS)) {
