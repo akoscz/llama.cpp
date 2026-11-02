@@ -87,6 +87,61 @@ struct view_graph {
     }
 };
 
+static bool test_owned_cache_views(ggml_backend_dev_t gpu, ggml_type type) {
+    ggml_backend_dev_t devices[] = {gpu, gpu, gpu, gpu};
+    ggml_backend_dev_t meta = ggml_backend_meta_device(devices, 4, mirrored, nullptr);
+    ggml_backend_t backend = ggml_backend_dev_init(meta, nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = {backend, cpu};
+    ggml_context * weights = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * cache = ggml_new_tensor_3d(weights, type, 64, 16, 8);
+    const int64_t streams[] = {1, 0, 2, 5};
+    ggml_backend_meta_split_input(cache, 2, streams, 4);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, ggml_backend_dev_buffer_type(meta));
+    GGML_ASSERT(buffer);
+    bool ok = ggml_backend_buffer_get_size(buffer) < ggml_nbytes(cache);
+    std::vector<float> data(ggml_nelements(cache));
+    for (size_t i = 0; i < data.size(); ++i) { data[i] = 127.0f*(1 + i/32); }
+    std::vector<uint8_t> bytes(ggml_nbytes(cache));
+    GGML_ASSERT(ggml_quantize_chunk(type, data.data(), bytes.data(), 0, 16*8, 64, nullptr) == bytes.size());
+    ggml_backend_tensor_set(cache, bytes.data(), 0, bytes.size());
+    for (int kind = 0; kind < 3; ++kind) {
+        ggml_context * ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        ggml_tensor * view;
+        if (kind == 1) {
+            view = ggml_view_4d(ctx, cache, 32, 2, 7, 4, ggml_row_size(type, 32), cache->nb[1], cache->nb[2], cache->nb[2] + 2*cache->nb[1]);
+        } else {
+            view = ggml_view_2d(ctx, cache, 64, 7, cache->nb[1], 5*cache->nb[2] + 3*cache->nb[1]);
+            if (kind == 2) { view = ggml_view_1d(ctx, view, 128, ggml_row_size(type, 64)); }
+        }
+        ggml_tensor * out = ggml_scale(ctx, ggml_cast(ctx, view, GGML_TYPE_F32), 2.0f);
+        ggml_set_output(out);
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        std::vector<float> result(ggml_nelements(out));
+        bool case_ok = true;
+        for (int step = 0; step < 4; ++step) {
+            GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+            for (size_t i = 0; i < result.size(); ++i) {
+                const size_t src = kind == 1 ? ((1 + i/(64*7))*16 + 2)*64 + i%(64*7) : (5*16 + (kind == 2 ? 4 : 3))*64 + i;
+                case_ok = case_ok && result[i] == 2.0f*data[src];
+            }
+        }
+        printf("%s owned %s cache view %d: %zu values\n", case_ok ? "ok  " : "FAIL", ggml_type_name(type), kind, result.size());
+        ok = case_ok && ok;
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(weights);
+    return ok;
+}
+
 int main() {
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
@@ -150,6 +205,9 @@ int main() {
     ggml_backend_free(cpu);
     ggml_backend_buffer_free(buf_w);
     ggml_free(ctx_w);
+
+    ok = test_owned_cache_views(gpu, GGML_TYPE_F32) && ok;
+    ok = test_owned_cache_views(gpu, GGML_TYPE_Q8_0) && ok;
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

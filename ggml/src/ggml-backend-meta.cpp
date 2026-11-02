@@ -614,6 +614,65 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
     return true;
 }
 
+struct ggml_backend_meta_view_layout {
+    ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+    size_t offsets[GGML_BACKEND_META_MAX_DEVICES] = {};
+};
+
+static bool ggml_backend_meta_slice_view(const ggml_tensor * tensor, const ggml_backend_meta_split_state & source,
+        size_t n_devices, ggml_backend_meta_view_layout & layout) {
+    const ggml_tensor * root = tensor->view_src;
+    if (tensor->op != GGML_OP_VIEW || root == nullptr || !ggml_is_contiguous(root) ||
+            source.axis < 0 || source.axis >= GGML_MAX_DIMS || source.n_segments != 1 || source.nr[0] != 1) {
+        return false;
+    }
+    for (int d = source.axis + 1; d < GGML_MAX_DIMS; ++d) { if (root->ne[d] != 1) { return false; } }
+    if (source.axis == 0 && ggml_blck_size(root->type) != 1) { return false; }
+    const size_t stride = root->nb[source.axis];
+    const size_t begin = tensor->view_offs;
+    size_t owner_begin = 0;
+    if (ggml_is_contiguous(tensor)) {
+        const int axis = ggml_n_dims(tensor) - 1;
+        const size_t unit_bytes = tensor->nb[axis];
+        const int64_t unit_elements = axis == 0 ? ggml_blck_size(tensor->type) : 1;
+        const size_t end = begin + ggml_nbytes(tensor);
+        layout.split.axis = ggml_backend_meta_split_axis(axis);
+        for (size_t j = 0; j < n_devices; ++j) {
+            const size_t owner_end = owner_begin + source.ne[j]*stride;
+            const size_t lo = std::max(begin, owner_begin);
+            const size_t hi = std::min(end, owner_end);
+            if (hi > lo) {
+                if ((hi - lo) % unit_bytes != 0) { return false; }
+                layout.split.ne[j] = (hi - lo)/unit_bytes * unit_elements;
+                layout.offsets[j] = lo - owner_begin;
+            }
+            owner_begin = owner_end;
+        }
+        return true;
+    }
+    // A cache view can shorten the cell axis while keeping the full stride between streams.
+    const int axis = ggml_n_dims(tensor) - 1;
+    if (tensor->nb[axis] != stride) { return false; }
+    ggml_tensor plane = *tensor;
+    plane.ne[axis] = 1;
+    const size_t inner_offset = begin % stride;
+    if (ggml_nbytes(&plane) > stride - inner_offset) { return false; }
+    const size_t first = begin / stride;
+    const size_t end = first + tensor->ne[axis];
+    layout.split.axis = ggml_backend_meta_split_axis(axis);
+    for (size_t j = 0; j < n_devices; ++j) {
+        const size_t owner_end = owner_begin + source.ne[j];
+        const size_t lo = std::max(first, owner_begin);
+        const size_t hi = std::min(end, owner_end);
+        if (hi > lo) {
+            layout.split.ne[j] = hi - lo;
+            layout.offsets[j] = (lo - owner_begin)*stride + inner_offset;
+        }
+        owner_begin = owner_end;
+    }
+    return true;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
@@ -1015,6 +1074,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             return ret;
         }
 
+        if (tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr) {
+            ggml_backend_meta_view_layout layout;
+            const auto root_split = ggml_backend_meta_get_split_state(tensor->view_src, true);
+            if (ggml_backend_meta_slice_view(tensor, root_split, n_bufs, layout)) { return layout.split; }
+        }
+
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
@@ -1410,6 +1475,9 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
     int64_t gather_offset = 0;
     const bool scatter = tensor->op == GGML_OP_RESHAPE && (tensor->flags & GGML_TENSOR_FLAG_META);
     int64_t scatter_offset = 0;
+    ggml_backend_meta_view_layout view_layout;
+    const bool sliced_view = tensor->op == GGML_OP_VIEW && tensor->view_src != nullptr &&
+        ggml_backend_meta_slice_view(tensor, ggml_backend_meta_get_split_state(tensor->view_src, true), n_simple_bufs, view_layout);
 
     simple_tensors.clear();
     simple_tensors.reserve(n_simple_bufs);
@@ -1459,7 +1527,9 @@ static void ggml_backend_meta_buffer_make_simple_tensors(
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
-            if (scatter) {
+            if (sliced_view) {
+                t_ij->view_offs = view_layout.offsets[j];
+            } else if (scatter) {
                 t_ij->view_offs += scatter_offset * tensor->nb[split_dim];
                 scatter_offset += split_state.ne[j];
                 memset(t_ij->op_params, 0, sizeof(t_ij->op_params));
