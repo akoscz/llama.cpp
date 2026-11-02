@@ -4393,7 +4393,8 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
             block = b;
         }
     }
-    if (block != 2*GGML_CUDA_SSM_CONV_UPDATE_THREADS) {
+    // The fold reads eight columns per chunk and has no tail.
+    if (block != 2*GGML_CUDA_SSM_CONV_UPDATE_THREADS || w0->ne[0] % 8 != 0) {
         return;
     }
 
