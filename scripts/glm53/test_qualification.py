@@ -1,11 +1,17 @@
 """The paid window must use pinned bytes, matched serving and real device coverage."""
 import copy
+import contextlib
 import hashlib
+import io
 import itertools
+import json
 import re
+import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from qualification import (BASELINE_COMMIT, device_cases, check_run_identity, check_quality, check_stop_at,
                            verify_files, validate_arch_table, validate_device_csv)
@@ -259,6 +265,95 @@ class QualificationTest(unittest.TestCase):
                         if bool(re.search(pattern, text)) != (kda == 1):
                             wrong.append((case["name"], text))
         self.assertEqual(wrong[:3], [])
+
+
+class ServingRecipeTest(unittest.TestCase):
+    def setUp(self):
+        import serve
+        self.serve = serve
+
+    def test_retained_recipe_has_no_experimental_profile(self):
+        args = self.serve.arguments(["--model", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf"])
+        argv, env = self.serve.make_plan(args)
+        self.assertEqual(argv, [str(self.serve.ROOT / "build/bin/llama-server"),
+            "-m", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf",
+            "-ngl", "99", "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on",
+            "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ctki", "q8_0",
+            "-b", "2048", "-ub", "2048", "--prompt-step", "1024",
+            "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(self.serve.TEMPLATE),
+            "--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
+            "--spec-draft-mtp-vocab", str(self.serve.DRAFT_VOCAB), "--spec-draft-mtp-adaptive", "0.18",
+            "-c", "524288", "-np", "3", "--kv-unified", "--cache-ram", "32768",
+            "--no-cache-idle-slots", "--metrics", "--host", "127.0.0.1", "--port", "8102",
+            "--log-timestamps"])
+        self.assertEqual(env, {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
+            "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
+            "LLAMA_INDEXER_Q8_QUERY": "1", "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
+            "LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0",
+            "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
+            "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
+        self.assertNotIn("--glm53-profile", argv)
+
+    def test_depth_and_responsiveness_options_are_independent(self):
+        for depth in ["1", "2", "off"]:
+            args = self.serve.arguments(["--model", "/models/target.gguf", "--mtp-depth", depth,
+                                         "--prompt-step", "0", "--host", "0.0.0.0", "--port", "8090"])
+            argv, _ = self.serve.make_plan(args)
+            self.assertNotIn("--mmproj", argv)
+            self.assertEqual(argv[argv.index("--prompt-step") + 1], "0")
+            self.assertEqual(argv[argv.index("--host") + 1], "0.0.0.0")
+            self.assertEqual(argv[argv.index("--port") + 1], "8090")
+            if depth == "off":
+                self.assertFalse(any(arg.startswith("--spec-") for arg in argv))
+            else:
+                self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
+
+    def test_hidden_engine_settings_do_not_override_the_recipe(self):
+        args = self.serve.arguments(["--model", "/models/target.gguf"])
+        _, settings = self.serve.make_plan(args)
+        inherited = {"PATH": "/bin", "HOME": "/home/operator", "GGML_CUDA_Q8_TMA": "1",
+                     "LLAMA_ARG_GLM53_PROFILE": "sm120-balanced", "LLAMA_ARG_MODEL": "wrong.gguf",
+                     "LLAMA_KPOOL_DIRECT_INDICES": "1", "CUDA_LAUNCH_BLOCKING": "1",
+                     "CUDA_VISIBLE_DEVICES": "9", "LD_LIBRARY_PATH": "/wrong/build"}
+        actual = self.serve.execution_environment(settings, inherited)
+        self.assertEqual(actual, {"PATH": "/bin", "HOME": "/home/operator", **settings})
+
+    def test_dry_run_never_executes_and_does_not_require_model_downloads(self):
+        args = self.serve.arguments(["--model", "/missing/model;literal.gguf", "--server", "/missing/server with spaces",
+                                     "--dry-run"])
+        output = io.StringIO()
+        with mock.patch.object(self.serve.os, "execve") as execute, contextlib.redirect_stdout(output):
+            self.assertEqual(self.serve.main(args), 0)
+        execute.assert_not_called()
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan["argv"][0], "/missing/server with spaces")
+        self.assertEqual(plan["argv"][2], "/missing/model;literal.gguf")
+
+    def test_real_launch_checks_inputs_and_executes_without_a_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model;literal.gguf"
+            args = self.serve.arguments(["--model", str(model), "--server", sys.executable])
+            with mock.patch.object(self.serve.os, "execve") as execute:
+                with self.assertRaisesRegex(ValueError, "model"):
+                    self.serve.main(args)
+                execute.assert_not_called()
+                model.touch()
+                self.serve.main(args)
+                executable, argv, env = execute.call_args.args
+                self.assertEqual(executable, str(Path(sys.executable).resolve()))
+                self.assertEqual(argv[2], str(model))
+                self.assertEqual(env["LLAMA_KPOOL_DIRECT_INDICES"], "0")
+
+    def test_published_assets_have_the_pinned_bytes_and_vocabulary_shape(self):
+        self.serve.verify_assets()
+        data = self.serve.DRAFT_VOCAB.read_bytes()
+        self.assertEqual(len(data), 393216)
+        ids = struct.unpack("<98304i", data)
+        self.assertEqual(len(set(ids)), 98304)
+        self.assertTrue(set(range(256)).issubset(ids))
+        self.assertTrue(set(range(154820, 154856)).issubset(ids))
+        self.assertTrue(all(0 <= token <= 154855 for token in ids))
 
 
 if __name__ == "__main__":
