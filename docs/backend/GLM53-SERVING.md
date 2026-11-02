@@ -163,6 +163,12 @@ that an effort setting disables reasoning.
 
 ## Measurement scope
 
+The measurements below were collected before PR #92 was rebased onto
+`ddf1d49b3` (main after PR #109). The combined branch includes PR #108's
+device-resident MTP/token-embedding work and PR #109's peer-copy reductions.
+Local builds and regression checks do not qualify that combined build on GPUs;
+remeasure it before treating these rates as its current performance.
+
 The exact build, request workload, raw measurements, and remaining limitations
 belong with the associated [PR #92](https://github.com/torad-labs/llama.cpp/pull/92)
 qualification record. The earlier SM120 bundle's 200 tok/s target and historical
