@@ -54,6 +54,7 @@ python3 scripts/glm53/serve.py \
   --server ./build/bin/llama-server \
   --model /models/GLM-5.3/IQ3_XXS/GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf \
   --mmproj /models/GLM-5.3/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+  --mtp-depth off \
   --dry-run
 ```
 
@@ -111,6 +112,14 @@ rewrites or omits. Large context allocation is a capacity setting, not evidence
 that every context depth, three fully occupied histories, or every image shape
 has been tested. This recipe does not enable the separate 1M-context profile.
 
+Q8 indexer queries are a retained lossy setting: rounding can change pool
+selection near score ties. Use `--indexer-query f32` to disable query rounding
+for a comparison; `--indexer-query q8` is the default. This option changes query
+scoring only, leaving the Q8 indexer/KV caches unchanged. Matched eight-token
+probes on fresh servers diverged at token eight at 32k and token seven at 128k,
+for both cold and warm requests. The checks do not establish coding-quality
+equivalence or tell which continuation is better.
+
 ## API and history
 
 OpenAI-compatible chat request:
@@ -162,4 +171,54 @@ context allocation, or a passing synthetic coding fixture do not establish a
 GPU throughput ceiling or broad coding/reasoning quality. Direct sparse indices
 and the prior bundled profiles are not promoted by this recipe.
 
-The November 2 sweep measured warm raw-completion decoding at 32k and 128k tokens, with three repetitions. With three active sessions, median server rates were 32.45/29.54 tokens per second per request at MTP depth two and 57.09/37.41 at depth one. Single-session medians were 138.27/162.38 at depth two and 182.74/134.73 at depth one. These repeated-public-code requests used 128 output tokens, temperature zero, and a 512k allocation; they are not general coding scores or guaranteed rates. Depth one also passed the staged native tool-loop fixture with a new duplicate-key requirement on turn two. For concurrent coding, start by comparing `--mtp-depth 1`; retain depth two as a comparison for a single long-context session. Target-only and broader workload qualification remain separate checks.
+The November 2 sweep measured warm raw-completion decoding at 32k and 128k
+tokens, with three repetitions. Values below are median server decode tokens per
+second **per request**, including the three-active-session columns.
+
+| Prompt | MTP off, single | MTP 1, single | MTP 2, single | MTP off, three active | MTP 1, three active | MTP 2, three active |
+|---|---:|---:|---:|---:|---:|---:|
+| 32k | 131.56 | 182.74 | 138.27 | 67.84 | 57.09 | 32.45 |
+| 128k | 125.73 | 134.73 | 162.38 | 51.88 | 37.41 | 29.54 |
+
+For predominantly concurrent coding, start with `--mtp-depth off`, as in the
+launch example. Compare `--mtp-depth 1` for one shorter session and
+`--mtp-depth 2` for one longer session. Omitting the option retains the original
+depth-two configuration; the launcher does not switch modes automatically.
+These sequential configuration sweeps used repeated public code, 128 output
+tokens, temperature zero, and a 512k allocation. They are not general coding
+scores or guaranteed rates, and an opposite-order full-model repeat remains
+outstanding. This recommendation applies to warm concurrent histories. In a
+separate 128k cold-prefill overlap leg, the existing warm response fell to
+3.43 tokens/s with MTP off, 4.72 at depth one, and 6.04 at depth two; the new
+request's client time to first output was 38.33, 43.29, and 41.92 seconds,
+respectively. A mode that wins with warm sessions can lose while another session
+prefills. These overlap legs were single observations, not tail percentiles.
+
+Depth one passed the staged native tool-loop fixture, and MTP off passed its
+OpenAI-compatible counterpart. Both introduced a new duplicate-key requirement
+on turn two, required another implementation change, and passed all eight
+follow-up checks. These are bounded synthetic tests. Workload quality and cache
+retention must be checked alongside throughput when changing serving settings.
+
+A capacity-pressure check filled three separate 163,840-token histories, then
+replaced one with a 262,144-token prompt. Both earlier histories returned with
+163,836 cached tokens and only four prompt tokens evaluated. The run exercised
+an allocation-related restore failure: the host snapshot remained recoverable,
+an idle slot was saved and cleared, and the retry succeeded. Returning first
+output took 5.40 and 3.55 seconds including client transfer and restore work;
+cache reuse does not make host-to-device restoration free. This check used MTP
+off and the 32 GiB host-cache budget; smaller budgets can require intentional
+eviction.
+
+One target-only 128k overlap comparison changed `--prompt-step` from 1024 to
+256. The existing warm response improved from 3.43 to 5.63 server tokens/s,
+but the cold request's client time to first output increased from 38.33 to
+48.67 seconds. The recipe retains 1024; compare 256 when protecting an existing
+stream matters more than admitting a new long prompt. This single comparison
+does not establish a latency percentile or a universal optimum.
+
+The real-model recurrent rollback test also passed all four cases on the two
+GPUs: three rows removed from a nine-row batch, and one, two, or three rows
+removed from a four-row verification batch. It used a 512-token test context,
+Q8 caches, and a rounding-aware error bound with one-token-early/late controls;
+it is not a full long-context distribution test.

@@ -26,6 +26,7 @@ def arguments(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8102)
     parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
+    parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
     parser.add_argument("--prompt-step", type=int, default=1024, help="Prompt tokens per step alongside generation; 0 removes the cap")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -53,7 +54,8 @@ def make_plan(args):
     env = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
         "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
-        "LLAMA_INDEXER_Q8_QUERY": "1", "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
+        "LLAMA_INDEXER_Q8_QUERY": "1" if args.indexer_query == "q8" else "0",
+        "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
         "LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0",
         "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
         "LD_LIBRARY_PATH": str(server.parent),

@@ -296,10 +296,12 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertNotIn("--glm53-profile", argv)
 
     def test_depth_and_responsiveness_options_are_independent(self):
-        for depth in ["1", "2", "off"]:
+        for depth, query in itertools.product(["1", "2", "off"], ["q8", "f32"]):
             args = self.serve.arguments(["--model", "/models/target.gguf", "--mtp-depth", depth,
+                                         "--indexer-query", query,
                                          "--prompt-step", "0", "--host", "0.0.0.0", "--port", "8090"])
-            argv, _ = self.serve.make_plan(args)
+            argv, env = self.serve.make_plan(args)
+            self.assertEqual(env["LLAMA_INDEXER_Q8_QUERY"], "1" if query == "q8" else "0")
             self.assertNotIn("--mmproj", argv)
             self.assertEqual(argv[argv.index("--prompt-step") + 1], "0")
             self.assertEqual(argv[argv.index("--host") + 1], "0.0.0.0")
