@@ -1,4 +1,5 @@
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 from utils import *
 
 # We use a F16 MOE gguf as main model, and q4_0 as draft model
@@ -51,6 +52,51 @@ def test_with_and_without_draft():
     tokens_draft = res.body["tokens"]
 
     assert tokens_no_draft == tokens_draft
+
+
+def test_draft_respects_batch_capacity():
+    global server
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.model_file = server.model_draft
+    server.n_slots = 2
+    server.n_ctx = 2048
+    server.n_batch = 32
+    server.n_ubatch = 32
+    server.spec_draft_n_min = 1
+    server.spec_draft_n_max = 48
+    server.server_continuous_batching = True
+
+    def complete(slot):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": ["Once upon a time", "A little girl found a"][slot],
+            "id_slot": slot,
+            "temperature": 0.0,
+            "n_predict": 96,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "return_tokens": True,
+            "n_probs": 2,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    draft_model = server.model_draft
+    server.model_draft = None
+    server.spec_type = None
+    server.start()
+    plain = [complete(slot) for slot in range(2)]
+    server.stop()
+
+    server.model_draft = draft_model
+    server.spec_type = "draft-simple"
+    server.start()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        drafted = list(pool.map(complete, range(2)))
+    for expected, actual in zip(plain, drafted):
+        assert actual["timings"]["draft_n"] > 0
+        assert actual["tokens"] == expected["tokens"]
+        assert len(actual["completion_probabilities"]) == len(actual["tokens"])
 
 
 def test_draft_acceptance_floor():
