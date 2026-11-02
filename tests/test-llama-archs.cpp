@@ -2107,6 +2107,147 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
+// a server with more slots than a graph slot holds rows (graph_slot_max_tokens, 32 rows) must load, which reserves the
+// slot graph over every stream of the cache, then answer the two-token probe common_context_can_seq_rm makes at load
+// and a step with one row on every sequence
+static bool test_glm_many_slots(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_seq   = 40;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(n_seq, n_vocab, seed);
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx      = 64*n_seq;
+    params.n_batch    = 512;
+    params.n_ubatch   = 512;
+    params.n_seq_max  = n_seq;
+    params.kv_unified = false;
+    params.n_threads  = params.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    if (!ctx) {
+        LOG_ERR("GLM many slots: no context for %d sequences\n", n_seq);
+        return false;
+    }
+
+    const auto finite = [&](int32_t row, const char * what) {
+        const float * logits = llama_get_logits_ith(ctx.get(), row);
+        if (!logits) {
+            LOG_ERR("GLM many slots: %s: no logits for row %d\n", what, row);
+            return false;
+        }
+        for (int v = 0; v < n_vocab; ++v) {
+            if (!std::isfinite(logits[v])) {
+                LOG_ERR("GLM many slots: %s: row %d logit %d is %f\n", what, row, v, logits[v]);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // the probe at load: two tokens on one sequence, the last an output, the other sequences idle
+    {
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, tokens[0], 0, {0}, false);
+        common_batch_add(batch, tokens[1], 1, {0}, true);
+        const int result = llama_decode(ctx.get(), batch);
+        llama_batch_free(batch);
+        if (result) {
+            LOG_ERR("GLM many slots: the two-token probe failed (%d)\n", result);
+            return false;
+        }
+        if (!finite(-1, "probe")) return false;
+    }
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+
+    // one row on every sequence, every row an output: more rows than a graph slot holds
+    {
+        llama_batch batch = llama_batch_init(n_seq, 0, 1);
+        for (int s = 0; s < n_seq; ++s) {
+            common_batch_add(batch, tokens[s], 0, {s}, true);
+        }
+        const int result = llama_decode(ctx.get(), batch);
+        llama_batch_free(batch);
+        if (result) {
+            LOG_ERR("GLM many slots: the step over %d sequences failed (%d)\n", n_seq, result);
+            return false;
+        }
+        for (int s = 0; s < n_seq; ++s) {
+            if (!finite(s, "every sequence")) return false;
+        }
+    }
+    return true;
+}
+
+// the MTP head's masked nextn rows (llama_set_embeddings_nextn masked) are the batch's output rows: the drafter reads
+// them by output index. A step with fewer outputs than rows must hand back the output rows, not the first rows
+static bool test_glm_nextn_masked_rows(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
+    auto * model = pair.first.get();
+    const int n_embd  = llama_model_n_embd_out(model);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto tokens = get_tokens(2, n_vocab, seed);
+
+    const auto make = [&](bool masked) {
+        llama_context_params params = llama_context_default_params();
+        params.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+        params.n_ctx      = 256;
+        params.n_batch    = 64;
+        params.n_ubatch   = 64;
+        params.n_seq_max  = 2;
+        params.n_threads  = params.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        if (!ctx) throw std::runtime_error("nextn masked rows: failed to create a context");
+        llama_set_embeddings_nextn(ctx.get(), true, masked);
+        return ctx;
+    };
+    llama_context_ptr masked = make(true), unmasked = make(false);
+
+    // two rows on one sequence with distinct hidden inputs, only the second an output
+    std::vector<float> hidden((size_t) 2*n_embd);
+    for (int i = 0; i < 2; ++i) {
+        for (int k = 0; k < n_embd; ++k) hidden[(size_t) i*n_embd + k] = 0.05f*(i + 1)*(1.0f + (k % 7));
+    }
+    const auto rows = [&](llama_context * ctx, const char * what) -> const float * {
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, tokens[0], 0, {0}, false);
+        common_batch_add(batch, tokens[1], 1, {0}, true);
+        batch.embd = hidden.data();
+        const int rc = llama_decode(ctx, batch);
+        batch.embd = nullptr;
+        llama_batch_free(batch);
+        if (rc) {
+            LOG_ERR("GLM nextn masked rows: the %s decode failed (%d)\n", what, rc);
+            return nullptr;
+        }
+        return llama_get_embeddings_nextn(ctx);
+    };
+    const float * h_masked   = rows(masked.get(),   "masked");
+    const float * h_unmasked = rows(unmasked.get(), "unmasked");
+    if (!h_masked || !h_unmasked) return false;
+
+    // the one masked row is the output row, the unmasked read's second row
+    const std::vector<float> got(h_masked, h_masked + n_embd);
+    const std::vector<float> want(h_unmasked + n_embd, h_unmasked + 2*n_embd);
+    const std::vector<float> other(h_unmasked, h_unmasked + n_embd);
+    if (nmse(other, want) < 1e-6) {
+        LOG_ERR("GLM nextn masked rows: the two rows do not differ, the check cannot tell them apart\n");
+        return false;
+    }
+    const double err = nmse(got, want);
+    if (!(err < 1e-6)) {
+        LOG_ERR("GLM nextn masked rows: the masked row is not the output row (nmse %g against it, %g against the first row)\n",
+                err, nmse(got, other));
+        return false;
+    }
+    return true;
+}
+
+
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     struct user_data_t {
         struct {
@@ -2283,6 +2424,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         if (arch == LLM_ARCH_GLM5NEXT && !test_glm_nextn_store(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL nextn store\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_nextn_masked_rows(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL nextn masked rows\033[0m";
+                        }
+                        if (arch == LLM_ARCH_GLM5NEXT && !test_glm_many_slots(seed, dc.devs, dc.split_mode, dc.tensor_split)) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL many slots\033[0m";
                         }
                     }
 
