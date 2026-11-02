@@ -1788,6 +1788,211 @@ static void test_tools_oaicompat_json_conversion() {
                   common_chat_tools_to_json_oaicompat({ special_function_tool }).dump(2));
 }
 
+static json anthropic_tools_request() {
+    return json::parse(R"({"messages":[{"role":"user","content":"inspect the file"}],"tools":[
+        {"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{}}},
+        {"name":"Write","description":"write a file","input_schema":{"type":"object","properties":{}}}
+    ]})");
+}
+
+static void test_anthropic_tool_choices() {
+    auto request = anthropic_tools_request();
+    request["tool_choice"] = {{"type", "tool"}, {"name", "Read"}, {"disable_parallel_tool_use", true}};
+    auto converted = server_chat_convert_anthropic_to_oai(request);
+    assert_equals(json::parse(R"({"type":"function","function":{"name":"Read"}})").dump(), converted.at("tool_choice").dump());
+    assert_equals(false, converted.at("parallel_tool_calls").get<bool>());
+
+    server_chat_params opt;
+    opt.tmpls = read_templates("models/templates/GLM-4.7-Flash.jinja");
+    opt.use_jinja = true;
+    std::vector<raw_buffer> files;
+    auto forced = oaicompat_chat_params_parse(converted, opt, files);
+    assert_contains(forced.at("grammar").get<std::string>(), "Read");
+    assert_not_contains(forced.at("grammar").get<std::string>(), "Write");
+    assert_equals(false, forced.at("grammar_lazy").get<bool>());
+    assert_contains(forced.at("prompt").get<std::string>(), "write a file");
+    const auto matches = [](const json & params, const std::string & output) {
+        auto grammar = build_grammar(params.at("grammar").get<std::string>());
+        return match_string(params.at("generation_prompt").get<std::string>() + output, grammar.get());
+    };
+    assert_equals(true, matches(forced, "<tool_call>Read</tool_call>"));
+    assert_equals(false, matches(forced, "<tool_call>Write</tool_call>"));
+    assert_equals(false, matches(forced, "<tool_call>Read</tool_call><tool_call>Read</tool_call>"));
+
+    request["tool_choice"] = {{"type", "any"}, {"disable_parallel_tool_use", false}};
+    converted = server_chat_convert_anthropic_to_oai(request);
+    assert_equals(std::string("required"), converted.at("tool_choice").get<std::string>());
+    assert_equals(true, converted.at("parallel_tool_calls").get<bool>());
+    auto parallel = oaicompat_chat_params_parse(converted, opt, files);
+    assert_equals(true, matches(parallel, "<tool_call>Read</tool_call><tool_call>Write</tool_call>"));
+
+    request["tool_choice"] = {{"type", "none"}};
+    converted = server_chat_convert_anthropic_to_oai(request);
+    assert_equals(std::string("none"), converted.at("tool_choice").get<std::string>());
+    auto none = oaicompat_chat_params_parse(converted, opt, files);
+    assert_equals(false, none.contains("grammar"));
+    assert_equals(false, none.at("parse_tool_calls").get<bool>());
+
+    request["tool_choice"] = {{"type", "tool"}, {"name", "Missing"}};
+    bool rejected = false;
+    try {
+        converted = server_chat_convert_anthropic_to_oai(request);
+        oaicompat_chat_params_parse(converted, opt, files);
+    } catch (const std::exception &) {
+        rejected = true;
+    }
+    assert_equals(true, rejected);
+}
+
+static void test_anthropic_block_order() {
+    auto request = json::parse(R"({"messages":[{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"first","content":"first result"},
+        {"type":"text","text":"between"},
+        {"type":"tool_result","tool_use_id":"second","content":"second result"},
+        {"type":"text","text":"after"}
+    ]}]})");
+    auto messages = common_chat_msgs_parse_oaicompat(server_chat_convert_anthropic_to_oai(request).at("messages"));
+    assert_equals(size_t(4), messages.size());
+    assert_equals(std::string("first"), messages[0].tool_call_id);
+    assert_equals(std::string("between"), messages[1].render_content());
+    assert_equals(std::string("second"), messages[2].tool_call_id);
+    assert_equals(std::string("after"), messages[3].render_content());
+
+    request["messages"][0] = json::parse(R"({"role":"assistant","content":[
+        {"type":"thinking","thinking":"check first","signature":"opaque"},
+        {"type":"text","text":"before"},
+        {"type":"tool_use","id":"read","name":"Read","input":{}},
+        {"type":"text","text":"after"}
+    ]})");
+    messages = common_chat_msgs_parse_oaicompat(server_chat_convert_anthropic_to_oai(request).at("messages"));
+    assert_equals(size_t(2), messages.size());
+    assert_equals(std::string("check first"), messages[0].reasoning_content);
+    assert_equals(std::string("before"), messages[0].render_content());
+    assert_equals(std::string("Read"), messages[0].tool_calls.at(0).name);
+    assert_equals(std::string("after"), messages[1].render_content());
+}
+
+static void test_anthropic_discovery_normalization() {
+    // Exercise conversion, server validation, common normalization and Jinja rendering.
+    const std::string tmpl = R"(
+        {%- for tool in tools if not tool.function.defer_loading -%}
+            {{- 'initial:' + tool.function.name + ';' -}}
+        {%- endfor -%}
+        {%- for message in messages -%}
+            {{- '<' + message.role + '>' -}}
+            {%- if message.content is string -%}{{ message.content }}
+            {%- else -%}{%- for part in message.content -%}
+                {%- if part.type in ['text', 'media_marker'] -%}{{ part.text }}
+                {%- elif part.type == 'tool_reference' -%}
+                    {%- for tool in tools if tool.function.name == part.name -%}
+                        {{- 'discovered:' + tool.function.name + ':' + tool.function.description + ';' -}}
+                    {%- endfor -%}
+                {%- endif -%}
+            {%- endfor -%}{%- endif -%}
+        {%- endfor -%}
+    )";
+    auto request = anthropic_tools_request();
+    request["tools"][1]["defer_loading"] = true;
+    request["messages"].push_back(json::parse(R"({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"search","content":[
+            {"type":"tool_reference","tool_name":"Write"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9kcAAAAASUVORK5CYII="}},
+            {"type":"text","text":"found"}]},
+        {"type":"text","text":"use it"}
+    ]})"));
+    auto converted = server_chat_convert_anthropic_to_oai(request);
+    server_chat_params opt;
+    opt.tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, tmpl));
+    opt.use_jinja = true;
+    opt.force_pure_content = true;
+    opt.allow_image = true;
+    std::vector<raw_buffer> files;
+    auto parsed = oaicompat_chat_params_parse(converted, opt, files);
+    auto prompt = parsed.at("prompt").get<std::string>();
+    assert_contains(prompt, "initial:Read;");
+    assert_not_contains(prompt, "initial:Write;");
+    assert_equals(size_t(1), files.size());
+    assert_contains(prompt, "<tool>discovered:Write:write a file;" + std::string(get_media_marker()) + "found<user>use it");
+}
+
+static void test_glm53_tool_result_renders_one_block() {
+    // GLM pairs results with calls by position, so one result is one <tool_response>, whatever parts make it up: a
+    // result that mixes text and tool_reference blocks (a tool search) must not spread over several blocks.
+    auto request = anthropic_tools_request();
+    request["messages"].push_back(json::parse(R"({"role":"assistant","content":[
+        {"type":"tool_use","id":"call_a","name":"Read","input":{}},
+        {"type":"tool_use","id":"call_b","name":"Read","input":{}}
+    ]})"));
+    request["messages"].push_back(json::parse(R"({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"call_a","content":[
+            {"type":"text","text":"found one"},
+            {"type":"tool_reference","tool_name":"Write"},
+            {"type":"text","text":"and more"}]},
+        {"type":"tool_result","tool_use_id":"call_b","content":"plain result"}
+    ]})"));
+    auto converted = server_chat_convert_anthropic_to_oai(request);
+    server_chat_params opt;
+    opt.tmpls = read_templates("models/templates/GLM-5.3-Flash.jinja");
+    opt.use_jinja = true;
+    opt.force_pure_content = true;
+    std::vector<raw_buffer> files;
+    auto parsed = oaicompat_chat_params_parse(converted, opt, files);
+    auto prompt = parsed.at("prompt").get<std::string>();
+    size_t n_blocks = 0;
+    for (auto pos = prompt.find("<tool_response>"); pos != std::string::npos; pos = prompt.find("<tool_response>", pos + 1)) {
+        n_blocks++;
+    }
+    assert_equals(size_t(2), n_blocks);
+    const auto first     = prompt.find("<tool_response>");
+    const auto first_end = prompt.find("</tool_response>", first);
+    const auto second    = prompt.find("<tool_response>", first_end);
+    const auto block_a   = prompt.substr(first, first_end - first);
+    assert_contains(block_a, "found one");
+    assert_contains(block_a, "\"name\": \"Write\"");
+    assert_contains(block_a, "and more");
+    assert_contains(prompt.substr(second), "plain result");
+    assert_not_contains(prompt.substr(second), "\"name\": \"Write\"");
+}
+
+static void test_anthropic_unsupported_blocks() {
+    // A block the server cannot represent is kept as a text placeholder in its place, so a session that carries one
+    // goes on: Claude Code replays its whole history each turn, and one rejected block would fail every later request.
+    {
+        auto request = anthropic_tools_request();
+        request["messages"][0]["content"] = json::array({
+            json::parse(R"({"type":"text","text":"before"})"),
+            json::parse(R"({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}})"),
+            json::parse(R"({"type":"text","text":"after"})")});
+        auto converted = server_chat_convert_anthropic_to_oai(request);
+        const auto & content = converted.at("messages").at(0).at("content");
+        assert_equals(size_t(3), content.size());
+        assert_equals(std::string("before"), content.at(0).at("text").get<std::string>());
+        assert_equals(std::string("[document omitted: application/pdf]"), content.at(1).at("text").get<std::string>());
+        assert_equals(std::string("after"), content.at(2).at("text").get<std::string>());
+    }
+    {
+        auto request = anthropic_tools_request();
+        request["messages"][0]["content"] = json::array({json::parse(
+            R"({"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"PDF read"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]})")});
+        auto converted = server_chat_convert_anthropic_to_oai(request);
+        const auto & msg = converted.at("messages").at(0);
+        assert_equals(std::string("tool"), msg.at("role").get<std::string>());
+        assert_equals(std::string("PDF read[document omitted: application/pdf]"), msg.at("content").get<std::string>());
+    }
+    // A malformed image source is still an invalid request.
+    {
+        auto request = anthropic_tools_request();
+        request["messages"][0]["content"] = json::array({json::parse(R"({"type":"image","source":{"type":"unknown"}})")});
+        bool rejected = false;
+        try {
+            server_chat_convert_anthropic_to_oai(request);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+}
+
 static void test_convert_responses_to_chatcmpl() {
     LOG_DBG("%s\n", __func__);
 
@@ -7261,6 +7466,11 @@ int main(int argc, char ** argv) {
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
+        test_anthropic_tool_choices();
+        test_anthropic_block_order();
+        test_anthropic_discovery_normalization();
+        test_anthropic_unsupported_blocks();
+        test_glm53_tool_result_renders_one_block();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();

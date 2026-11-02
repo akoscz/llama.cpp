@@ -576,7 +576,7 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,
-                top_k, inp_kp->sel_mask, inp_kp->cand_mask, inp_kp->n_tail, kq_scale, il);
+                top_k, inp_kp->sel_mask, inp_kp->cand_mask, inp_kp->n_tail, kq_scale, il, inp_kp->tail_cells);
     } else {
         cur = build_attn(inp_attn,
                 layer.wo, nullptr, nullptr,

@@ -79,9 +79,19 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
-    if (n_draft_tokens > 0) {
+    if (n_draft_tokens > 0 || n_draft_verif_attempts > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        base["draft_rounds"] = n_draft_verif_steps;
+        base["draft_delivered_n"] = n_draft_delivered;
+        base["draft_delivered_per_round"] = n_draft_verif_steps ?
+            double(n_draft_delivered)/n_draft_verif_steps : 0.0;
+        base["draft_verify_attempts"] = n_draft_verif_attempts;
+        base["draft_verify_rows_total"] = n_draft_verif_rows;
+        base["draft_replay_attempts"] = n_draft_replay_attempts;
+        for (size_t i = 0; i < draft_verify_rows.size(); ++i) {
+            base["draft_verify_rows"][i < 8 ? std::to_string(i+1) : ">8"] = draft_verify_rows[i];
+        }
     }
 
     return base;
@@ -1205,7 +1215,23 @@ json oaicompat_chat_params_parse(
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
-    auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+    const auto tool_choice_json = json_value(body, "tool_choice", json("auto"));
+    std::string tool_choice;
+    std::string tool_choice_name;
+    if (tool_choice_json.is_null()) {
+        tool_choice = "auto";
+    } else if (tool_choice_json.is_object()) {
+        if (tool_choice_json.value("type", "") != "function") {
+            throw std::invalid_argument("tool_choice object requires type 'function'");
+        }
+        tool_choice_name = tool_choice_json.at("function").at("name").get<std::string>();
+        if (tool_choice_name.empty()) {
+            throw std::invalid_argument("tool_choice requires a non-empty function name");
+        }
+        tool_choice = "required";
+    } else {
+        tool_choice = tool_choice_json.get<std::string>();
+    }
 
     if (!opt.use_jinja) {
         if (has_tools) {
@@ -1319,7 +1345,7 @@ json oaicompat_chat_params_parse(
                 p["text"] = get_media_marker();
                 p.erase("input_video");
 
-            } else if (type != "text") {
+            } else if (type != "text" && type != "tool_reference") {
                 throw std::invalid_argument("unsupported content[].type");
             }
         }
@@ -1330,6 +1356,20 @@ json oaicompat_chat_params_parse(
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    if (!tool_choice_name.empty() && std::none_of(inputs.tools.begin(), inputs.tools.end(), [&](const common_chat_tool & tool) {
+        return tool.name == tool_choice_name;
+    })) {
+        throw std::invalid_argument("tool_choice function is not in tools: " + tool_choice_name);
+    }
+    for (const auto & message : inputs.messages) {
+        for (const auto & part : message.content_parts) {
+            if (part.type == "tool_reference" && std::none_of(inputs.tools.begin(), inputs.tools.end(), [&](const common_chat_tool & tool) {
+                return tool.name == part.name;
+            })) {
+                throw std::invalid_argument("tool_reference function is not in tools: " + part.name);
+            }
+        }
+    }
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1355,6 +1395,9 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking = opt.enable_thinking;
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+        llama_params["parse_tool_calls"] = false;
+    }
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
@@ -1394,6 +1437,19 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    if (!tool_choice_name.empty()) {
+        // Restrict generation without removing definitions from the conversation prompt.
+        auto constrained_inputs = inputs;
+        constrained_inputs.tools.erase(std::remove_if(constrained_inputs.tools.begin(), constrained_inputs.tools.end(), [&](const common_chat_tool & tool) {
+            return tool.name != tool_choice_name;
+        }), constrained_inputs.tools.end());
+        auto constrained_params = common_chat_templates_apply(opt.tmpls.get(), constrained_inputs);
+        if (constrained_params.grammar.empty() || constrained_params.generation_prompt != chat_params.generation_prompt) {
+            throw std::invalid_argument("The chat template does not support this named tool_choice");
+        }
+        constrained_params.prompt = std::move(chat_params.prompt);
+        chat_params = std::move(constrained_params);
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

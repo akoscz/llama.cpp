@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -2282,6 +2283,84 @@ static void test_backend_tensor_split(const test_params & params) {
     printf("backend -sm tensor sampling test PASSED\n");
 }
 
+static void test_speculative_eog(const test_params & tp) {
+    const llama_vocab * vocab = llama_model_get_vocab(tp.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const llama_token eog = llama_vocab_eos(vocab);
+    GGML_ASSERT(eog != LLAMA_TOKEN_NULL && llama_vocab_is_eog(vocab, eog));
+
+    llama_tokens ordinary;
+    for (llama_token t = 0; t < n_vocab && ordinary.size() < 3; ++t) {
+        if (!llama_vocab_is_eog(vocab, t)) {
+            ordinary.push_back(t);
+        }
+    }
+    GGML_ASSERT(ordinary.size() == 3);
+    const auto a = ordinary[0], b = ordinary[1], c = ordinary[2];
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 4;
+    cparams.n_ubatch = 4;
+    cparams.n_outputs_max = 4;
+    cparams.n_outputs_max_per_seq = 4;
+    llama_context_ptr ctx(llama_init_from_model(tp.model.get(), cparams));
+    GGML_ASSERT(ctx);
+    llama_batch batch = llama_batch_init(4, 0, 1);
+    for (int i = 0; i < 4; ++i) {
+        common_batch_add(batch, a, i, {0}, true);
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_batch_free(batch);
+
+    auto check = [&](const char * name, const llama_tokens & sampled, const llama_tokens & draft,
+                     const llama_tokens & expected, bool ignore_eog = false) {
+        GGML_ASSERT(sampled.size() == draft.size() + 1);
+        common_params_sampling params;
+        params.temp = 0.0f;
+        params.samplers = {COMMON_SAMPLER_TYPE_TEMPERATURE};
+        if (ignore_eog) {
+            // ignore_eos is implemented by suppressing every EOG token before sampling.
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                if (llama_vocab_is_eog(vocab, t)) {
+                    params.logit_bias.push_back({t, -INFINITY});
+                }
+            }
+        }
+        common_sampler_ptr sampler(common_sampler_init(tp.model.get(), params));
+        GGML_ASSERT(sampler);
+        std::vector<int> rows;
+        for (size_t i = 0; i < sampled.size(); ++i) {
+            float * logits = llama_get_logits_ith(ctx.get(), i);
+            GGML_ASSERT(logits);
+            std::fill(logits, logits + n_vocab, -100.0f);
+            logits[a] = 0.0f;
+            logits[sampled[i]] = 100.0f;
+            rows.push_back(i);
+        }
+        llama_tokens observed;
+        const auto accepted = common_sampler_sample_and_accept_n(sampler.get(), ctx.get(), rows, draft, false,
+                [&](size_t i, llama_token token) {
+                    GGML_ASSERT(i == observed.size());
+                    observed.push_back(token);
+                });
+        printf("speculative EOG %s: accepted %zu, expected %zu\n", name, accepted.size(), expected.size());
+        GGML_ASSERT(accepted == expected);
+        GGML_ASSERT(observed == expected && "no post-EOG token may be sampled or accepted");
+        GGML_ASSERT(common_sampler_last(sampler.get()) == expected.back());
+    };
+
+    check("first",       {eog, eog, a}, {eog, eog}, {eog});
+    check("middle",      {a, eog, eog, b}, {a, eog, eog}, {a, eog});
+    check("last draft",  {a, eog, b}, {a, eog}, {a, eog});
+    check("bonus",       {a, b, eog}, {a, b}, {a, b, eog});
+    check("empty draft", {eog}, {}, {eog});
+    check("no EOG",      {a, b, c}, {a, b}, {a, b, c});
+    check("mismatch",    {a, b, c}, {a, eog}, {a, b});
+    check("ignore EOG",  {eog, eog, eog}, {a, a}, {a, a, a}, true);
+    printf("speculative EOG boundary test PASSED\n");
+}
+
 // GOAL: serving with MTP drafts (n_max 2): each step decodes a verify batch, the last accepted token and the
 // drafts, with one output a draft, and samples every output with the served chain (repeat penalty 1.1 over the last 256 tokens,
 // top-p 0.95, temp 1.0, dist). The penalties sampler refused the backend for more than one output a sequence, so every
@@ -2650,6 +2729,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "top_p",           test_backend_top_p_sampling,          true  },
     { "tensor_split",    test_backend_tensor_split,            true  },
     { "verify_penalties", test_backend_verify_penalties,       true  },
+    { "speculative_eog", test_speculative_eog,                  true  },
 };
 
 static test_args parse_cli(int argc, char ** argv) {

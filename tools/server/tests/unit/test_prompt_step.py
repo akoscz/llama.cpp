@@ -125,3 +125,50 @@ def test_without_prompt_step_a_read_beside_a_reply_fills_its_batches():
     assert sum(steps) == n_read
     # the reply's token takes one place in the batch
     assert max(steps) >= N_BATCH - 2, f"without --prompt-step a step beside a reply read only {max(steps)}: {steps}"
+
+
+def test_short_prompt_progresses_before_long_prompt_finishes():
+    server.n_batch = 32
+    server.n_threads = 1
+    server.start()
+    started = threading.Event()
+    prompt_done = threading.Event()
+    errors = []
+
+    def read_long_prompt():
+        try:
+            for data in server.make_stream_request("POST", "/completion", data={
+                "prompt": PROMPT,
+                "id_slot": 0,
+                "n_predict": 1,
+                "cache_prompt": False,
+                "stream": True,
+                "return_progress": True,
+            }):
+                progress = data.get("prompt_progress")
+                if progress:
+                    if progress["processed"] > 0:
+                        started.set()
+                    if progress["processed"] == progress["total"]:
+                        prompt_done.set()
+        except Exception as error:
+            errors.append(error)
+            started.set()
+
+    reader = threading.Thread(target=read_long_prompt)
+    reader.start()
+    try:
+        assert started.wait(timeout=60), "long prompt never made progress"
+        assert not prompt_done.is_set(), "long prompt ended before the competing request"
+        response = server.make_request("POST", "/completion", data={
+            "prompt": "Once upon a time",
+            "id_slot": 1,
+            "n_predict": 1,
+            "cache_prompt": False,
+        })
+        assert response.status_code == 200
+        assert not prompt_done.is_set(), "short prompt waited for the long prompt to finish"
+    finally:
+        reader.join(timeout=60)
+    assert not reader.is_alive()
+    assert not errors

@@ -29,7 +29,7 @@ void ggml_cuda_mmvq_pq2_mma(const void * vx, const void * vgate, const void * vy
 // beside it before its own dependency wait (the conv folding the alpha/beta pair in): the launch takes 152 registers,
 // which leaves that kernel's blocks room on its SMs, and lets the next kernel launch only after its own dependency
 // wait, not at its start.
-void ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
+int ggml_cuda_mmvq_pq2_mma_group(int n, const void * const * vx, float * const * dst, const int64_t * nrows_x,
                                   const int64_t * stride_row_x, const int64_t * stride_col_dst, const void * vy,
                                   int64_t ncols_x, int64_t ncols_dst, int64_t stride_col_y,
-                                  const ggml_cuda_pq2_prefetch & next, bool fold_beside, cudaStream_t stream);
+                                  const ggml_cuda_pq2_prefetch & next, bool fold_beside, unsigned int * release_to, cudaStream_t stream);

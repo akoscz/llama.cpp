@@ -889,6 +889,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first,
         const std::function<void(size_t, llama_token)> & on_sample) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -905,7 +906,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
             on_sample(i, id);
         }
 
-        if (draft[i] != id) {
+        // EOG is the terminal sample, even when the draft agrees. Accepting further
+        // rows advances sampler/cache state past the response's actual end.
+        if (draft[i] != id || llama_vocab_is_eog(vocab, id)) {
             break;
         }
 

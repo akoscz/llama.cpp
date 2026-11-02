@@ -597,6 +597,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_FLASH_ATTN_EXT_SPARSE,
 
         GGML_OP_COUNT,
     };
@@ -2448,6 +2449,16 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Exact zero-bias attention over I32 [bound, n_batch, 1, ne3] physical cell indices.
+    // Each row is ascending, unique and in [0, n_kv), followed by -1 padding. Empty rows return zero.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            float                 scale);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2765,6 +2776,7 @@ extern "C" {
     enum ggml_kpool_mask_mode {
         GGML_KPOOL_MASK_SEL  = 0,
         GGML_KPOOL_MASK_CAND = 1,
+        GGML_KPOOL_MASK_INDICES = 2,
     };
 
     GGML_API struct ggml_tensor * ggml_kpool_mask(
@@ -2773,6 +2785,19 @@ extern "C" {
             struct ggml_tensor      * rows,
             enum ggml_kpool_mask_mode mode,
             int64_t                   n_extra);
+
+    // Selected: I32 [n_selected, n_rows, n_stream], with dump ids in [n_kv, n_kv+n_extra).
+    // Tail: I32 [n_tail, n_rows, n_stream], physical cells or -1 padding. Result is sorted and unique, padded with -1.
+    // bound >= n_selected + n_tail; CUDA supports at most GGML_KPOOL_INDICES_MAX input entries per row.
+#define GGML_KPOOL_INDICES_MAX 4096
+    GGML_API struct ggml_tensor * ggml_kpool_indices(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * selected,
+            struct ggml_tensor  * tail,
+            int64_t               n_extra,
+            int64_t               bound);
 
     // custom operators
 

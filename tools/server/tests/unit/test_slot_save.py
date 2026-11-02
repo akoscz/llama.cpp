@@ -158,6 +158,34 @@ def test_slot_erase():
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
 
+def test_ram_cache_exchange_protects_incoming():
+    server.n_ctx = 2048
+    server.n_slots = 1
+    server.n_batch = 128
+    server.n_predict = 1
+    server.cache_ram = 1
+    server.no_cache_idle_slots = True
+    server.kv_unified = True
+    server.start()
+    tokenized = server.make_request("POST", "/tokenize", data={"content": "The quick brown fox jumps over the lazy dog. " * 100})
+    assert tokenized.status_code == 200
+    tokens = tokenized.body["tokens"]
+    assert len(tokens) >= 1020
+    a = tokens[:1000]
+    b = list(reversed(a))
+    first = server.make_request("POST", "/completion", data={"prompt": a, "cache_prompt": True})
+    assert first.status_code == 200
+    saved = server.make_request("POST", "/slots/0?action=save", data={"filename": "cache_exchange.bin"})
+    assert saved.status_code == 200
+    # This model's serialized snapshot fits once, but not twice, in 1 MiB.
+    assert 512 * 1024 < saved.body["n_written"] < 1024 * 1024
+    other = server.make_request("POST", "/completion", data={"prompt": b, "cache_prompt": True})
+    assert other.status_code == 200
+    resumed = server.make_request("POST", "/completion", data={"prompt": tokens[:1020], "cache_prompt": True})
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] == 1000
+
+
 #
 # Multimodal server (mmproj loaded) slot save/restore.
 #

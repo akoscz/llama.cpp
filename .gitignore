@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local agent build, trace, and model-test artifacts
+.Codex/tmp/

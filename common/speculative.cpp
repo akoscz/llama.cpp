@@ -931,10 +931,19 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
-        if (!need_boundary_stash()) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+        // Empty state also clears ordinary attention targets: the slot's old
+        // boundary and verification rows belong to the discarded conversation.
+        if (data.empty()) {
+            pending_pos_last[seq_id] = -1;
+            verify_pos_first[seq_id] = -1;
+            verify_g_rows[seq_id] = 0;
+            verify_g[seq_id].clear();
+            return;
+        }
+        if (!need_boundary_stash()) {
             return;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
