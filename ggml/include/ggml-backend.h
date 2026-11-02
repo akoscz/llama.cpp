@@ -427,6 +427,14 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // Contiguous slices on the outermost axis. Counts are in device order and must sum to that axis's extent.
+    // Layouts belong to the graph tensors, so graph copies and capture keys keep the ownership information.
+    GGML_API void ggml_backend_meta_split_input(
+        struct ggml_tensor * tensor, int axis, const int64_t * counts, size_t n_devices);
+    GGML_API struct ggml_tensor * ggml_backend_meta_scatter(
+        struct ggml_context * ctx, struct ggml_tensor * tensor, int axis, const int64_t * counts, size_t n_devices);
+    GGML_API struct ggml_tensor * ggml_backend_meta_gather(struct ggml_context * ctx, struct ggml_tensor * tensor);
+
     //
     // Utils
     //
