@@ -1938,12 +1938,15 @@ static bool ggml_cuda_ssm_conv_ab_enabled() {
 // activation, the conv's new inputs, the fold's handoff slot, the blocks released by the writer or the PQ2 group after it,
 // and whether that group launched (ggml_cuda_ssm_conv_ab_enabled). The conv folds the pair in only with both.
 struct ggml_cuda_ssm_conv_ab_plan {
-    const ggml_tensor * pair[2] = { nullptr, nullptr };
-    const ggml_tensor * y       = nullptr;
-    const ggml_tensor * x       = nullptr;
-    int                 slot    = -1;
-    int                 writers = 0;
-    bool                fed     = false;
+    const ggml_tensor * pair[2]  = { nullptr, nullptr };
+    const ggml_tensor * y        = nullptr;
+    const ggml_tensor * x        = nullptr;
+    int                 slot     = -1;
+    int                 writers  = 0;     // releases the conv acquires: the writer's blocks, else the group's
+    bool                fed      = false;
+    int                 conv_idx = -1;    // the SSM_CONV's node in the graph being evaluated
+    int                 y_idx    = -1;    // the node writing y (-1: a graph input), so a group feeds only the plan
+                                          // whose activation is written before it and whose conv comes after it
 };
 
 // The alpha/beta folds' handoff slots, one unsigned int a fold of an evaluation, in the order the folds are planned.

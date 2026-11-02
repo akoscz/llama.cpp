@@ -4317,9 +4317,12 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
 // launch where there were two, and one boundary fewer on the chain from the qkv group to the recurrence. The conv's
 // blocks compute the rows before their dependency wait and write them after it (ssm_conv_ab_rows), so:
 // - the normed input reaches them by a release/acquire handoff on the plan's slot (ggml_cuda_ssm_conv_ab_slots): the
-//   writer or the PQ2 group after it releases to the slot, and the conv folds the pair in only after that release;
-// - the PQ2_0 group launch writing the conv's new inputs must come after that writer (checked when the group is
-//   dispatched: ggml_cuda_ssm_conv_ab_plan); it then lets the kernels after it launch only after its own wait
+//   writer (rms_norm_fwht, which knows the plan by its activation) or else the PQ2 group after it releases to the slot,
+//   one of the two, and the conv folds the pair in only after that release;
+// - the PQ2_0 group launch writing the conv's new inputs must come after that writer and before the conv (checked when
+//   the group is dispatched against the plan's y_idx and conv_idx, ggml_cuda_try_fuse: every plan is registered before
+//   the graph runs, and ggml-alloc gives the layers' same-shaped inputs one address, so by address alone a group would
+//   match a later layer's plan too); it then lets the kernels after it launch only after its own wait
 //   (ggml_cuda_ssm_conv_ab_enabled), so the writer has ended when the conv starts and the conv's blocks never wait on
 //   the slot beside writer blocks still to run. Nodes between the group and the conv may launch kernels (the SSM
 //   state's GET_ROWS, unless the recurrence gathers it);
@@ -4450,7 +4453,13 @@ static void ggml_cuda_try_ssm_conv_ab(ggml_backend_cuda_context & ctx, const ggm
     u.ab_stride_dst = mm[0]->nb[1] / sizeof(float);
     u.ab_rows       = (int) n_rows;
     u.ab_ncols      = (int) w0->ne[0];
-    cu.ab_plans[conv] = { { mm[0], mm[1] }, y, x, cu.ab_slots++, 0, false };
+    int y_idx = -1; // the node writing y, or -1 for a graph input, written before the graph runs
+    for (int j = conv_idx - 1; j >= 0 && y_idx < 0; --j) {
+        if (cgraph->nodes[j] == y) {
+            y_idx = j;
+        }
+    }
+    cu.ab_plans[conv] = { { mm[0], mm[1] }, y, x, cu.ab_slots++, 0, false, conv_idx, y_idx };
     cu.ab_by_y[y]     = conv;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
@@ -6408,21 +6417,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int n = ggml_cuda_pq2_mma_group_size(*cuda_ctx, cgraph, i); n > 1) {
-        // a group releases the conv that folds the alpha/beta pair after its stores
-        bool feeds_fold = false;
+        // a group writing the new inputs of a conv whose alpha/beta fold is planned feeds that fold: the plan whose
+        // activation is written before the group and whose conv comes after it, at most one, since the layers' node
+        // ranges do not interleave. Every plan is registered before the graph runs and ggml-alloc gives the layers'
+        // same-shaped inputs one address, so by address alone a later layer's plan would match too. The slot has one
+        // releaser: the activation's writer where it released (rms_norm_fwht, writers set), else the group after its
+        // stores, which has waited on every kernel before it
         ggml_cuda_ssm_conv_ab_plan * fed = nullptr;
         for (auto & [conv, ab] : cuda_ctx->ssm_conv_updates().ab_plans) {
-            for (int g = 0; g < n && !ab.fed; ++g) {
+            if (ab.fed || !(ab.y_idx < i && i < ab.conv_idx)) {
+                continue;
+            }
+            for (int g = 0; g < n && fed != &ab; ++g) {
                 if (ggml_cuda_ranges_overlap(cgraph->nodes[i + g], ab.x)) {
-                    ab.fed = feeds_fold = true;
+                    GGML_ASSERT(fed == nullptr);
                     fed = &ab;
                 }
             }
         }
-        unsigned int * release_to = fed != nullptr ? cuda_ctx->ssm_conv_ab_slots.ptr + fed->slot : nullptr;
-        const int writers = ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n, feeds_fold, release_to);
+        unsigned int * release_to = fed != nullptr && fed->writers == 0 ? cuda_ctx->ssm_conv_ab_slots.ptr + fed->slot : nullptr;
+        const int writers = ggml_cuda_mul_mat_vec_q_pq2_group(*cuda_ctx, cgraph->nodes + i, n, fed != nullptr, release_to);
         if (fed != nullptr) {
-            fed->writers = writers;
+            fed->fed = true;
+            if (release_to != nullptr) {
+                fed->writers = writers;
+            }
         }
         return n - 1;
     }
