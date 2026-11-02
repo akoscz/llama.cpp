@@ -1490,11 +1490,11 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 #endif // GGML_USE_NCCL
 
 // Whether the internal AR pipeline takes these tensors: F32, F16 or BF16 of one
-// shape on both devices, contiguously allocated and 16-byte aligned, or empty.
+// shape on all devices, contiguously allocated and 16-byte aligned, or empty.
 static bool ggml_backend_cuda_comm_internal_supports(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends >= 2 && n_backends <= GGML_CUDA_MAX_DEVICES);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1530,7 +1530,6 @@ static bool ggml_backend_cuda_comm_internal_supports(
                            __func__, i, tensors[i]->data, (int) type, ne);
             return false;
         }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
     return true;
@@ -1599,7 +1598,7 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
+    GGML_LOG_WARN("internal AllReduce init failed; "
                   "falling back to meta-backend butterfly\n");
     ggml_backend_cuda_comm_init_none(ret);
 }

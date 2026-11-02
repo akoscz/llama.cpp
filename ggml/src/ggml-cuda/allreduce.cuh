@@ -28,8 +28,8 @@ bool ggml_cuda_ar_allreduce(
     ggml_tensor           ** tensors,
     const ggml_cgraph * const * next = nullptr);
 
-// In-place exact gather across tensors[0..1]: each holds its device's part and zero bits elsewhere, and both end up
-// with the bitwise OR of the two, 32-bit word by word, on the chunked or LL kernel (capturable). tensors[i] must be
+// In-place exact gather across tensors[0..n_devices-1]: each holds its device's part and zero bits elsewhere, and all end up
+// with the bitwise OR of the shares, 32-bit word by word, on the chunked or LL kernel (capturable). tensors[i] must be
 // contiguous, 16-byte aligned and a whole number of words.
 bool ggml_cuda_ar_allgather(
     ggml_cuda_ar_pipeline * pipeline,

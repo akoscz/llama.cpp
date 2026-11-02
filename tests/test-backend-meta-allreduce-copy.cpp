@@ -202,12 +202,157 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & v)
     return err/sum;
 }
 
-int main() {
+// Direct collectives check every rank, including tails and inactive ranks. The graph tests below check delayed producers.
+static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
+    const int n = (int) devices.size();
+    auto reg = ggml_backend_dev_backend_reg(devices[0]);
+    auto init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
+    auto free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+    auto sum  = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
+    auto gather = (ggml_backend_comm_allgather_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allgather_tensor");
+    GGML_ASSERT(init && free && sum && gather);
+    std::vector<ggml_backend_t> backends(n);
+    for (int rank = 0; rank < n; ++rank) {
+        backends[rank] = ggml_backend_dev_init(devices[rank], nullptr);
+        GGML_ASSERT(backends[rank]);
+    }
+    struct route {
+        const char * name;
+        const char * ll;
+        const char * p2p;
+        const char * copy;
+        bool one_stream;
+    };
+    const route routes[] = {
+        {"host LL",      "1048576", "0",       "0", false},
+        {"host chunked", "0",       "0",       "0", false},
+        {"peer LL",      "0",       "1048576", "0", false},
+        {"host copy",    "0",       "0",       "1", false},
+        {"host serial",  "0",       "0",       "1", true},
+        {"peer copy",    "0",       "1048576", "1", false},
+    };
+    bool ok = true;
+    for (bool bf16 : {false, true}) {
+        for (const auto & route : routes) {
+            set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
+            set_env("GGML_CUDA_AR_LL_MAX_BYTES", route.ll);
+            set_env("GGML_CUDA_AR_P2P_MAX_BYTES", route.p2p);
+            set_env("GGML_CUDA_AR_COPY_THRESHOLD", route.copy);
+            set_env("GGML_CUDA_AR_COPY_ONE_STREAM", route.one_stream ? "1" : "0");
+            set_env("GGML_CUDA_AR_COPY_PEER", "1");
+            const int before = n_pipelines;
+            void * comm = init(backends.data(), backends.size());
+            if (!comm || n_pipelines != before + 1) {
+                fprintf(stderr, "FAIL: %d-rank internal pipeline did not initialize\n", n);
+                if (comm) { free(comm); }
+                for (auto backend : backends) { ggml_backend_free(backend); }
+                return 1;
+            }
+            std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079};
+            if (route.copy[0] == '1') {
+                sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
+            }
+            for (const int64_t ne : sizes) {
+                bool case_ok = true;
+                std::vector<ggml_context *> contexts(n);
+                std::vector<ggml_tensor *> tensors(n);
+                std::vector<ggml_backend_buffer_t> buffers(n);
+                for (int rank = 0; rank < n; ++rank) {
+                    contexts[rank] = ggml_init({ggml_tensor_overhead(), nullptr, true});
+                    tensors[rank] = ggml_new_tensor_1d(contexts[rank], GGML_TYPE_F32, ne);
+                    buffers[rank] = ggml_backend_alloc_ctx_tensors(contexts[rank], backends[rank]);
+                    GGML_ASSERT(buffers[rank]);
+                }
+                std::vector<float> input(ne), expected(ne), output(ne), first(ne);
+                for (int iteration = 0; iteration < 6; ++iteration) {
+                    std::fill(expected.begin(), expected.end(), 0.0f);
+                    for (int rank = 0; rank < n; ++rank) {
+                        const bool active = iteration < 2 || (iteration < 5 && rank != iteration % n);
+                        tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
+                        for (int64_t j = 0; j < ne; ++j) {
+                            float v = (float) ((j*13 + rank*7 + iteration) % 41 - 20) / 7.0f;
+                            if (j % 17 == 0) {
+                                v = rank == 0 ? 1e20f : rank == 1 ? -1e20f : (float) rank;
+                            }
+                            input[j] = active ? v : 12345.0f;
+                            v = active ? v : 0.0f;
+                            if (bf16) { v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)); }
+                            // Keep the reference's logical rank order, without regrouping partial sums.
+                            volatile float reduced = rank == 0 ? v : expected[j] + v;
+                            expected[j] = reduced;
+                        }
+                        ggml_backend_tensor_set(tensors[rank], input.data(), 0, input.size()*sizeof(float));
+                    }
+                    const bool ran = sum(comm, tensors.data());
+                    case_ok = case_ok && ran;
+                    for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                    for (int rank = 0; rank < n && ran; ++rank) {
+                        ggml_backend_tensor_get(tensors[rank], output.data(), 0, output.size()*sizeof(float));
+                        const bool same = memcmp(output.data(), expected.data(), output.size()*sizeof(float)) == 0;
+                        if (!same) { fprintf(stderr, "FAIL: %s %s ne=%lld iteration=%d rank=%d vs ordered sum\n",
+                                             route.name, bf16 ? "BF16" : "F32", (long long) ne, iteration, rank); }
+                        case_ok = case_ok && same;
+                        if (rank == 0) { first = output; }
+                        else { case_ok = case_ok && memcmp(first.data(), output.data(), output.size()*sizeof(float)) == 0; }
+                    }
+                }
+                if (ne <= 131079) {
+                    std::vector<uint32_t> words(ne), want(ne), got(ne);
+                    for (int iteration = 0; iteration < 6; ++iteration) {
+                        for (int64_t j = 0; j < ne; ++j) { want[j] = 0x7fc00000u | (uint32_t) (j + iteration); }
+                        for (int rank = 0; rank < n; ++rank) {
+                            tensors[rank]->flags = GGML_TENSOR_FLAG_COMPUTE;
+                            for (int64_t j = 0; j < ne; ++j) { words[j] = j % n == rank ? want[j] : 0; }
+                            ggml_backend_tensor_set(tensors[rank], words.data(), 0, words.size()*sizeof(uint32_t));
+                        }
+                        const bool ran = gather(comm, tensors.data());
+                        case_ok = case_ok && ran;
+                        for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                        for (int rank = 0; rank < n && ran; ++rank) {
+                            ggml_backend_tensor_get(tensors[rank], got.data(), 0, got.size()*sizeof(uint32_t));
+                            case_ok = case_ok && got == want;
+                        }
+                    }
+                }
+                for (int rank = 0; rank < n; ++rank) {
+                    ggml_backend_buffer_free(buffers[rank]);
+                    ggml_free(contexts[rank]);
+                }
+                ok = ok && case_ok;
+                printf("%s: %d ranks, %s, %s wire, %lld elements\n", case_ok ? "ok" : "FAIL", n, route.name,
+                       bf16 ? "BF16" : "F32", (long long) ne);
+            }
+            free(comm);
+        }
+    }
+    for (auto backend : backends) { ggml_backend_free(backend); }
+    return ok ? 0 : 1;
+}
+
+int main(int argc, char ** argv) {
+    const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
+    const bool direct = logical || (argc == 3 && strcmp(argv[1], "--direct") == 0);
+    const int n_devices = direct ? atoi(argv[2]) : 2;
+    if ((argc != 1 && !direct) || n_devices < 2 || n_devices > 4) {
+        fprintf(stderr, "usage: %s [--direct 2|3|4 | --logical 2|3|4]\n", argv[0]);
+        return 1;
+    }
     std::vector<ggml_backend_dev_t> gpus;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < (size_t) n_devices; i++) {
         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             gpus.push_back(ggml_backend_dev_get(i));
         }
+    }
+    if (logical && !gpus.empty()) {
+        const auto physical = gpus;
+        for (size_t rank = gpus.size(); rank < (size_t) n_devices; ++rank) {
+            gpus.push_back(physical[rank % physical.size()]);
+        }
+        printf("%d logical ranks on %zu physical GPUs; not a four-card qualification\n", n_devices, physical.size());
+    }
+    if (direct && gpus.size() < (size_t) n_devices) {
+        printf("need %d physical GPUs for direct collectives, found %zu, skipped\n", n_devices, gpus.size());
+        return 77;
     }
     if (gpus.empty()) {
         printf("no GPU for the meta backend, skipped\n");
@@ -226,6 +371,9 @@ int main() {
     set_env("GGML_CUDA_ALLREDUCE", "internal");
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
+    if (direct) {
+        return test_direct(gpus);
+    }
 
     std::mt19937 rng(42);
     std::vector<std::vector<float>> w_data(2*n_layer);
