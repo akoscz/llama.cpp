@@ -16,7 +16,7 @@ Use the PR branch, a CUDA toolkit supporting the target cards, and the same buil
 git fetch origin train/glm53-dp
 git switch train/glm53-dp
 cmake -S . -B build-dp -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build-dp --parallel 6 --target llama-server llama-perplexity test-llama-archs test-backend-meta-split test-backend-meta-allreduce-copy
+cmake --build build-dp --parallel 6 --target llama-server llama-perplexity test-llama-archs test-speculative-mtp test-backend-meta-split test-backend-meta-allreduce-copy
 build-dp/bin/llama-server --list-devices
 ```
 
@@ -61,6 +61,18 @@ After the F32-wire run passes, unset `GGML_CUDA_AR_BF16_THRESHOLD` and repeat qu
 ## Qualification and capacity
 
 Local development used an RTX 5080 and RTX 5070 Ti without peer-to-peer access. Four logical ranks on those two cards validate partition mechanics; they do not validate four-card topology, capacity or speed.
+
+On the four-card host, run the component and synthetic-model checks before loading the full pack:
+
+```sh
+build-dp/bin/test-backend-meta-allreduce-copy --direct 4
+GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
+  build-dp/bin/test-llama-archs --glm-dp-device CUDA0,CUDA1,CUDA2,CUDA3 -s 1234
+GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
+  build-dp/bin/test-speculative-mtp --dp-device CUDA0,CUDA1,CUDA2,CUDA3
+```
+
+The MTP test compares every draft and greedy verification result with an unsplit model, and exercises forced acceptance of zero, one and two drafts after slot reuse. The untrained fixture has no naturally accepted greedy drafts; these are correctness checks, not an acceptance-rate benchmark. Run it under Compute Sanitizer as well. The backend handles failed CUDA graph updates by re-instantiating the graph; use `--report-api-errors no` to check device memory without counting that handled update result as a memory failure.
 
 - Synthetic GLM tests cover two/four ranks, mixed streams, microbatch boundaries, cross-owner forks, per-sequence/full checkpoints, MTP hidden-store/head behavior and rollback against an unsplit model. CPU tests also check rollback against the kept-prefix oracle.
 - CUDA dense kernels change arithmetic with row count. Single-device 16-row and 64-row controls themselves change one near-tied top token in the synthetic fixture. DP comparisons retain the KL limit of 1e-6 against both controls and require top-token agreement with one entire unsplit control. This is not a claim of byte-identical logits across batch shapes.
