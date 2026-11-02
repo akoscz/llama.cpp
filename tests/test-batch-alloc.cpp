@@ -650,6 +650,62 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void test_device_order(testing & t) {
+    llama_vocab vocab;
+    const llama_seq_id input[] = {7, 0, 5, 2, 4, 1, 6, 3};
+    const llama_seq_id ordered[] = {0, 4, 1, 5, 2, 6, 3, 7};
+    const int32_t original[] = {1, 4, 5, 2, 3, 6, 7, 0};
+    t.test("rows_and_output_mapping", [&](testing & t) {
+        batch_builder bb;
+        for (int pos = 0; pos < 3; ++pos) {
+            for (llama_seq_id seq : input) { bb.add(pos, {seq}, pos != 0); }
+        }
+        llama_batch_allocr ba(1, 4);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        for (int pos = 0; pos < 3; ++pos) {
+            const auto ub = ba.split_equal(8, false, 0);
+            t.assert_equal(8u, ub.n_tokens);
+            for (int row = 0; row < 8; ++row) {
+                const int idx = 8*pos + original[row];
+                t.assert_equal(ordered[row], ub.seq_id[row][0]);
+                t.assert_equal(ordered[row], ub.seq_id_unq[row]);
+                t.assert_equal(row, ub.seq_idx[ordered[row]]);
+                t.assert_equal(idx, ub.idx[row]);
+                t.assert_equal(pos, ub.pos[row]);
+                t.assert_equal(100.0f*idx, ub.embd[row*bb.n_embd]);
+                if (pos != 0) { t.assert_equal(idx, ba.get_out_ids()[8*(pos - 1) + row]); }
+            }
+        }
+        t.assert_equal(0u, ba.split_equal(8, false, 0).n_tokens);
+    });
+    t.test("reserve_uses_the_same_owners", [&](testing & t) {
+        llama_batch_allocr ba(1, 4);
+        const auto ub = ba.ubatch_reserve(2, 8);
+        for (int row = 0; row < 8; ++row) {
+            t.assert_equal(ordered[row], ub.seq_id_unq[row]);
+            t.assert_equal(row, ub.seq_idx[ordered[row]]);
+        }
+    });
+    t.test("prompt_rows_keep_sequence_order", [&](testing & t) {
+        batch_builder bb;
+        for (int pos = 0; pos < 2; ++pos) {
+            for (llama_seq_id seq : input) { bb.add(pos, {seq}, true); }
+        }
+        llama_batch_allocr ba(1, 3);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        const auto ub = ba.split_simple(16);
+        const llama_seq_id expected[] = {0, 3, 6, 1, 4, 7, 2, 5};
+        t.assert_equal(16u, ub.n_tokens);
+        for (int row = 0; row < 16; ++row) {
+            t.assert_equal(expected[row/2], ub.seq_id[row][0]);
+            t.assert_equal(row % 2, ub.pos[row]);
+            t.assert_equal(input[ub.idx[row] % 8], ub.seq_id[row][0]);
+            t.assert_equal(ub.idx[row], ba.get_out_ids()[row]);
+            t.assert_equal(100.0f*ub.idx[row], ub.embd[row*bb.n_embd]);
+        }
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -669,6 +725,7 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("device_order", test_device_order);
 
     return t.summary();
 }

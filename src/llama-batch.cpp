@@ -9,7 +9,8 @@
 #include <algorithm>
 #include <sstream>
 
-llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
+llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devices) : n_pos_per_embd(n_pos_per_embd), n_devices(n_devices) {
+    GGML_ASSERT(n_devices > 0);
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
 
@@ -412,9 +413,11 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
 
-    for (uint32_t s = 0; s < n_seqs; ++s) {
-        udata->seq_idx[s] = s;
-        udata->seq_id_unq.push_back(s);
+    for (uint32_t d = 0; d < n_devices; ++d) {
+        for (uint32_t s = d; s < n_seqs; s += n_devices) {
+            udata->seq_idx[s] = udata->seq_id_unq.size();
+            udata->seq_id_unq.push_back(s);
+        }
     }
 
     llama_ubatch res {
@@ -749,7 +752,17 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs_inp, uint32_t n_seqs, bool equal_seqs) {
+    std::vector<int32_t> idxs_ordered;
+    if (n_devices > 1) {
+        idxs_ordered = idxs_inp;
+        std::stable_sort(idxs_ordered.begin(), idxs_ordered.end(), [&](int32_t a, int32_t b) {
+            const llama_seq_id sa = batch.seq_id[a][0];
+            const llama_seq_id sb = batch.seq_id[b][0];
+            return sa % n_devices == sb % n_devices ? sa < sb : sa % n_devices < sb % n_devices;
+        });
+    }
+    const auto & idxs = n_devices > 1 ? idxs_ordered : idxs_inp;
     const uint32_t n_tokens = idxs.size();
 
     assert(n_tokens%n_seqs == 0);
@@ -812,10 +825,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         seq_id_ptr += udata->n_seq_id[i];
     }
 
-    for (uint32_t s = 0; s < n_seq_max; ++s) {
-        if (seq_set_unq.test(s)) {
-            udata->seq_idx[s] = udata->seq_id_unq.size();
-            udata->seq_id_unq.push_back(s);
+    for (uint32_t d = 0; d < n_devices; ++d) {
+        for (uint32_t s = d; s < n_seq_max; s += n_devices) {
+            if (seq_set_unq.test(s)) {
+                udata->seq_idx[s] = udata->seq_id_unq.size();
+                udata->seq_id_unq.push_back(s);
+            }
         }
     }
 
