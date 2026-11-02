@@ -1458,6 +1458,10 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // as contains experts [first, first + as->ne[2]); ids remain global. Other expert lanes produce zero.
+    // Backends must advertise ggml_backend_supports_expert_partition before executing this form.
+    GGML_API void ggml_mul_mat_id_set_expert_range(struct ggml_tensor * a, int32_t first, int32_t total);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

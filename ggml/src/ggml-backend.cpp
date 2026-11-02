@@ -625,6 +625,12 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) {
+        const auto reg = ggml_backend_dev_backend_reg(device);
+        const auto supports = reg ? reinterpret_cast<bool (*)(void)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_supports_expert_partition")) : nullptr;
+        if (!supports || !supports()) { return false; }
+    }
     return device->iface.supports_op(device, op);
 }
 

@@ -6110,6 +6110,36 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_partition : public test_mul_mat_id {
+    const int first;
+    test_mul_mat_id_partition(ggml_type type, bool broadcast, int64_t tokens, int first)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, broadcast, 256, tokens, 256), first(first) {}
+
+    std::string vars() override { return test_mul_mat_id::vars() + "," + VAR_TO_STR(first); }
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_PARTITION"; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_tensor * as = out->src[0];
+        out->src[0] = ggml_view_3d(ctx, as, k, m, 2, as->nb[1], as->nb[2], first*as->nb[2]);
+        ggml_mul_mat_id_set_expert_range(out, first, n_mats);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        std::vector<int32_t> values(n_mats*n);
+        for (int64_t row = 0; row < n; ++row) {
+            for (int slot = 0; slot < n_mats; ++slot) { values[row*n_mats + slot] = (2*row + slot) % n_mats; }
+        }
+        ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
+    }
+};
+
 // A new [ne0, ne1, ne2, ne3] view of rows of ne0 + pad elements that starts off elements into its own buffer: with an
 // odd off its data address is an element off the alignment of any wider type, which kernels that read or write their
 // operands in pairs or 16-byte chunks must not be sent.
@@ -10513,6 +10543,15 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) {
+        for (int64_t tokens : {1, 17, 40}) {
+            for (bool broadcast : {false, true}) {
+                for (int first : {0, 6}) {
+                    test_cases.emplace_back(new test_mul_mat_id_partition(type, broadcast, tokens, first));
+                }
+            }
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
