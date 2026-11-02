@@ -203,7 +203,7 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & v)
 }
 
 // Direct collectives check every rank, including tails and inactive ranks. The graph tests below check delayed producers.
-static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
+static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool require_p2p) {
     const int n = (int) devices.size();
     auto reg = ggml_backend_dev_backend_reg(devices[0]);
     auto init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
@@ -248,6 +248,27 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
                 for (auto backend : backends) { ggml_backend_free(backend); }
                 return 1;
             }
+            const bool peer_requested = route.p2p[0] != '0';
+            const bool peer_active = last_p2p;
+            if (last_one_stream != route.one_stream || (!peer_requested && (last_p2p || last_card_to_card)) ||
+                    (peer_requested && require_p2p && (!last_p2p || (route.copy[0] == '1' && !last_card_to_card)))) {
+                fprintf(stderr, "FAIL: %d-rank %s did not select the required transport\n", n, route.name);
+                free(comm);
+                for (auto backend : backends) { ggml_backend_free(backend); }
+                return 1;
+            }
+            void * pair_comm = nullptr;
+            if (n > 2) {
+                const int before_pair = n_pipelines;
+                pair_comm = init(backends.data(), 2);
+                if (!pair_comm || n_pipelines != before_pair + 1) {
+                    fprintf(stderr, "FAIL: two-rank reference pipeline did not initialize\n");
+                    if (pair_comm) { free(pair_comm); }
+                    free(comm);
+                    for (auto backend : backends) { ggml_backend_free(backend); }
+                    return 1;
+                }
+            }
             std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079};
             if (route.copy[0] == '1') {
                 sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
@@ -264,16 +285,18 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
                     GGML_ASSERT(buffers[rank]);
                 }
                 std::vector<float> input(ne), expected(ne), output(ne), first(ne);
-                for (int iteration = 0; iteration < 6; ++iteration) {
+                const auto value = [](int rank, int64_t j, int iteration) {
+                    if (iteration == 6 && rank >= 2) { return 0.0f; }
+                    if (j % 17 == 0) { return rank == 0 ? 1e20f : rank == 1 ? -1e20f : (float) rank; }
+                    return (float) ((j*13 + rank*7 + iteration) % 41 - 20) / 7.0f;
+                };
+                for (int iteration = 0; iteration < (pair_comm ? 7 : 6); ++iteration) {
                     std::fill(expected.begin(), expected.end(), 0.0f);
                     for (int rank = 0; rank < n; ++rank) {
-                        const bool active = iteration < 2 || (iteration < 5 && rank != iteration % n);
+                        const bool active = iteration < 2 || iteration == 6 || (iteration < 5 && rank != iteration % n);
                         tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
                         for (int64_t j = 0; j < ne; ++j) {
-                            float v = (float) ((j*13 + rank*7 + iteration) % 41 - 20) / 7.0f;
-                            if (j % 17 == 0) {
-                                v = rank == 0 ? 1e20f : rank == 1 ? -1e20f : (float) rank;
-                            }
+                            float v = value(rank, j, iteration);
                             input[j] = active ? v : 12345.0f;
                             v = active ? v : 0.0f;
                             if (bf16) { v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)); }
@@ -294,6 +317,23 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
                         case_ok = case_ok && same;
                         if (rank == 0) { first = output; }
                         else { case_ok = case_ok && memcmp(first.data(), output.data(), output.size()*sizeof(float)) == 0; }
+                    }
+                    if (iteration == 6) {
+                        // The same two contributions plus zero-valued ranks must retain the two-device result.
+                        for (int rank = 0; rank < 2; ++rank) {
+                            for (int64_t j = 0; j < ne; ++j) { input[j] = value(rank, j, iteration); }
+                            ggml_backend_tensor_set(tensors[rank], input.data(), 0, input.size()*sizeof(float));
+                        }
+                        const bool pair_ran = sum(pair_comm, tensors.data());
+                        case_ok = case_ok && pair_ran;
+                        for (int rank = 0; rank < 2; ++rank) { ggml_backend_synchronize(backends[rank]); }
+                        for (int rank = 0; rank < 2 && pair_ran; ++rank) {
+                            ggml_backend_tensor_get(tensors[rank], output.data(), 0, output.size()*sizeof(float));
+                            const bool same = memcmp(first.data(), output.data(), output.size()*sizeof(float)) == 0;
+                            if (!same) { fprintf(stderr, "FAIL: %d-rank result differs from two-rank reference, %s, ne=%lld\n",
+                                                 n, route.name, (long long) ne); }
+                            case_ok = case_ok && same;
+                        }
                     }
                 }
                 if (ne <= 131079) {
@@ -319,9 +359,11 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
                     ggml_free(contexts[rank]);
                 }
                 ok = ok && case_ok;
-                printf("%s: %d ranks, %s, %s wire, %lld elements\n", case_ok ? "ok" : "FAIL", n, route.name,
-                       bf16 ? "BF16" : "F32", (long long) ne);
+                printf("%s: %d ranks, %s%s, %s wire, %lld elements%s\n", case_ok ? "ok" : "FAIL", n, route.name,
+                       peer_requested && !peer_active ? " (host fallback)" : "", bf16 ? "BF16" : "F32", (long long) ne,
+                       pair_comm ? ", including two-rank parity" : "");
             }
+            if (pair_comm) { free(pair_comm); }
             free(comm);
         }
     }
@@ -331,10 +373,11 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices) {
 
 int main(int argc, char ** argv) {
     const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
-    const bool direct = logical || (argc == 3 && strcmp(argv[1], "--direct") == 0);
+    const bool require_p2p = argc == 4 && strcmp(argv[3], "--require-p2p") == 0;
+    const bool direct = logical || ((argc == 3 || require_p2p) && strcmp(argv[1], "--direct") == 0);
     const int n_devices = direct ? atoi(argv[2]) : 2;
     if ((argc != 1 && !direct) || n_devices < 2 || n_devices > 4) {
-        fprintf(stderr, "usage: %s [--direct 2|3|4 | --logical 2|3|4]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -363,7 +406,7 @@ int main(int argc, char ** argv) {
     }
     if (strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) != 0) {
         printf("%s has no internal AllReduce, skipped\n", ggml_backend_dev_name(gpus[0]));
-        return 0;
+        return direct ? 77 : 0;
     }
     printf("meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
 
@@ -372,7 +415,7 @@ int main(int argc, char ** argv) {
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
     if (direct) {
-        return test_direct(gpus);
+        return test_direct(gpus, require_p2p);
     }
 
     std::mt19937 rng(42);

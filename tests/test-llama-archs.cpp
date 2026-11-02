@@ -515,7 +515,7 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
 static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir, bool q8_cache = false);
 
-static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false) {
+static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false, size_t selected_ranks = 0) {
     GGML_ASSERT(!devices.empty());
     const auto ranks_on = [&](size_t count) {
         std::vector<ggml_backend_dev_t> result;
@@ -542,7 +542,10 @@ static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> 
     }
     bool ok = true;
     for (const size_t ranks : {2u, 4u}) {
-        fprintf(stderr, "GLM dp: %zu logical ranks on %zu devices, %s cache\n", ranks, devices.size(), q8_cache ? "q8_0" : "default");
+        if (selected_ranks != 0 && ranks != selected_ranks) { continue; }
+        const auto rank_devices = ranks_on(ranks);
+        const std::set<ggml_backend_dev_t> physical_devices(rank_devices.begin(), rank_devices.end());
+        fprintf(stderr, "GLM dp: %zu logical ranks on %zu devices, %s cache\n", ranks, physical_devices.size(), q8_cache ? "q8_0" : "default");
         auto split = get_model_and_ctx(gguf.get(), nullptr, seed, ranks_on(ranks), LLAMA_SPLIT_MODE_DATA, false, {}, false, q8_cache);
         const auto actual = get_logits(split.first.get(), split.second.get(), tokens);
         size_t differ, tied;
@@ -2299,6 +2302,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     size_t max_device_label_length = 4;
     {
         std::vector<ggml_backend_dev_t> devices_meta;
+        std::vector<ggml_backend_dev_t> devices_dp;
         {
             const size_t device_count = ggml_backend_dev_count();
             for (size_t i = 0; i < device_count; i++) {
@@ -2309,6 +2313,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
                     devices_meta.push_back(dev);
+                }
+                if (strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0) {
+                    devices_dp.push_back(dev);
                 }
             }
         }
@@ -2327,6 +2334,19 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
         dev_configs.emplace_back(devices_meta, "Meta 3:7", LLAMA_SPLIT_MODE_TENSOR, tensor_split_uneven);
         max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+        if (devices_dp.empty()) {
+            if (auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) { devices_dp.push_back(cpu); }
+        }
+        if (!devices_dp.empty()) {
+            for (const size_t ranks : {4u, 2u}) {
+                std::vector<ggml_backend_dev_t> devs;
+                for (size_t i = 0; i < ranks; ++i) { devs.push_back(devices_dp[i % devices_dp.size()]); }
+                const std::string label = "DP " + std::to_string(ranks) + (devices_dp.size() < ranks ? " (logical)" : "");
+                dev_configs.emplace(dev_configs.begin(), devs, label, LLAMA_SPLIT_MODE_DATA);
+                max_device_label_length = std::max(max_device_label_length, label.length());
+            }
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -2380,10 +2400,19 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
+                if (dc.split_mode == LLAMA_SPLIT_MODE_DATA && arch != LLM_ARCH_GLM5NEXT) { continue; }
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
                 printf(template_row_cfg.c_str(),
                     llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
                 fflush(stdout);
+
+                if (dc.split_mode == LLAMA_SPLIT_MODE_DATA) {
+                    const int plain = test_glm_dp(seed, dc.devs, false, dc.devs.size());
+                    const int quantized = test_glm_dp(seed, dc.devs, true, dc.devs.size());
+                    all_ok = all_ok && !plain && !quantized;
+                    printf(template_row_res.c_str(), plain || quantized ? "FAIL DP" : "OK DP", "KL <= 1e-6", "SKIP");
+                    continue;
+                }
 
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;

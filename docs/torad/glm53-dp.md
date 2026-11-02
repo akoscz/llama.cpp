@@ -65,12 +65,18 @@ Local development used an RTX 5080 and RTX 5070 Ti without peer-to-peer access. 
 On the four-card host, run the component and synthetic-model checks before loading the full pack:
 
 ```sh
-build-dp/bin/test-backend-meta-allreduce-copy --direct 4
+build-dp/bin/test-backend-meta-allreduce-copy --direct 4 --require-p2p
+GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
+  build-dp/bin/test-llama-archs -a glm5next -s 1234
 GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
   build-dp/bin/test-llama-archs --glm-dp-device CUDA0,CUDA1,CUDA2,CUDA3 -s 1234
 GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
   build-dp/bin/test-speculative-mtp --dp-device CUDA0,CUDA1,CUDA2,CUDA3
 ```
+
+The direct collective test covers host staging and peer paths on F32/BF16 wires, including tails and transfers larger than 32 MiB. `--require-p2p` fails if a requested peer path falls back to host memory. Without it, a fallback is labeled in the output. For three/four ranks it also runs an actual two-rank reference with the same two contributions and zero-valued extra ranks; this is bit-identical. Arbitrarily regrouping nonzero floating-point contributions is not guaranteed to preserve bits.
+
+The standard `-a glm5next` command includes DP 2 and DP 4 with default and Q8 caches. With fewer than four CUDA devices, repeated devices are labeled logical ranks; a CPU-only build uses logical CPU ranks. The full CPU command passes locally. On the local CUDA cards the DP configurations pass, then the existing unsplit generated-prefix rollback comparison fails; the executable from before this test integration reproduces that failure. The focused `--glm-dp-device` command isolates DP results but does not waive the unsplit failure.
 
 The MTP test compares every draft and greedy verification result with an unsplit model, and exercises forced acceptance of zero, one and two drafts after slot reuse. The untrained fixture has no naturally accepted greedy drafts; these are correctness checks, not an acceptance-rate benchmark. Run it under Compute Sanitizer as well. The backend handles failed CUDA graph updates by re-instantiating the graph; use `--report-api-errors no` to check device memory without counting that handled update result as a memory failure.
 
@@ -81,4 +87,4 @@ The MTP test compares every draft and greedy verification result with an unsplit
 - Measure 1/12/40 decoding streams and one/four 45K prefills. Report aggregate throughput, per-stream throughput and inter-token latency while another request prefills. Use ABBA against two-card tensor mode on two of the same cards.
 - The fallback candidate is 36 slots at `-ub 1024` (`-c 15925248`). It needs its own measurement. Smaller microbatches can improve responsiveness but do not guarantee the highest prefill rate.
 
-The requested 40-slot Rig profile must use the measured peak plus 1 GiB as `min_vram_mib`. Until that exists, no measured VRAM threshold or production profile is claimed.
+The requested 40-slot Rig profile must use the measured peak plus 1 GiB as `min_vram_mib`. Its `draft_cache = { k = "q8_0", v = "q8_0" }` overrides the draft formats only for that profile. The draft microbatch inherits the target's 512 rows when `-ubd` is absent. Until the hardware measurements exist, no measured VRAM threshold or production profile is claimed.
