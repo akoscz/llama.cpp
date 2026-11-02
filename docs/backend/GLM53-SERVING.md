@@ -90,7 +90,10 @@ model's sampling defaults.
 
 The launcher removes inherited `LLAMA_*`, `GGML_*`, `CUDA_*`, and `NVIDIA_*`
 overrides, then installs the displayed settings. This prevents a forgotten
-profile or diagnostic switch from changing the recipe. It fixes device
+profile or diagnostic switch from changing the recipe. The server's own access
+controls stay: `LLAMA_API_KEY`, `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SSL_KEY_FILE`
+and `LLAMA_ARG_SSL_CERT_FILE` reach the server, and the dry run lists the keys it
+removes under `removed`. It fixes device
 visibility to cards 0 and 1; container device mapping must make the intended
 cards available. `LD_LIBRARY_PATH` is set to the selected server's directory,
 so place its matching shared libraries there. Run the displayed command

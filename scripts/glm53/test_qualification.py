@@ -321,6 +321,53 @@ class ServingRecipeTest(unittest.TestCase):
         actual = self.serve.execution_environment(settings, inherited)
         self.assertEqual(actual, {"PATH": "/bin", "HOME": "/home/operator", **settings})
 
+    def test_model_paths_keep_their_own_names_through_symlinks(self):
+        # A Hugging Face cache snapshot links the first shard to a blob whose name carries no split suffix; the loader
+        # finds shards 2 and 3 from the first shard's name, so the launcher must pass the link's path, not its target.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            blob = root / "blobs" / "9916f01db53f8a2bfd5db1d6eb8cd48f93ae2b732fe1dfce993450745334cae1"
+            blob.parent.mkdir()
+            blob.write_bytes(b"GGUF")
+            shard = root / "snapshots" / "1bc0afad" / "IQ3_XXS" / "GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf"
+            shard.parent.mkdir(parents=True)
+            shard.symlink_to(blob)
+            projector = root / "snapshots" / "1bc0afad" / "mmproj-GLM-5.3-Flash-Uncensored-F16.gguf"
+            projector.symlink_to(blob)
+            args = self.serve.arguments(["--model", str(shard), "--mmproj", str(projector)])
+            argv, _ = self.serve.make_plan(args)
+            self.assertEqual(argv[argv.index("-m") + 1], str(shard))
+            self.assertEqual(argv[argv.index("--mmproj") + 1], str(projector))
+            relative = self.serve.arguments(["--model", "models/first.gguf"])
+            argv, _ = self.serve.make_plan(relative)
+            self.assertEqual(argv[argv.index("-m") + 1], str(Path.cwd() / "models/first.gguf"))
+
+    def test_server_access_controls_survive_the_engine_scrub(self):
+        # The scrub removes engine, profile and diagnostic overrides; the server's own key and TLS settings stay.
+        args = self.serve.arguments(["--model", "/models/target.gguf"])
+        _, settings = self.serve.make_plan(args)
+        kept = {"LLAMA_API_KEY": "secret", "LLAMA_ARG_API_KEY_FILE": "/etc/llama/keys",
+                "LLAMA_ARG_SSL_KEY_FILE": "/etc/llama/key.pem", "LLAMA_ARG_SSL_CERT_FILE": "/etc/llama/cert.pem"}
+        inherited = {**kept, "PATH": "/bin", "LLAMA_ARG_MODEL": "wrong.gguf", "LLAMA_KPOOL_DIRECT_INDICES": "1",
+                     "LLAMA_INDEXER_Q8_QUERY": "0", "GGML_CUDA_Q8_TMA": "1", "CUDA_VISIBLE_DEVICES": "9",
+                     "NVIDIA_TF32_OVERRIDE": "0"}
+        self.assertEqual(self.serve.execution_environment(settings, inherited), {**kept, "PATH": "/bin", **settings})
+        self.assertEqual(self.serve.removed_overrides(inherited),
+                         ["CUDA_VISIBLE_DEVICES", "GGML_CUDA_Q8_TMA", "LLAMA_ARG_MODEL", "LLAMA_INDEXER_Q8_QUERY",
+                          "LLAMA_KPOOL_DIRECT_INDICES", "NVIDIA_TF32_OVERRIDE"])
+
+    def test_dry_run_names_the_inherited_overrides_it_removes(self):
+        args = self.serve.arguments(["--model", "/missing/model.gguf", "--server", "/missing/server", "--dry-run"])
+        output = io.StringIO()
+        with mock.patch.dict(self.serve.os.environ, {"LLAMA_KPOOL_DIRECT_INDICES": "1", "LLAMA_API_KEY": "secret"}), \
+                mock.patch.object(self.serve.os, "execve") as execute, contextlib.redirect_stdout(output):
+            self.assertEqual(self.serve.main(args), 0)
+        execute.assert_not_called()
+        plan = json.loads(output.getvalue())
+        self.assertIn("LLAMA_KPOOL_DIRECT_INDICES", plan["removed"])
+        self.assertNotIn("LLAMA_API_KEY", plan["removed"])
+        self.assertNotIn("secret", output.getvalue())
+
     def test_dry_run_never_executes_and_does_not_require_model_downloads(self):
         args = self.serve.arguments(["--model", "/missing/model;literal.gguf", "--server", "/missing/server with spaces",
                                      "--dry-run"])
