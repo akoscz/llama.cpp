@@ -3259,7 +3259,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= (ggml_is_quantized(src0->type) ? MMVQ_MMID_CEILING : MMVQ_MAX_BATCH_SIZE)) {
+    if (ggml_get_op_params_i32(dst, 2) == 0 &&
+            dst->ne[2] <= (ggml_is_quantized(src0->type) ? MMVQ_MMID_CEILING : MMVQ_MAX_BATCH_SIZE)) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
@@ -3280,6 +3281,15 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+static __global__ void ggml_cuda_local_expert_ids(const int32_t * ids, int32_t * local,
+        int64_t n, int n_used, int64_t stride, int first, int count) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int expert = ids[(i/n_used)*stride + i % n_used] - first;
+        local[i] = expert >= 0 && expert < count ? expert : count;
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -3291,6 +3301,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (ggml_get_op_params_i32(dst, 2) > 0) {
+        GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(!ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+        const int64_t n = ggml_nelements(ids);
+        ggml_cuda_pool_alloc<int32_t> local_ids(ctx.pool(), n);
+        ggml_cuda_local_expert_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(
+            (const int32_t *) ids->data, local_ids.get(), n, ids->ne[0], ids->nb[1]/sizeof(int32_t),
+            ggml_get_op_params_i32(dst, 1), src0->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        ggml_tensor mapped = *ids;
+        mapped.data = local_ids.get();
+        mapped.nb[1] = mapped.ne[0]*sizeof(int32_t);
+        mapped.nb[2] = mapped.nb[1]*mapped.ne[1];
+        mapped.nb[3] = mapped.nb[2];
+        if (ggml_is_quantized(src0->type)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, &mapped, dst);
+        } else {
+            ggml_cuda_mul_mat_f(ctx, src0, src1, &mapped, dst);
+        }
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -5382,6 +5415,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(node, 2) > 0) { return 0; }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading
@@ -8190,6 +8225,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) {
+                    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16 &&
+                            a->type != GGML_TYPE_Q8_0 && a->type != GGML_TYPE_IQ3_XXS) { return false; }
+                    if (!ggml_is_contiguous(op) || op->src[2]->nb[0] != sizeof(int32_t) ||
+                            ggml_cuda_mul_mat_id_needs_sync(op, ggml_cuda_info().devices[dev_ctx->device].cc)) { return false; }
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -8760,8 +8801,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_supports_expert_partition() { return true; }
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_supports_expert_partition") == 0) {
+        return (void *) ggml_backend_cuda_supports_expert_partition;
+    }
     if (strcmp(name, "ggml_backend_supports_op_storage") == 0) {
         return (void *)ggml_backend_cuda_supports_op_storage;
     }
