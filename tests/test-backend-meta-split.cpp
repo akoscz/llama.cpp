@@ -228,6 +228,95 @@ static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type) {
     return ok;
 }
 
+static bool test_host_layout(ggml_backend_dev_t device) {
+    ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
+    auto meta = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
+    auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    bool ok = true;
+    for (int kind = 0; kind < 3; ++kind) {
+        auto ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        const int64_t owners[] = {1, 0, 2, 1}, flat_owners[] = {8, 0, 16, 8};
+        auto root = kind == 2 ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        ggml_backend_meta_split_input(root, kind == 2 ? 0 : 1, kind == 2 ? flat_owners : owners, 4);
+        ggml_set_input(root);
+        auto view = kind == 2 ? ggml_view_2d(ctx, root, 4, 4, 8*sizeof(float), 2*sizeof(float)) :
+            ggml_reshape_4d(ctx, root, 2, 4, 1, 4);
+        if (kind == 1) { view = ggml_cast(ctx, ggml_cast(ctx, view, GGML_TYPE_F16), GGML_TYPE_F32); }
+        auto x = ggml_dup_tensor(ctx, view);
+        ggml_backend_meta_split_input(x, kind == 2 ? 1 : 3, owners, 4);
+        ggml_set_input(x);
+        auto out = ggml_add(ctx, x, view);
+        ggml_set_output(out);
+        auto graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_t backends[] = {meta, cpu};
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        ggml_backend_sched_set_tensor_backend(sched, root, cpu);
+        ggml_backend_sched_set_tensor_backend(sched, view, cpu);
+        ggml_backend_sched_set_tensor_backend(sched, x, meta);
+        ggml_backend_sched_set_tensor_backend(sched, out, meta);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        std::vector<float> data(32), values(ggml_nelements(x), 100.0f), result(values.size());
+        for (size_t i = 0; i < data.size(); ++i) { data[i] = i + 1; }
+        ggml_backend_tensor_set(root, data.data(), 0, ggml_nbytes(root));
+        ggml_backend_tensor_set(x, values.data(), 0, ggml_nbytes(x));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+        bool case_ok = true;
+        for (size_t i = 0; i < result.size(); ++i) {
+            case_ok = case_ok && result[i] == 100.0f + data[kind == 2 ? i/4*8 + i%4 + 2 : i];
+        }
+        printf("%s host-owned input reshape/cast/chunk case %d\n", case_ok ? "ok  " : "FAIL", kind);
+        ok = ok && case_ok;
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(meta);
+    ggml_backend_free(cpu);
+    return ok;
+}
+
+static bool test_stream_view(ggml_backend_dev_t device, ggml_type type) {
+    ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
+    auto backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
+    auto ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    auto cache = ggml_new_tensor_3d(ctx, type, 64, 64, 16);
+    const int64_t capacity[] = {4, 4, 4, 4}, active[] = {1, 0, 2, 1}, first[] = {2, 0, 1, 3};
+    ggml_backend_meta_split_input(cache, 2, capacity, 4);
+    ggml_set_input(cache);
+    auto view = ggml_view_4d(ctx, cache, 32, 2, 32, 4, ggml_row_size(type, 32), cache->nb[1], cache->nb[2], 0);
+    ggml_backend_meta_set_stream_view(view, active, first, 4);
+    auto nested = ggml_view_3d(ctx, view, 32, 32, 4, view->nb[2], view->nb[3], view->nb[1]);
+    auto out = ggml_cont(ctx, ggml_cast(ctx, nested, GGML_TYPE_F32));
+    ggml_set_output(out);
+    auto graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    auto alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    std::vector<float> data(ggml_nelements(cache));
+    for (size_t i = 0; i < data.size(); ++i) { data[i] = 127.0f*(1 + i/32); }
+    std::vector<uint8_t> bytes(ggml_nbytes(cache));
+    ggml_quantize_chunk(type, data.data(), bytes.data(), 0, 64*16, 64, nullptr);
+    ggml_backend_tensor_set(cache, bytes.data(), 0, bytes.size());
+    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result(ggml_nelements(out));
+    ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+    const size_t streams[] = {2, 9, 10, 15};
+    bool ok = true;
+    for (size_t s = 0; s < 4; ++s) {
+        for (size_t row = 0; row < 32; ++row) {
+            for (size_t col = 0; col < 32; ++col) {
+                ok = ok && result[s*32*32 + row*32 + col] == data[streams[s]*64*64 + row*64 + 32 + col];
+            }
+        }
+    }
+    printf("%s %s active stream views with empty owner, unequal starts and nested channel slice\n", ok ? "ok  " : "FAIL", ggml_type_name(type));
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+}
+
 static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32) {
     const int captured_before = captured;
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
@@ -323,18 +412,29 @@ static bool test_experts(ggml_backend_dev_t gpu, ggml_type type = GGML_TYPE_F32)
     return ok;
 }
 
-static bool test_owned_ops(ggml_backend_dev_t gpu, int variant) {
+static bool test_owned_ops(ggml_backend_dev_t gpu, int variant, bool single_owner = false) {
     ggml_backend_dev_t devs[] = {gpu, second_device(gpu), gpu, second_device(gpu)};
     ggml_backend_t meta = ggml_backend_dev_init(ggml_backend_meta_device(devs, 4, split_rows, nullptr), nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     std::vector<float> results[2];
     const int64_t owners[] = {1, 0, 2, 1};
+    const int64_t n_stream = single_owner ? 1 : 4;
     for (int mode = 0; mode < 2; ++mode) {
         ggml_backend_t backend = mode ? meta : cpu;
         ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
         std::vector<ggml_tensor *> inputs;
         std::vector<ggml_tensor *> outputs;
         auto input = [&](ggml_type type, std::array<int64_t, 4> ne, int axis) {
+            if (single_owner && axis >= 0) { ne[axis] = 1; }
+            if (single_owner && axis >= 0) {
+                const int64_t size = ne[0]*ne[1]*ne[2]*ne[3];
+                auto * flat = ggml_new_tensor_1d(ctx, type, size);
+                ggml_set_input(flat);
+                const int64_t owned[] = {0, 0, size, 0};
+                if (mode) { ggml_backend_meta_split_input(flat, 0, owned, 4); }
+                inputs.push_back(flat);
+                return ggml_reshape_4d(ctx, flat, ne[0], ne[1], ne[2], ne[3]);
+            }
             ggml_tensor * t = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_input(t);
             if (mode && axis >= 0) { ggml_backend_meta_split_input(t, axis, owners, 4); }
@@ -367,18 +467,18 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant) {
             ggml_tensor * beta = input(GGML_TYPE_F32, {1, 2, 3, 4}, 3);
             ggml_tensor * state = input(GGML_TYPE_F32, {128, 128, 2, 4}, 3);
             out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, snapshots);
-            outputs.push_back(ggml_scale(ctx, ggml_view_4d(ctx, out, 128, 2, 3, 4,
+            outputs.push_back(ggml_scale(ctx, ggml_view_4d(ctx, out, 128, 2, 3, n_stream,
                 128*sizeof(float), 256*sizeof(float), 3*256*sizeof(float), 0), 2.0f));
-            outputs.push_back(ggml_scale(ctx, ggml_view_3d(ctx, out, 128*128*2, 4, snapshots,
-                128*128*2*sizeof(float), 4*128*128*2*sizeof(float), 3*4*256*sizeof(float)), 2.0f));
+            outputs.push_back(ggml_scale(ctx, ggml_view_3d(ctx, out, 128*128*2, n_stream, snapshots,
+                128*128*2*sizeof(float), n_stream*128*128*2*sizeof(float), 3*n_stream*256*sizeof(float)), 2.0f));
         } else if (variant == 3) {
             ggml_tensor * mixes = input(GGML_TYPE_F32, {24, 4, 1, 1}, 1);
             ggml_tensor * scale = input(GGML_TYPE_F32, {3, 1, 1, 1}, -1);
             ggml_tensor * base = input(GGML_TYPE_F32, {24, 1, 1, 1}, -1);
             ggml_tensor * x = input(GGML_TYPE_F32, {64, 4, 4, 1}, 2);
             ggml_tensor * weights = ggml_dsv4_hc_weights(ctx, mixes, scale, base, 1e-6f, 4);
-            ggml_tensor * pre = ggml_view_2d(ctx, weights, 4, 4, weights->nb[1], 0);
-            ggml_tensor * post = ggml_view_2d(ctx, weights, 4, 4, weights->nb[1], 4*sizeof(float));
+            ggml_tensor * pre = ggml_view_2d(ctx, weights, 4, n_stream, weights->nb[1], 0);
+            ggml_tensor * post = ggml_view_2d(ctx, weights, 4, n_stream, weights->nb[1], 4*sizeof(float));
             ggml_tensor * comb = ggml_dsv4_hc_comb(ctx, mixes, scale, base, 1e-6f, 4);
             out = ggml_dsv4_hc_post(ctx, ggml_dsv4_hc_pre(ctx, x, pre), x, post, comb);
         } else if (variant == 4) {
@@ -448,7 +548,7 @@ static bool test_owned_ops(ggml_backend_dev_t gpu, int variant) {
     }
     const bool ok = variant == 4 ? results[0] == results[1] : std::isfinite(error) && error < 1e-6*norm;
     const char * names[] = {"attention", "sparse attention", "indexer", "hyper-connections", "k-pool mask", "KDA final state", "KDA snapshots", "RoPE", "SSM convolution", "batched projection", "batched cache gather"};
-    printf("%s owned %s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], norm ? error/norm : error);
+    printf("%s owned %s%s, NMSE %.9g\n", ok ? "ok  " : "FAIL", names[variant], single_owner ? " (single owner)" : "", norm ? error/norm : error);
     ggml_backend_free(meta);
     ggml_backend_free(cpu);
     return ok;
@@ -507,6 +607,16 @@ int main(int argc, char ** argv) {
 #endif
     ggml_log_set(log_cb, nullptr);
     ggml_backend_dev_t gpu = nullptr;
+    if (argc == 2 && strcmp(argv[1], "--host-layout-cpu") == 0) {
+        return test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "--single-owner-cpu") == 0) {
+        return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2]), true) ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--stream-view-cpu") == 0) {
+        gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        return test_stream_view(gpu, GGML_TYPE_F32) && test_stream_view(gpu, GGML_TYPE_Q8_0) ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "--owned-op-cpu") == 0) {
         return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2])) ? 0 : 1;
     }
@@ -514,9 +624,13 @@ int main(int argc, char ** argv) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         bool ok = true;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-        for (int variant = 0; variant < 11; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
+        for (int variant = 0; variant < 11; ++variant) {
+            ok = test_owned_ops(gpu, variant) && ok;
+            ok = test_owned_ops(gpu, variant, true) && ok;
+        }
         ok = test_scatter_views(gpu) && ok;
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && ok; }
+        ok = test_host_layout(gpu) && ok;
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
         return ok ? 0 : 1;
     }
     for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
@@ -581,9 +695,13 @@ int main(int argc, char ** argv) {
     ok = test_rows(gpu, true) && ok;
     ok = test_sequence_axis(gpu) && ok;
     ok = test_scatter_views(gpu) && ok;
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && ok; }
+    ok = test_host_layout(gpu) && ok;
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
-    for (int variant = 0; variant < 11; ++variant) { ok = test_owned_ops(gpu, variant) && ok; }
+    for (int variant = 0; variant < 11; ++variant) {
+        ok = test_owned_ops(gpu, variant) && ok;
+        ok = test_owned_ops(gpu, variant, true) && ok;
+    }
 
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

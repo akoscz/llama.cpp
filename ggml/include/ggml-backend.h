@@ -445,6 +445,10 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_backend_meta_set_rows_local(
         struct ggml_context * ctx, struct ggml_tensor * cache, struct ggml_tensor * rows, struct ggml_tensor * indices);
 
+    // View one contiguous run of streams per device. The cache splits on axis 2, the view on axis 3.
+    GGML_API void ggml_backend_meta_set_stream_view(
+        struct ggml_tensor * view, const int64_t * counts, const int64_t * first, size_t n_devices);
+
     //
     // Utils
     //
