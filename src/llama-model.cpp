@@ -373,6 +373,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5next = ud->model->arch == LLM_ARCH_GLM5NEXT;
 
+    if (ud->model->split_mode() == LLAMA_SPLIT_MODE_DATA) {
+        static const std::regex experts("blk\\.\\d+\\.ffn_(up|gate|down)_exps\\.weight");
+        if (std::regex_match(tensor_name, experts)) {
+            GGML_ASSERT(tensor->ne[2] >= (int64_t) ud->n_devices);
+            ggml_backend_meta_split_state split = {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+            for (size_t rank = 0; rank < ud->n_devices; ++rank) {
+                split.ne[rank] = tensor->ne[2]/ud->n_devices + (rank < tensor->ne[2] % ud->n_devices);
+            }
+            return split;
+        }
+        // Caches must supply explicit ownership before allocation; never silently mirror them.
+        GGML_ASSERT(tensor_name.rfind("cache_", 0) != 0 && tensor_name != "mtp_h_store");
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
@@ -1628,6 +1643,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
+    if (split_mode == LLAMA_SPLIT_MODE_DATA && n_gpu_layers < n_layer_all + 1) {
+        throw std::runtime_error("data parallelism requires all layers and the output on the meta device");
+    }
 
     const bool use_mmap_buffer = true;
 
@@ -1656,7 +1674,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
-        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+        if (split_mode != LLAMA_SPLIT_MODE_DATA) {
+            buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+        }
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
     }
 
@@ -1718,7 +1738,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // 2,048-row prefill step gathered its rows from the 643 MiB q8_0 table on the host and copied the 32 MiB result to each
     // card, and its MTP head gathered the same tokens again (two RTX PRO 6000, Nov 1, 2026). Read at each load
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
-    if (ggml_env_switch("LLAMA_TOK_EMBD_GPU") && i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1) {
+    if ((ggml_env_switch("LLAMA_TOK_EMBD_GPU") || split_mode == LLAMA_SPLIT_MODE_DATA) &&
+            i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1) {
         pimpl->dev_input = get_layer_buft_list(0);
         LLAMA_LOG_INFO("%s: input layer assigned to device %s (LLAMA_TOK_EMBD_GPU)\n", __func__,
                 ggml_backend_dev_name(pimpl->dev_input.dev));
@@ -2267,6 +2288,10 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+uint32_t llama_model::n_seq_devices() const {
+    return split_mode() == LLAMA_SPLIT_MODE_DATA ? get_split_state_ud.n_devices : 1;
 }
 
 const float * llama_model::tensor_split() const {

@@ -616,7 +616,8 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
     }
 
     // noaux_tc: exp_probs_b biases top-k selection only; the weights stay unbiased
-    ggml_tensor * moe_out = build_moe_ffn(cur,
+    ggml_tensor * moe_in = cparams.n_seq_devices > 1 ? ggml_backend_meta_gather(ctx0, cur) : cur;
+    ggml_tensor * moe_out = build_moe_ffn(moe_in,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
             layer.ffn_gate_exps,
@@ -627,6 +628,12 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
             il);
+
+    if (cparams.n_seq_devices > 1) {
+        const auto counts = ubatch.device_rows(cparams.n_seq_devices);
+        moe_out = ggml_backend_meta_reduce(ctx0, moe_out);
+        moe_out = ggml_backend_meta_scatter(ctx0, moe_out, 1, counts.data(), counts.size());
+    }
 
     ggml_tensor * shexp = build_ffn(cur,
             layer.ffn_up_shexp,   nullptr, nullptr,
@@ -738,7 +745,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     if (inp_out_ids && mask_early) {
         // get_rows needs one token's streams contiguous
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
-        inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
+        inpL = ggml_reshape_3d(ctx0, build_output_rows(flat, inp_out_ids), n_embd, hc, n_outputs);
     }
 
     // unweighted mean, not DeepSeek-V4's learned gated head
@@ -755,13 +762,16 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         GGML_ASSERT(cur->ne[1] == n_tokens);
         auto inp_nextn = std::make_unique<llm_graph_input_nextn>(nextn);
         inp_nextn->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+        split_inp_rows(inp_nextn->rows, 0);
         ggml_set_input(inp_nextn->rows);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, nextn.store, cur, inp_nextn->rows));
+        ggml_build_forward_expand(gf, cparams.n_seq_devices > 1 ?
+                ggml_backend_meta_set_rows_local(ctx0, nextn.store, cur, inp_nextn->rows) :
+                ggml_set_rows(ctx0, nextn.store, cur, inp_nextn->rows));
         res->add_input(std::move(inp_nextn));
     }
 
     if (inp_out_ids && !mask_early) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = build_output_rows(cur, inp_out_ids);
     }
 
     cb(cur, "result_norm", -1);
@@ -794,9 +804,11 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    split_inp_rows(inp->tokens, 0);
     ggml_set_input(inp->tokens);
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    split_inp_rows(inp->embd, 1);
     ggml_set_input(inp->embd);
 
     ggml_tensor * tok_embd;
@@ -814,12 +826,15 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
         // the target's hidden rows where it left them, in the MTP store (llama_set_nextn_source)
         auto inp_nextn = std::make_unique<llm_graph_input_nextn>(nextn);
         inp_nextn->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        split_inp_rows(inp_nextn->rows, 0);
         ggml_set_input(inp_nextn->rows);
-        h_embd = ggml_get_rows(ctx0, nextn.store, inp_nextn->rows);
+        h_embd = cparams.n_seq_devices > 1 ? ggml_backend_meta_get_rows_local(ctx0, nextn.store, inp_nextn->rows) :
+                                           ggml_get_rows(ctx0, nextn.store, inp_nextn->rows);
         ggml_set_name(h_embd, "mtp_h_input");
         res->add_input(std::move(inp_nextn));
     } else {
         inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        split_inp_rows(inp->h, 1);
         ggml_set_input(inp->h);
         ggml_set_name(inp->h, "mtp_h_input");
         h_embd = inp->h;
@@ -886,7 +901,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_h_nextn = cur;
 
     if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = build_output_rows(cur, inp_out_ids);
     }
     cb(cur, "mtp_shared_head_norm", -1);
 
@@ -904,7 +919,9 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
             hot = ggml_cont(ctx0, ggml_view_2d(ctx0, hot, n_hot, n_out, hot->nb[1], 0));
         }
         cb(hot, "mtp_draft_logits", -1);
-        ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        ggml_tensor * full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out);
+        split_inp_rows(full, 2, true);
+        full = ggml_fill_inplace(ctx0, full, -INFINITY);
         cur = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, hot, 1, n_hot, n_out), model.output_draft_ids);
         cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_out);
     } else {

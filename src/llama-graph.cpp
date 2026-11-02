@@ -46,6 +46,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
+    if (cparams.n_seq_devices > 1) {
+        const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+        ggml_backend_meta_split_input(res, 3, counts.data(), counts.size());
+    }
+
     return res;
 }
 
@@ -154,6 +159,10 @@ void llm_graph_input_nextn::set_input(const llama_ubatch * ubatch) {
         for (int64_t i = 0; i < n_tokens; ++i) {
             GGML_ASSERT(ubatch->idx[i] < nextn.n_batch);
             data[i] = base + ubatch->idx[i];
+            if (nextn.n_devices > 1) {
+                const int64_t half = base/(nextn.n_batch + nextn.n_carry);
+                nextn.owners->at(half*nextn.n_batch + ubatch->idx[i]) = ubatch->seq_id[i][0] % nextn.n_devices;
+            }
         }
         ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*ggml_element_size(rows));
         return;
@@ -166,6 +175,20 @@ void llm_graph_input_nextn::set_input(const llama_ubatch * ubatch) {
         const int32_t s = (*nextn.src)[ubatch->idx[i]];
         GGML_ASSERT(s < nextn.n_batch && -s <= nextn.n_carry);
         data[i] = (int32_t) (s >= 0 ? base + s : base + nextn.n_batch - s - 1);
+        if (nextn.n_devices > 1) {
+            const uint32_t owner = ubatch->seq_id[i][0] % nextn.n_devices;
+            if (s >= 0) {
+                const int64_t half = base/(nextn.n_batch + nextn.n_carry);
+                GGML_ASSERT(nextn.owners->at(half*nextn.n_batch + s) == owner);
+            } else {
+                const int64_t n_embd = nextn.store->ne[0];
+                const int64_t carry_row = -int64_t(s) - 1;
+                GGML_ASSERT(nextn.carry && (carry_row + 1)*n_embd <= (int64_t) nextn.carry->size());
+                const int64_t row = owner*2*(nextn.n_batch + nextn.n_carry) + data[i];
+                ggml_backend_tensor_set(nextn.store, nextn.carry->data() + carry_row*n_embd,
+                        row*nextn.store->nb[1], nextn.store->nb[1]);
+            }
+        }
     }
     ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*ggml_element_size(rows));
 }
@@ -254,6 +277,22 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
+
+    if (cparams.n_seq_devices > 1) {
+        int32_t first = 0;
+        int32_t out = 0;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            if (i > 0 && ubatch->seq_id[i][0] % cparams.n_seq_devices !=
+                         ubatch->seq_id[i - 1][0] % cparams.n_seq_devices) {
+                first = i;
+            }
+            if (n_outputs == n_tokens || ubatch->output[i]) {
+                data[out++] = i - first;
+            }
+        }
+        GGML_ASSERT(out == n_outputs);
+        return;
+    }
 
     if (n_outputs == n_tokens) {
         for (int i = 0; i < n_tokens; ++i) {
@@ -403,6 +442,15 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
         for (int64_t r = 0; r < s_write_rows->ne[0]; ++r) {
             data[r] = (r / n_seqs) * (int64_t) mem_size + (int64_t) rs_head + (r % n_seqs);
         }
+    }
+    for (uint32_t snapshot = 0; snapshot < s_write_local.size(); ++snapshot) {
+        ggml_tensor * rows = s_write_local[snapshot];
+        if (!rows) { continue; }
+        std::vector<int64_t> data(ubatch->n_seqs);
+        for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
+            data[s] = mctx_cur->s_write(ubatch->seq_id[s*ubatch->n_seq_tokens][0], snapshot);
+        }
+        ggml_backend_tensor_set(rows, data.data(), 0, ggml_nbytes(rows));
     }
 }
 
@@ -2712,6 +2760,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+void llm_graph_context::split_inp_rows(ggml_tensor * tensor, int axis, bool outputs_only) const {
+    if (cparams.n_seq_devices > 1) {
+        const auto counts = ubatch.device_rows(cparams.n_seq_devices, outputs_only);
+        ggml_backend_meta_split_input(tensor, axis, counts.data(), counts.size());
+    }
+}
+
+ggml_tensor * llm_graph_context::build_output_rows(ggml_tensor * tensor, ggml_tensor * ids) const {
+    return cparams.n_seq_devices > 1 ? ggml_backend_meta_get_rows_local(ctx0, tensor, ids)
+                                    : ggml_get_rows(ctx0, tensor, ids);
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2722,11 +2782,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    split_inp_rows(inp->tokens, 0);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    split_inp_rows(inp->embd, 1);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
@@ -2820,6 +2882,10 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
     auto & cur = inp->pos;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
+    if (cparams.n_seq_devices > 1) {
+        GGML_ASSERT(hparams.n_pos_per_embd() == 1);
+        split_inp_rows(cur, 0);
+    }
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
@@ -2856,6 +2922,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     auto & cur = inp->out_ids;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+    split_inp_rows(cur, 0, true);
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
@@ -3900,7 +3967,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
-    const int64_t n_rs   = mctx_cur->get_n_rs();
+    const int64_t n_rs   = mctx_cur->n_devices() > 1 ? ubatch.n_seqs : mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
@@ -3908,6 +3975,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+
+    if (mctx_cur->n_devices() > 1) {
+        const auto counts = ubatch.device_seqs(mctx_cur->n_devices());
+        ggml_backend_meta_split_input(inp->s_copy, 0, counts.data(), counts.size());
+        inp->s_copy_main = inp->s_copy;
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
@@ -3930,6 +4003,11 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   n_seqs,
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
+
+    if (cparams.n_seq_devices > 1) {
+        GGML_ASSERT(state_size == s->ne[0] && n_seqs == inp->s_copy_main->ne[0]);
+        return ggml_backend_meta_get_rows_local(ctx0, s, inp->s_copy_main);
+    }
 
     inp->rs_z_baked |= s->type == GGML_TYPE_F32;
 
@@ -3980,6 +4058,21 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
 
     return states;
+}
+
+ggml_tensor * llm_graph_context::build_rs_store_local(llm_graph_input_rs * inp, ggml_tensor * cache,
+        ggml_tensor * states, uint32_t snapshot) const {
+    GGML_ASSERT(cparams.n_seq_devices > 1 && snapshot <= cparams.n_rs_seq);
+    if (inp->s_write_local.size() <= snapshot) { inp->s_write_local.resize(snapshot + 1, nullptr); }
+    auto & rows = inp->s_write_local[snapshot];
+    if (!rows) {
+        rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_seqs);
+        const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+        ggml_backend_meta_split_input(rows, 0, counts.data(), counts.size());
+        ggml_set_input(rows);
+    }
+    states = ggml_cont_2d(ctx0, states, cache->ne[0], ubatch.n_seqs);
+    return ggml_backend_meta_set_rows_local(ctx0, cache, states, rows);
 }
 
 ggml_tensor * llm_graph_context::build_rs_write_rows(
@@ -4077,6 +4170,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
     GGML_ASSERT(kpool > 0);
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_attn, mctx_idx, kpool);
+    inp->n_seq_devices = cparams.n_seq_devices;
     inp->draft = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_cur->get_mtp_index() : nullptr;
 
     inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
@@ -4213,6 +4307,19 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
     }
 
+    if (cparams.n_seq_devices > 1 && scoring) {
+        const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+        for (const auto & item : std::initializer_list<std::pair<ggml_tensor *, int>>{
+                {inp->pool_cells, 1}, {inp->pool_bias, 2}, {inp->pool_dump, 2}, {inp->pool_reps, 1},
+                {inp->new_pool_cells, 1}, {inp->mask_cells, 3}, {inp->mask_rows, 2},
+                {inp->tail_cells, 2}, {inp->draft_top_k, 2},
+                {inp->mask_cells ? nullptr : inp->sel_mask, 3}, {inp->mask_cells ? nullptr : inp->cand_mask, 3}}) {
+            if (item.first) { ggml_backend_meta_split_input(item.first, item.second, counts.data(), counts.size()); }
+        }
+        auto writes = counts;
+        for (auto & count : writes) { count *= inp->n_new_max; }
+        ggml_backend_meta_split_input(inp->new_pool_reps, 0, writes.data(), writes.size());
+    }
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
@@ -4287,6 +4394,10 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         // a constant 0, never the cell's bias: scattering -inf would ERASE a zero granted to the
         // tail. f32 because CUDA only does SET_ROWS for f32
         ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        if (cparams.n_seq_devices > 1) {
+            const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+            ggml_backend_meta_split_input(zeros, 3, counts.data(), counts.size());
+        }
         zeros = ggml_fill(ctx0, zeros, 0.0f);
 
         mask_top_k = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);

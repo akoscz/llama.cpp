@@ -257,6 +257,9 @@ struct llama_nextn_store {
     int64_t  n_embd   = 0;
     int64_t  n_batch  = 0;
     int64_t  n_carry  = 0;
+    uint32_t n_devices = 1;
+    std::vector<uint32_t> owners;
+    std::vector<float> carry;
     uint32_t min_rows = 64; // env: LLAMA_MTP_DEVICE_H_MIN_ROWS
 
     int     half   = 1; // the half the target wrote last
@@ -268,6 +271,12 @@ struct llama_nextn_store {
     llama_context *      reader          = nullptr;
 
     int64_t base(int h) const { return h*(n_batch + n_carry); }
+    int64_t row(int h, int64_t batch_row) const {
+        GGML_ASSERT(batch_row >= 0 && batch_row < n_batch);
+        const uint32_t owner = n_devices > 1 ? owners[h*n_batch + batch_row] : 0;
+        GGML_ASSERT(owner < n_devices);
+        return owner*2*(n_batch + n_carry) + base(h) + batch_row;
+    }
 
     void wait_read(int h) {
         if (!read_pending[h]) {
@@ -296,7 +305,7 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(), model.n_seq_devices())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -307,6 +316,7 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_seq_devices = model.n_seq_devices();
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -495,6 +505,9 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    if (model.split_mode() == LLAMA_SPLIT_MODE_DATA && (cparams.kv_unified || !params.offload_kqv || !cparams.flash_attn)) {
+        throw std::runtime_error("data parallelism requires non-unified KV, KV offload and flash attention");
+    }
     cparams.attn_mask_bits = params.attn_mask_bits;
 
     if (cparams.attn_mask_bits && hparams.use_alibi) {
@@ -1240,7 +1253,13 @@ void llama_context::nextn_refill() {
     const auto & st  = *nextn_store;
     const size_t row = (size_t) st.n_embd*sizeof(float);
     GGML_ASSERT((size_t) st.n_rows*st.n_embd <= embd_nextn.size);
-    ggml_backend_tensor_get(st.t, embd_nextn.data, st.base(st.half)*row, st.n_rows*row);
+    if (st.n_devices > 1) {
+        for (int32_t i = 0; i < st.n_rows; ++i) {
+            ggml_backend_tensor_get(st.t, embd_nextn.data + i*st.n_embd, st.row(st.half, i)*row, row);
+        }
+    } else {
+        ggml_backend_tensor_get(st.t, embd_nextn.data, st.base(st.half)*row, st.n_rows*row);
+    }
     n_nextn_to_host += st.n_rows;
 }
 
@@ -2993,8 +3012,9 @@ static void ubatch_prepare_reserve(
             continue;
         }
 
-        sampler_seqs.push_back(seq_id);
-        has_sampler[seq_id] = true;
+        const uint32_t seq_idx = ubatch.seq_idx[seq_id];
+        sampler_seqs.push_back(seq_idx);
+        has_sampler[seq_idx] = true;
     }
 
     uint32_t n_outputs_set = 0;
@@ -3045,7 +3065,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = n_outputs;
 
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd(), model.n_seq_devices());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
@@ -3111,7 +3131,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(sched_gf),
         /*.res         =*/ res,
         /*.nextn       =*/ nextn_mode == LLM_GRAPH_NEXTN_NONE ? llm_graph_nextn{} : llm_graph_nextn{
-            nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry },
+            nextn_mode, nextn_store->t, &nextn_base, &nextn_src, nextn_store->n_batch, nextn_store->n_carry,
+            nextn_store->n_devices, &nextn_store->owners, &nextn_store->carry },
     };
 }
 
@@ -3129,6 +3150,8 @@ bool llama_context::nextn_bind(llama_context & head) {
     st->n_embd  = hparams.n_embd_out();
     st->n_batch = cparams.n_batch;
     st->n_carry = std::max<int64_t>(1, cparams.n_seq_max);
+    st->n_devices = model.n_seq_devices();
+    st->owners.resize(2*st->n_batch, st->n_devices);
     if (const char * env = getenv("LLAMA_MTP_DEVICE_H_MIN_ROWS")) {
         // above the decode steps' graph slots (graph_slot_max_tokens), which a verification keeps
         st->min_rows = std::max<uint32_t>(graph_slot_max_tokens + 1, (uint32_t) atoi(env));
@@ -3136,7 +3159,11 @@ bool llama_context::nextn_bind(llama_context & head) {
 
     ggml_init_params params = { ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
     st->ctx.reset(ggml_init(params));
-    st->t = ggml_new_tensor_2d(st->ctx.get(), GGML_TYPE_F32, st->n_embd, 2*(st->n_batch + st->n_carry));
+    st->t = ggml_new_tensor_2d(st->ctx.get(), GGML_TYPE_F32, st->n_embd, st->n_devices*2*(st->n_batch + st->n_carry));
+    if (st->n_devices > 1) {
+        const std::vector<int64_t> counts(st->n_devices, 2*(st->n_batch + st->n_carry));
+        ggml_backend_meta_split_input(st->t, 1, counts.data(), counts.size());
+    }
     ggml_set_name(st->t, "mtp_h_store");
     st->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(st->ctx.get(), ggml_backend_dev_buffer_type(st->dev)));
     if (!st->buf) {
@@ -3174,7 +3201,10 @@ void llama_context::nextn_set_h_rows(const int32_t * src, int32_t n, const float
     GGML_ASSERT(nextn_store && !nextn_is_target && "llama_set_nextn_h_rows: the context is not a bound MTP head");
     auto & st = *nextn_store;
     GGML_ASSERT(n_carry >= 0 && n_carry <= st.n_carry);
-    if (n_carry > 0) {
+    if (st.n_devices > 1) {
+        st.carry.clear();
+        if (n_carry > 0) { st.carry.assign(carry, carry + n_carry*st.n_embd); }
+    } else if (n_carry > 0) {
         const size_t row = (size_t) st.n_embd*sizeof(float);
         ggml_backend_tensor_set(st.t, carry, (st.base(st.half) + st.n_batch)*row, n_carry*row);
     }
@@ -3190,13 +3220,13 @@ bool llama_context::nextn_get_rows(const int32_t * rows, int32_t n, float * dst)
         const auto & st = *nextn_store;
         for (int32_t i0 = 0; i0 < n; ) {
             int32_t i1 = i0 + 1;
-            while (i1 < n && rows[i1] == rows[i1 - 1] + 1) {
+            while (st.n_devices == 1 && i1 < n && rows[i1] == rows[i1 - 1] + 1) {
                 ++i1;
             }
             if (rows[i0] < 0 || rows[i1 - 1] >= st.n_rows) {
                 return false;
             }
-            ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, (st.base(st.half) + rows[i0])*row, (i1 - i0)*row);
+            ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, st.row(st.half, rows[i0])*row, (i1 - i0)*row);
             i0 = i1;
         }
         n_nextn_to_host += n;

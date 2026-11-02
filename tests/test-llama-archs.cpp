@@ -433,7 +433,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const std::vector<float> & tensor_split = {}, bool mtp = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const std::vector<float> & tensor_split = {}, bool mtp = false, bool q8_cache = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -450,6 +450,16 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     if (!encode) {
         ctx_params.n_ubatch = 64;
+    }
+    if (split_mode == LLAMA_SPLIT_MODE_DATA) {
+        ctx_params.kv_unified = false;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.n_seq_max = 8;
+        ctx_params.n_ctx = 8*256;
+    }
+    if (q8_cache) {
+        ctx_params.type_k = ctx_params.type_v = ctx_params.type_s = ctx_params.type_idx = GGML_TYPE_Q8_0;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
     size_t tmp = seed;
@@ -498,6 +508,112 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, bool q8_cache = false);
+static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir, bool q8_cache = false);
+
+static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false) {
+    GGML_ASSERT(!devices.empty());
+    const auto ranks_on = [&](size_t count) {
+        std::vector<ggml_backend_dev_t> result;
+        for (size_t i = 0; i < count; ++i) { result.push_back(devices[i % devices.size()]); }
+        return result;
+    };
+    auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true);
+    llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+    ms.add_kv(LLM_KV_EXPERT_USED_COUNT, uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(256));
+    auto reference = get_model_and_ctx(gguf.get(), nullptr, seed, {devices.front()}, LLAMA_SPLIT_MODE_LAYER, false, {}, false, q8_cache);
+    const auto tokens = get_tokens(128, 128, seed);
+    const auto expected = get_logits(reference.first.get(), reference.second.get(), tokens);
+    {
+        auto tensor = get_model_and_ctx(gguf.get(), nullptr, seed, ranks_on(2), LLAMA_SPLIT_MODE_TENSOR, false, {}, false, q8_cache);
+        const auto actual = get_logits(tensor.first.get(), tensor.second.get(), tokens);
+        size_t differ, tied;
+        const double kl = mean_kld(expected, actual, 128, differ, tied);
+        fprintf(stderr, "GLM tensor regression: mean KL %.9g, %zu differing top tokens\n", kl, differ);
+        if (!std::isfinite(kl) || kl > 1e-6 || differ != 0) { return 1; }
+    }
+    bool ok = true;
+    for (const size_t ranks : {2u, 4u}) {
+        fprintf(stderr, "GLM dp: %zu logical ranks on %zu devices, %s cache\n", ranks, devices.size(), q8_cache ? "q8_0" : "default");
+        auto split = get_model_and_ctx(gguf.get(), nullptr, seed, ranks_on(ranks), LLAMA_SPLIT_MODE_DATA, false, {}, false, q8_cache);
+        const auto actual = get_logits(split.first.get(), split.second.get(), tokens);
+        size_t differ, tied;
+        const double kl = mean_kld(expected, actual, 128, differ, tied);
+        fprintf(stderr, "GLM dp %zu: mean KL %.9g, %zu differing top tokens, %zu ties\n", ranks, kl, differ, tied);
+        if (!std::isfinite(kl) || kl > 1e-6 || differ != 0) {
+            return 1;
+        }
+        std::vector<std::vector<llama_token>> histories;
+        std::vector<std::vector<float>> expected_seq, actual_seq(8);
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            histories.push_back(get_tokens(136, 128, seed + seq));
+            llama_memory_clear(llama_get_memory(reference.second.get()), true);
+            expected_seq.push_back(get_logits(reference.first.get(), reference.second.get(), histories.back()));
+        }
+        llama_memory_clear(llama_get_memory(split.second.get()), true);
+        auto batch = llama_batch_init(512, 0, 1);
+        histories.resize(8);
+        histories[7] = histories[0];
+        histories[6] = histories[1];
+        const llama_seq_id order[] = {3, 0, 2, 1, 7, 6};
+        for (llama_pos begin = 0; begin < 136;) {
+            const llama_pos end = begin < 128 ? begin + 64 : begin + 1;
+            if (begin == 64) {
+                llama_memory_seq_cp(llama_get_memory(split.second.get()), 0, 7, -1, -1);
+                std::vector<uint8_t> checkpoint(llama_state_seq_get_size(split.second.get(), 1));
+                if (llama_state_seq_get_data(split.second.get(), checkpoint.data(), checkpoint.size(), 1) != checkpoint.size() ||
+                        llama_state_seq_set_data(split.second.get(), checkpoint.data(), checkpoint.size(), 6) != checkpoint.size()) {
+                    llama_batch_free(batch);
+                    return 1;
+                }
+            }
+            if (begin == 128) {
+                std::vector<uint8_t> checkpoint(llama_state_get_size(split.second.get()));
+                if (llama_state_get_data(split.second.get(), checkpoint.data(), checkpoint.size()) != checkpoint.size() ||
+                        llama_state_set_data(split.second.get(), checkpoint.data(), checkpoint.size()) != checkpoint.size()) {
+                    llama_batch_free(batch);
+                    return 1;
+                }
+            }
+            common_batch_clear(batch);
+            for (llama_pos pos = begin; pos < end; ++pos) {
+                for (auto seq : order) {
+                    if (begin > 0 || seq < 4) { common_batch_add(batch, histories[seq][pos], pos, {seq}, true); }
+                }
+            }
+            if (llama_decode(split.second.get(), batch)) { llama_batch_free(batch); return 1; }
+            for (int32_t row = 0; row < batch.n_tokens; ++row) {
+                auto & logits = actual_seq[batch.seq_id[row][0]];
+                const auto * values = llama_get_logits_ith(split.second.get(), row);
+                logits.insert(logits.end(), values, values + 128);
+            }
+            begin = end;
+        }
+        llama_batch_free(batch);
+        for (size_t seq = 0; seq < 4; ++seq) {
+            const double mixed_kl = mean_kld(expected_seq[seq], actual_seq[seq], 128, differ, tied);
+            fprintf(stderr, "GLM dp %zu mixed seq %zu: mean KL %.9g, %zu differing top tokens, %zu ties\n", ranks, seq, mixed_kl, differ, tied);
+            if (!std::isfinite(mixed_kl) || mixed_kl > 1e-6 || differ != 0) { return 1; }
+        }
+        for (const auto seq : {6, 7}) {
+            const auto & full = expected_seq[seq == 7 ? 0 : 1];
+            const std::vector<float> suffix(full.begin() + 64*128, full.end());
+            const double fork_kl = mean_kld(suffix, actual_seq[seq], 128, differ, tied);
+            fprintf(stderr, "GLM dp %zu fork/restore seq %d: mean KL %.9g, %zu differing top tokens\n", ranks, seq, fork_kl, differ);
+            if (!std::isfinite(fork_kl) || fork_kl > 1e-6 || differ != 0) { return 1; }
+        }
+        ok = test_glm_nextn_store(seed, ranks_on(ranks), LLAMA_SPLIT_MODE_DATA, {}, q8_cache) && ok;
+        ok = test_glm_generated_prefixes(seed, ranks_on(ranks), LLAMA_SPLIT_MODE_DATA, {}, "", q8_cache) && ok;
+    }
+    return ok ? 0 : 1;
 }
 
 static std::vector<float> get_mtp_logits(
@@ -1194,8 +1310,14 @@ static bool test_glm_tok_embd_on_device(const size_t seed, const std::vector<ggm
 // engine's own growth after its first reserve, which the store doesn't change). A batch under 64 rows keeps the host
 // path.
 static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        llama_split_mode split_mode, const std::vector<float> & tensor_split) {
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, bool q8_cache) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
+    if (split_mode == LLAMA_SPLIT_MODE_DATA) {
+        llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+        ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    }
     auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
     auto * model = pair.first.get();
     const int n_embd  = llama_model_n_embd_out(model);
@@ -1209,7 +1331,9 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
         params.n_batch    = 512;
         params.n_ubatch   = 64;
         params.n_seq_max  = 2;
-        params.kv_unified = true;
+        params.kv_unified = split_mode != LLAMA_SPLIT_MODE_DATA;
+        if (split_mode == LLAMA_SPLIT_MODE_DATA) { params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; }
+        if (q8_cache) { params.type_k = params.type_v = params.type_s = params.type_idx = GGML_TYPE_Q8_0; }
         params.n_threads  = params.n_threads_batch = 4;
         llama_context_ptr ctx(llama_init_from_model(model, params));
         if (!ctx) throw std::runtime_error("nextn store: failed to create a context");
@@ -1822,9 +1946,14 @@ static int test_glm_capture_failures() {
 }
 
 static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir = "") {
+        llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir = "", bool q8_cache) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
     llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
+    if (split_mode == LLAMA_SPLIT_MODE_DATA) {
+        ms.add_kv(LLM_KV_EXPERT_COUNT, uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(128));
+    }
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(4));
     auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
     auto * model = pair.first.get();
@@ -1832,6 +1961,7 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
     std::mt19937 rng(seed);
     const bool diagnostics = !diagnostic_dir.empty();
     for (const bool unified : {false, true}) {
+        if (split_mode == LLAMA_SPLIT_MODE_DATA && unified) { continue; }
         auto params = llama_context_default_params();
         params.n_ctx = 2048;
         params.n_seq_max = 3;
@@ -1840,6 +1970,8 @@ static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggm
         params.n_ubatch = 64;
         params.n_threads = params.n_threads_batch = 4;
         params.kv_unified = unified;
+        if (split_mode == LLAMA_SPLIT_MODE_DATA) { params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; }
+        if (q8_cache) { params.type_k = params.type_v = params.type_s = params.type_idx = GGML_TYPE_Q8_0; }
         llama_context_ptr actual(llama_init_from_model(model, params));
         llama_context_ptr reference(llama_init_from_model(model, params));
         if (!actual || !reference) return false;
@@ -2336,8 +2468,14 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
+    std::string dp_device;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--glm-dp-device") == 0) {
+            if (i + 1 == argc) return 1;
+            dp_device = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "--glm-prefix-diagnostics") == 0 || strcmp(argv[i], "--glm-prefix-device") == 0) {
             const bool directory = strcmp(argv[i], "--glm-prefix-diagnostics") == 0;
             if (i+1 == argc) return 1;
@@ -2381,6 +2519,18 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (!dp_device.empty()) {
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> devices;
+            for (const auto & name : string_split<std::string>(dp_device, ',')) {
+                const auto device = ggml_backend_dev_by_name(name.c_str());
+                if (!device) throw std::runtime_error("GLM DP device is unavailable: " + name);
+                devices.push_back(device);
+            }
+            const int plain = test_glm_dp(seed, devices);
+            const int quantized = test_glm_dp(seed, devices, true);
+            return plain || quantized;
+        }
         if (!diagnostic_dir.empty() || !diagnostic_device.empty()) {
             if (arch != LLM_ARCH_GLM5NEXT || diagnostic_dir.empty() || diagnostic_device.empty() || !out.empty()) {
                 throw std::runtime_error("GLM prefix diagnostics require --arch glm5next, a fresh directory and an explicit device");

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -155,17 +156,39 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    const bool data_parallel = params.split_mode == LLAMA_SPLIT_MODE_DATA;
+    const bool meta_split = params.split_mode == LLAMA_SPLIT_MODE_TENSOR || data_parallel;
+    if (data_parallel && model->arch != LLM_ARCH_GLM5NEXT) {
+        LLAMA_LOG_ERROR("%s: data parallelism currently requires glm5next\n", __func__);
+        return false;
+    }
+    if (data_parallel && params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern) {
+        LLAMA_LOG_ERROR("%s: data parallelism does not support tensor buffer overrides\n", __func__);
+        return false;
+    }
+    const auto valid_split = [&](size_t n_devices) {
+        if (!data_parallel || !params.tensor_split) { return true; }
+        const float share = params.tensor_split[0];
+        for (size_t i = 0; i < n_devices; ++i) {
+            if (!std::isfinite(params.tensor_split[i]) || params.tensor_split[i] < 0 || params.tensor_split[i] != share) {
+                LLAMA_LOG_ERROR("%s: data parallelism requires equal tensor-split proportions on all devices\n", __func__);
+                return false;
+            }
+        }
+        return true;
+    };
     // create list of devices to use with this model
     if (params.devices) {
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (meta_split) {
             size_t n_devs = 0;
             while (params.devices[n_devs]) {
                 n_devs++;
             }
-            if (n_devs == 0) {
-                LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
+            if (n_devs == 0 || n_devs > GGML_BACKEND_META_MAX_DEVICES || (data_parallel && n_devs < 2)) {
+                LLAMA_LOG_ERROR("%s: invalid device count for the requested meta split mode\n", __func__);
                 return false;
             }
+            if (!valid_split(n_devs)) { return false; }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
@@ -189,7 +212,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         std::vector<llama_device> igpus;
         std::vector<llama_device> rpc_servers;
 
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (meta_split) {
             std::vector<ggml_backend_dev_t> devs;
             devs.reserve(ggml_backend_dev_count());
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -200,12 +223,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 }
                 devs.push_back(dev);
             }
-            if (devs.empty()) {
-                LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
+            if (devs.empty() || devs.size() > GGML_BACKEND_META_MAX_DEVICES || (data_parallel && devs.size() < 2)) {
+                LLAMA_LOG_ERROR("%s: invalid device count for the requested meta split mode\n", __func__);
                 return false;
             }
+            if (!valid_split(devs.size())) { return false; }
 
-            LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+            LLAMA_LOG_INFO("%s: creating a Meta device for %s parallelism from %zu devices:\n", __func__, data_parallel ? "data" : "tensor", devs.size());
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
             }

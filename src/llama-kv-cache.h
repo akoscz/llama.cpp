@@ -178,6 +178,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_n_devices() const;
 
     bool get_has_shift() const;
 

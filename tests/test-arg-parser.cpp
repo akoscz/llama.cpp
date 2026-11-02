@@ -130,6 +130,14 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     {
+        common_params dp;
+        argv = {"binary_name", "-sm", "dp", "-ts", "1,1,1,1", "-np", "40", "-c", "17694720", "-fa", "on"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), dp, LLAMA_EXAMPLE_SERVER));
+        assert(dp.split_mode == LLAMA_SPLIT_MODE_DATA && dp.n_parallel == 40 && dp.n_ctx == 17694720);
+        for (size_t i = 0; i < 4; ++i) { assert(dp.tensor_split[i] == 1.0f); }
+    }
+
+    {
         common_params penalty_params;
         assert(penalty_params.sampling.penalty_last_n == 64);
         assert(penalty_params.sampling.dry_penalty_last_n == 64);

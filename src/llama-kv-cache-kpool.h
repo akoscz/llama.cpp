@@ -277,6 +277,7 @@ public:
     // fixed for the decode phase: a shape tracking pools-closed-this-step would flip the graph
     // topology every kpool tokens and force CUDA-graph recapture
     uint32_t n_new_max = 0;
+    uint32_t n_seq_devices = 1;
 
     // set at build time: re-emit every pool after a position mutation
     bool rebuild = false;
