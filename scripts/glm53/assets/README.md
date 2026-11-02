@@ -28,8 +28,8 @@ code, and 100% generated tool syntax. These measure token coverage, not draft
 acceptance, coding quality, or serving speed.
 
 The paired [chat template](../../../models/templates/GLM-5.3-Flash.jinja)
-is 12,981 bytes, SHA256
-`0bc9a9e2801e8dfbea88403de8523d87cb26cc91d9308e68bce4b50b90708ddb`.
+is 12,782 bytes, SHA256
+`bb443c2772691a62b661da6515637c3ff70b2a790bf939b30220e337a6d9e723`.
 It preserves supplied reasoning by default and renders deferred tool discovery
 where the corresponding tool result occurs. Both published assets are exact
 copies of the serving inputs; the launcher verifies their hashes before use.

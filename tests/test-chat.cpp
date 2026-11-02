@@ -1915,6 +1915,45 @@ static void test_anthropic_discovery_normalization() {
     assert_contains(prompt, "<tool>discovered:Write:write a file;" + std::string(get_media_marker()) + "found<user>use it");
 }
 
+static void test_glm53_tool_result_renders_one_block() {
+    // GLM pairs results with calls by position, so one result is one <tool_response>, whatever parts make it up: a
+    // result that mixes text and tool_reference blocks (a tool search) must not spread over several blocks.
+    auto request = anthropic_tools_request();
+    request["messages"].push_back(json::parse(R"({"role":"assistant","content":[
+        {"type":"tool_use","id":"call_a","name":"Read","input":{}},
+        {"type":"tool_use","id":"call_b","name":"Read","input":{}}
+    ]})"));
+    request["messages"].push_back(json::parse(R"({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"call_a","content":[
+            {"type":"text","text":"found one"},
+            {"type":"tool_reference","tool_name":"Write"},
+            {"type":"text","text":"and more"}]},
+        {"type":"tool_result","tool_use_id":"call_b","content":"plain result"}
+    ]})"));
+    auto converted = server_chat_convert_anthropic_to_oai(request);
+    server_chat_params opt;
+    opt.tmpls = read_templates("models/templates/GLM-5.3-Flash.jinja");
+    opt.use_jinja = true;
+    opt.force_pure_content = true;
+    std::vector<raw_buffer> files;
+    auto parsed = oaicompat_chat_params_parse(converted, opt, files);
+    auto prompt = parsed.at("prompt").get<std::string>();
+    size_t n_blocks = 0;
+    for (auto pos = prompt.find("<tool_response>"); pos != std::string::npos; pos = prompt.find("<tool_response>", pos + 1)) {
+        n_blocks++;
+    }
+    assert_equals(size_t(2), n_blocks);
+    const auto first     = prompt.find("<tool_response>");
+    const auto first_end = prompt.find("</tool_response>", first);
+    const auto second    = prompt.find("<tool_response>", first_end);
+    const auto block_a   = prompt.substr(first, first_end - first);
+    assert_contains(block_a, "found one");
+    assert_contains(block_a, "\"name\": \"Write\"");
+    assert_contains(block_a, "and more");
+    assert_contains(prompt.substr(second), "plain result");
+    assert_not_contains(prompt.substr(second), "\"name\": \"Write\"");
+}
+
 static void test_anthropic_unsupported_blocks() {
     // A block the server cannot represent is kept as a text placeholder in its place, so a session that carries one
     // goes on: Claude Code replays its whole history each turn, and one rejected block would fail every later request.
@@ -7431,6 +7470,7 @@ int main(int argc, char ** argv) {
         test_anthropic_block_order();
         test_anthropic_discovery_normalization();
         test_anthropic_unsupported_blocks();
+        test_glm53_tool_result_renders_one_block();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();
