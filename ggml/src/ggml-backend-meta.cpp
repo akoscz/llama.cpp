@@ -2011,11 +2011,13 @@ static bool ggml_backend_meta_outer_ranges(const ggml_tensor * tensor, const ggm
     size_t global = 0;
     size_t local[GGML_BACKEND_META_MAX_DEVICES] = {};
     const int64_t block = split.axis == 0 ? ggml_blck_size(tensor->type) : 1;
+    // A contiguous single-plane view can retain its larger parent's unused outer stride.
+    const size_t stride = split.axis > 0 && tensor->ne[split.axis] == 1 ? ggml_nbytes(tensor) : tensor->nb[split.axis];
     for (size_t s = 0; s < split.n_segments; ++s) {
         for (size_t r = 0; r < split.nr[s]; ++r) {
             for (size_t j = 0; j < n_devices; ++j) {
                 GGML_ASSERT(split.ne[s*n_devices + j] % block == 0);
-                const size_t bytes = split.ne[s*n_devices + j]/block*tensor->nb[split.axis];
+                const size_t bytes = split.ne[s*n_devices + j]/block*stride;
                 const size_t begin = std::max(global, offset);
                 const size_t end = std::min(global + bytes, offset + size);
                 if (end > begin) { copy(j, local[j] + begin - global, begin - offset, end - begin); }
