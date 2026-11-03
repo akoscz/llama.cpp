@@ -1,7 +1,11 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
+import urllib.parse
 
 import dp_longctx
 
@@ -120,3 +124,108 @@ class SummaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode()
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class FakeServer:
+    """urllib.request.urlopen stood in: the three routes the tool uses, tokens counted as characters by four, every
+    request's timeout kept, and the tokenizer slow for every thread but the first it hears from, so that one stream's
+    history takes longer to build than another's whole first turn"""
+
+    def __init__(self, slow=0.0):
+        self.slow = slow
+        self.lock = threading.Lock()
+        self.timeouts = []
+        self.first_thread = None
+        self.tokenize_at = []
+        self.chat_at = []
+
+    def __call__(self, request, timeout="unset"):
+        route = urllib.parse.urlparse(request.full_url).path
+        body = json.loads(request.data)
+        with self.lock:
+            self.timeouts.append(timeout)
+            if self.first_thread is None:
+                self.first_thread = threading.get_ident()
+            first = threading.get_ident() == self.first_thread
+        if route == "/apply-template":
+            return FakeResponse({"prompt": dp_longctx.session_text(body["messages"], body["tools"])})
+        if route == "/tokenize":
+            if not first:
+                time.sleep(self.slow)
+            with self.lock:
+                self.tokenize_at.append(time.monotonic())
+            return FakeResponse({"tokens": [0] * chars_by_four(body["content"])})
+        if route == "/v1/chat/completions":
+            with self.lock:
+                self.chat_at.append(time.monotonic())
+            n = chars_by_four(dp_longctx.session_text(body["messages"], body["tools"]))
+            return FakeResponse({"choices": [{"message": {"content": "a reply"}, "finish_reason": "stop"}],
+                                 "timings": {"prompt_n": n, "cache_n": 0, "prompt_ms": 10.0, "predicted_n": 4,
+                                             "predicted_ms": 100.0}})
+        raise AssertionError(route)
+
+
+class ToolRunTest(unittest.TestCase):
+    """main driven end to end, the server stood in and nvidia-smi absent"""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        root = Path(self.folder.name)
+        for i in range(12):
+            path = root / "src" / f"file{i}.cpp"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f"// file {i}\n" + "".join(f"int f{i}_{j}(int x) {{ return x * {j}; }}\n" for j in range(400)))
+        self.out = root / "results" / "run.json"
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def run_tool(self, fake, *extra):
+        with mock.patch.object(dp_longctx.urllib.request, "urlopen", fake), \
+                mock.patch.object(dp_longctx.subprocess, "run", side_effect=OSError("no nvidia-smi")):
+            return dp_longctx.main(["--corpus", self.folder.name, "--context-tokens", "20000", "--out", str(self.out),
+                                    "--memory-every", "0.1", *extra])
+
+    def test_a_response_is_waited_for_as_long_as_the_server_works_unless_a_limit_is_given(self):
+        # twelve 400k first turns at once took about an hour on four cards (docs/torad/glm53-dp.md), longer than a
+        # fixed 3,600 s socket timeout, which would fail every stream of the tool's own headline case before its reply
+        fake = FakeServer()
+        self.assertEqual(self.run_tool(fake, "--streams", "1", "--turns", "1"), 0)
+        self.assertEqual(set(fake.timeouts), {None})
+        fake = FakeServer()
+        self.assertEqual(self.run_tool(fake, "--streams", "1", "--turns", "1", "--timeout", "120"), 0)
+        self.assertEqual(set(fake.timeouts), {120.0})
+
+    def test_the_first_turns_leave_together(self):
+        # a burst of Claude Code windows opens at once: no stream sends its first turn while another is still
+        # building its history, however long that build takes
+        fake = FakeServer(slow=0.05)
+        self.assertEqual(self.run_tool(fake, "--streams", "2", "--turns", "1"), 0)
+        self.assertEqual(len(fake.chat_at), 2)
+        self.assertLess(max(fake.tokenize_at), min(fake.chat_at))
+
+    def test_every_turn_is_on_disk_as_it_lands(self):
+        # a twelve-stream 400k run takes over an hour on rented cards: a run stopped before its end keeps the turns
+        # it measured, one JSON row a line beside the results file, and the results file holds the same rows
+        fake = FakeServer()
+        self.assertEqual(self.run_tool(fake, "--streams", "2", "--turns", "2"), 0)
+        rows = [json.loads(line) for line in self.out.with_suffix(".partial.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted((r["stream"], r["turn"]) for r in rows),
+                         [("s00", 1), ("s00", 2), ("s01", 1), ("s01", 2)])
+        report = json.loads(self.out.read_text())
+        self.assertEqual(sorted((r["stream"], r["turn"]) for r in report["results"]),
+                         sorted((r["stream"], r["turn"]) for r in rows))

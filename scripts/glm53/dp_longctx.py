@@ -6,6 +6,9 @@ server's own count (/apply-template then /tokenize). Turn 1 prefills that whole 
 reply, the user's next ask and one more Read step, and must reuse the cache: a turn that re-evaluates more than a
 quarter of its context is reported as a lost cache. --streams sessions start their first turn together, as a burst of
 Claude Code windows would, and then run their turns independently. Memory is sampled on every card while they run.
+A response is waited for as long as the server works at it (--timeout sets a limit; twelve 400k first turns at once
+take over an hour on four cards), and every turn is appended to <out>.partial.jsonl as it lands, so a run stopped
+before its end keeps what it measured.
 
     python3 scripts/glm53/dp_longctx.py --server http://127.0.0.1:8080 --corpus . \\
         --context-tokens 400000 --streams 12 --turns 3 --out results/dp-12x400k.json
@@ -253,7 +256,7 @@ def peak(samples):
 
 
 class Server:
-    def __init__(self, url, timeout=3600):
+    def __init__(self, url, timeout=None):  # None: wait as long as the server is working on the response
         self.url = url.rstrip("/")
         self.timeout = timeout
 
@@ -283,10 +286,13 @@ def sample_memory(stop, samples, every):
         stop.wait(every)
 
 
-def run_stream(server, number, files, args, results, log):
+def run_stream(server, number, files, args, record, log, start):
     name = f"s{number:02d}"
-    session = build_session(files, args.context_tokens, server.measure, TOOLS, seed=number + 1)
-    size = server.measure(session, TOOLS)
+    try:
+        session = build_session(files, args.context_tokens, server.measure, TOOLS, seed=number + 1)
+        size = server.measure(session, TOOLS)
+    finally:
+        start.wait()  # every first turn leaves together; a failed build still releases the others
     log(f"{name}: history built, {size} tokens, {sum(1 for m in session if m['role'] == 'tool')} reads")
     for turn in range(1, args.turns + 1):
         started = time.monotonic()
@@ -295,9 +301,9 @@ def run_stream(server, number, files, args, results, log):
         choice = response["choices"][0]["message"]
         reply = choice.get("content") or ""
         timings = response.get("timings", {})
-        results.append({"stream": name, "turn": turn, "wall_ms": wall_ms, "timings": timings,
-                        "finish_reason": response["choices"][0].get("finish_reason"), "reply_chars": len(reply),
-                        "tool_calls": len(choice.get("tool_calls") or [])})
+        record({"stream": name, "turn": turn, "wall_ms": wall_ms, "timings": timings,
+                "finish_reason": response["choices"][0].get("finish_reason"), "reply_chars": len(reply),
+                "tool_calls": len(choice.get("tool_calls") or [])})
         log(f"{name}: turn {turn} prompt_n={timings.get('prompt_n')} cache_n={timings.get('cache_n')} "
             f"prompt_ms={timings.get('prompt_ms')} predicted_n={timings.get('predicted_n')} "
             f"predicted_ms={timings.get('predicted_ms')} wall_ms={wall_ms:.0f}")
@@ -316,14 +322,26 @@ def main(argv=None):
     parser.add_argument("--reply-tokens", type=int, default=256)
     parser.add_argument("--memory-every", type=float, default=2.0, help="seconds between nvidia-smi samples")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="seconds to wait for one response (default: no limit; a burst of 400k prefills takes over an hour)")
     args = parser.parse_args(argv)
 
     files = corpus_files(args.corpus)
     if not files:
         parser.error(f"no source files under {args.corpus}")
-    server = Server(args.server)
+    server = Server(args.server, timeout=args.timeout)
     results, samples, lines = [], [], []
     lock = threading.Lock()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    partial = args.out.with_suffix(".partial.jsonl")
+    partial.unlink(missing_ok=True)
+
+    def record(row):
+        # each turn on disk as it lands: a run stopped before its end keeps what it measured
+        with lock:
+            results.append(row)
+            with partial.open("a") as f:
+                f.write(json.dumps(row, default=str) + "\n")
 
     def log(line):
         with lock:
@@ -335,7 +353,8 @@ def main(argv=None):
     sampler.start()
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.streams) as pool:
-        futures = [pool.submit(run_stream, server, i, files, args, results, log) for i in range(args.streams)]
+        start = threading.Barrier(args.streams)
+        futures = [pool.submit(run_stream, server, i, files, args, record, log, start) for i in range(args.streams)]
         failures = []
         for future in futures:
             try:
@@ -349,7 +368,6 @@ def main(argv=None):
     report = {"config": vars(args) | {"corpus": str(args.corpus), "out": str(args.out)},
               "elapsed_s": time.monotonic() - started, "results": results, "summary": summary,
               "vram_peak_mib": peak(samples), "memory_samples": len(samples), "failures": failures, "log": lines}
-    args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, default=str) + "\n")
     print("\n| turn | streams | prompt_n max | cache_n median | prefill ms median | prefill ms max | decode tok/s "
           "median | decode tok/s aggregate |")
