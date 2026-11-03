@@ -307,9 +307,8 @@ struct kpool_stream_out {
     size_t mask_ts  = 0;
 };
 
-// one sequence alone in its stream, from its view: the bytes the loop over the cells of llama_kpool_set_input writes.
-// That loop's caller has zeroed pool_cells, pool_reps, new_cells and the padded mask rows, set pool_bias to -INFINITY, and written
-// the dump pools and sel_mask's dump columns. Returns the most cells a row's tail was granted
+// Build one sequence's maps from its view; return the largest tail.
+// The caller initializes new_cells, padded mask rows, dump pools and sel_mask's dump columns.
 static int64_t kpool_stream_from_view(
         const kpool_stream_out         & o,
         const llama_kpool_views::view  & v,
@@ -336,6 +335,7 @@ static int64_t kpool_stream_from_view(
     const uint16_t * fill = v.fill.data() + off;
 
     std::copy_n(v.slot.data() + off*r, n_run*r, o.pool_cells);
+    std::fill(o.pool_cells + n_run*r, o.pool_cells + o.n_pools*r, 0);
 
     int64_t n_new = 0;
 
@@ -344,6 +344,7 @@ static int64_t kpool_stream_from_view(
 
     if (o.pool_reps) {
         std::copy_n(v.reps.data() + off, n_run, o.pool_reps);
+        std::fill(o.pool_reps + n_run, o.pool_reps + o.n_pools, 0);
 
         for (int64_t p = 0; p < n_run; ++p) {
             if (fill[p] == r) {
@@ -404,12 +405,8 @@ static int64_t kpool_stream_from_view(
     int64_t n_done     = 0;
     int64_t n_tail_max = 0;
 
-    // the device's facts: the cells once, and the positions a row's tail is counted from
-    kpool_tails tails;
-
     if (o.mask_rows) {
         kpool_facts_cells(o.mask_cells, v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv);
-        tails.init(v.pos_at.data(), o.n_kv, kpool_tail_lo(ubatch, s, o.n_tps, seq, r), o.tail_cells != nullptr);
     }
 
     std::mutex merge;
@@ -442,7 +439,24 @@ static int64_t kpool_stream_from_view(
             if (o.mask_rows) {
                 kpool_facts_row(o.mask_rows + 4*ii, q, 0, tail_start, bo_vis);
 
-                n_tail = tails.write(tail_start, q, o.tail_cells ? o.tail_cells + ii*o.n_tail : nullptr, o.n_tail);
+                // A valid view has one cell per position; inspect only the unfinished pool.
+                const int64_t lo = std::max<int64_t>(tail_start, v.b_lo*r);
+                const int64_t hi = std::min<int64_t>(q, (v.b_lo + v.cap)*r - 1);
+
+                for (int64_t p = lo; p <= hi; ++p) {
+                    const int32_t cell = v.slot[p - v.b_lo*r];
+
+                    // Cell 0 is also the empty-slot sentinel.
+                    if (v.pos_at[cell] != p) {
+                        continue;
+                    }
+
+                    if (o.tail_cells) {
+                        GGML_ASSERT(n_tail < o.n_tail);
+                        o.tail_cells[ii*o.n_tail + n_tail] = cell;
+                    }
+                    n_tail++;
+                }
             } else {
                 char * cur_sel  = o.sel_mask  + ii*o.n_sel*o.mask_ts;
                 char * cur_cand = o.cand_mask + ii*o.n_kv *o.mask_ts;
@@ -457,10 +471,12 @@ static int64_t kpool_stream_from_view(
             tail_max = std::max(tail_max, n_tail);
 
             float * q_pool_bias = o.pool_bias + ii*o.n_pools;
+            const int64_t n_vis = std::min(n_run, bo_vis);
 
-            for (int64_t p = 0, n_vis = std::min(n_run, bo_vis); p < n_vis; ++p) {
+            for (int64_t p = 0; p < n_vis; ++p) {
                 q_pool_bias[p] = fill[p] == r ? 0.0f : -INFINITY;
             }
+            std::fill(q_pool_bias + n_vis, q_pool_bias + o.n_pools, -INFINITY);
         }
 
         std::lock_guard<std::mutex> lock(merge);
@@ -678,12 +694,6 @@ int64_t llama_kpool_set_input(
         int32_t * cur_tail_cells = tail_cells ? (int32_t *) tail_cells->data + s*n_padq*n_tail : nullptr;
         float   * cur_pool_bias  = dst_pool_bias  + s*(n_tps*n_pools);
 
-        std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
-
-        llama_host_rows(n_tps, n_pools*(int64_t) sizeof(float), [&](int64_t i0, int64_t i1, int) {
-            std::fill(cur_pool_bias + i0*n_pools, cur_pool_bias + i1*n_pools, -INFINITY);
-        });
-
         // the dump pools name the dump columns, one cell each, so no two slots of a row name one cell
         for (int64_t c = 0; c < r*n_dump; ++c) {
             cur_pool_cells[r*n_pools + c] = (int32_t) (n_kv + c);
@@ -699,8 +709,6 @@ int64_t llama_kpool_set_input(
         const int32_t * any_rep_src = nullptr;
 
         if (kcache) {
-            // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
-            std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
             std::fill(cur_new_cells, cur_new_cells + r*n_new_max, 0);
         }
 
@@ -753,6 +761,17 @@ int64_t llama_kpool_set_input(
             }
 
             views->get_stats().n_direct++;
+        }
+
+        std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
+
+        llama_host_rows(n_tps, n_pools*(int64_t) sizeof(float), [&](int64_t i0, int64_t i1, int) {
+            std::fill(cur_pool_bias + i0*n_pools, cur_pool_bias + i1*n_pools, -INFINITY);
+        });
+
+        if (kcache) {
+            // a pool with no rep gathers row 0; such a pool is -INFINITY in pool_bias, so discarded
+            std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
         }
 
         // the cells named as a rep by the new slots: a byte per cell of the cache, so only on this path, which reads it
