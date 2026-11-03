@@ -112,18 +112,58 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(turn1["streams"], 2)
         self.assertEqual(turn1["prompt_n_max"], 400000)
         self.assertAlmostEqual(turn1["prompt_ms_median"], 122500.0)
-        self.assertAlmostEqual(turn1["decode_tps_median"], (64 / 1000.0 * 1000 + 64 / 1100.0 * 1000) / 2, places=3)
-        self.assertAlmostEqual(turn1["decode_tps_aggregate"], 64 / 1000.0 * 1000 + 64 / 1100.0 * 1000, places=3)
+        self.assertAlmostEqual(turn1["decode_tps_median"], (63 / 1000.0 * 1000 + 63 / 1100.0 * 1000) / 2, places=3)
+        self.assertIsNone(turn1["output_tps_aggregate"])
         self.assertEqual(turn2["prompt_n_max"], 400900)
         self.assertAlmostEqual(turn2["prompt_ms_median"], (400.0 + 121000.0) / 2)
+
+    def test_producer_rate_including_zero_and_legacy_fallback(self):
+        for n, producer, want in [(1, 0, 0), (256, 255, 255), (256, 7, 7)]:
+            row = self.timing("a", 1, 10, 0, n, 10, 1000)
+            row["timings"]["predicted_per_second"] = producer
+            self.assertEqual(dp_longctx.summarize([row])["turns"][0]["decode_tps_median"], want)
+        row = self.timing("a", 1, 10, 0, 256, 10, 1000)
+        self.assertEqual(dp_longctx.summarize([row])["turns"][0]["decode_tps_median"], 255)
+        for ms in [0, -1, None]:
+            row["timings"]["predicted_ms"] = ms
+            self.assertIsNone(dp_longctx.summarize([row])["turns"][0]["decode_tps_median"])
+
+    def test_common_interval_counts_outputs_and_staggered_starts(self):
+        for intervals, want in [([(0, 1), (2, 4)], 5), ([(0, 2), (1, 3)], 20 / 3), ([(2, 4)], 5)]:
+            rows = []
+            for i, (start, end) in enumerate(intervals):
+                row = self.timing(str(i), 1, 10, 0, 10, 10, 1000)
+                row.update(request_start_s=start, request_end_s=end)
+                rows.append(row)
+            self.assertAlmostEqual(dp_longctx.summarize(rows)["turns"][0]["output_tps_aggregate"], want)
+
+    def test_diagnostics_sum_histograms_and_weight_ratios(self):
+        rows = [self.timing(str(i), 1, 10, 0, 10, 10, 1000) for i in range(2)]
+        for row, n, rounds in zip(rows, [1, 9], [1, 3]):
+            row["timings"].update(draft_n=n, draft_n_accepted=1, draft_rounds=rounds,
+                                  draft_delivered_n=2, draft_verify_attempts=2,
+                                  draft_verify_rows_total=3, draft_replay_attempts=1,
+                                  draft_verify_rows={"1": 1, ">8": 2})
+        summary = dp_longctx.summarize(rows)["turns"][0]["diagnostics"]
+        self.assertEqual(summary["draft_n"], 10)
+        self.assertEqual(summary["draft_verify_rows"], {"1": 2, ">8": 4})
+        self.assertEqual(summary["acceptance"], 0.2)
+        self.assertEqual(summary["delivered_per_round"], 1)
+        rows[0]["timings"] = dict(prompt_n=10, prompt_ms=1, predicted_n=1, predicted_ms=1,
+                                   draft_n=0, draft_verify_attempts=3)
+        zero = dp_longctx.summarize(rows[:1])["turns"][0]["diagnostics"]
+        self.assertEqual(zero["draft_n"], 0)
+        self.assertEqual(zero["draft_verify_attempts"], 3)
+        self.assertIsNone(zero["acceptance"])
+        self.assertIsNone(zero["draft_rounds"])
+        rows[1]["timings"].pop("draft_verify_attempts")
+        mixed = dp_longctx.summarize(rows)["turns"][0]["diagnostics"]
+        self.assertEqual(mixed["observations"]["draft_verify_attempts"], 1)
+        self.assertEqual(mixed["requests"], 2)
 
     def test_peak_is_per_card(self):
         self.assertEqual(dp_longctx.peak([[1, 2, 3, 4], [5, 1, 1, 1], [2, 2, 9, 2]]), [5, 2, 9, 4])
         self.assertEqual(dp_longctx.peak([]), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class FakeResponse:
@@ -175,7 +215,8 @@ class FakeServer:
             n = chars_by_four(dp_longctx.session_text(body["messages"], body["tools"]))
             return FakeResponse({"choices": [{"message": {"content": "a reply"}, "finish_reason": "stop"}],
                                  "timings": {"prompt_n": n, "cache_n": 0, "prompt_ms": 10.0, "predicted_n": 4,
-                                             "predicted_ms": 100.0}})
+                                             "predicted_ms": 100.0, "predicted_per_second": 0,
+                                             "draft_verify_attempts": 3, "draft_verify_rows": {">8": 2}}})
         raise AssertionError(route)
 
 
@@ -229,3 +270,15 @@ class ToolRunTest(unittest.TestCase):
         report = json.loads(self.out.read_text())
         self.assertEqual(sorted((r["stream"], r["turn"]) for r in report["results"]),
                          sorted((r["stream"], r["turn"]) for r in rows))
+
+        self.assertEqual(report["results"], rows)
+        for row in rows:
+            self.assertLessEqual(row["request_start_s"], row["request_end_s"])
+            self.assertAlmostEqual(row["wall_ms"], (row["request_end_s"] - row["request_start_s"]) * 1000)
+            self.assertEqual(row["timings"]["draft_verify_rows"], {">8": 2})
+        self.assertEqual(report["summary"]["turns"][0]["diagnostics"]["draft_verify_attempts"], 6)
+        self.assertEqual(report["summary"]["turns"][0]["decode_tps_median"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

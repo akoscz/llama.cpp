@@ -171,3 +171,12 @@ Two regressions, then, both in tensor mode on two cards with no DP flag set: one
 - Alone, a 400k session is served well: 1,681 tokens a second to read, 38 to 47 to decode, the cache kept across turns. Beside eleven others it is not: a 400k read takes about an hour instead of four minutes, and decode beside the reads runs at 2 tokens a second. The rig profile this was for, many Claude Code sessions at 400k, is not served by this tree as it stands.
 - The tree breaks the two-card tensor profile rig serves today, in two places. It cannot merge until both are fixed, with their tests.
 - The path forward for DP prefill is in the gather: card to card by copy engine, as the reduction already goes, then reduce-scatter and a BF16 wire. Expert parallelism over PCIe will not read twelve prompts at four cards' speed, but it need not read them at one card's.
+
+
+### Measurement schema 2
+
+`dp_longctx.py` takes each request's decode rate from the server's `predicted_per_second`, including a literal zero. For old responses without that field it uses `max(predicted_n - 1, 0) / predicted_ms * 1000`; missing or nonpositive durations produce an unavailable rate. The first prompt-logit output is excluded from steady decode work.
+
+Every raw row and partial JSONL row stores `request_start_s` and `request_end_s` on the run's shared monotonic clock, relative to run start. Per-turn `output_tps_aggregate` divides delivered output tokens by `max(request_end_s) - min(request_start_s)`. It includes prefill, queueing, HTTP and gaps between staggered requests. It is not server decode throughput. The old `decode_tps_aggregate` sum of request rates was removed. Historical rows without endpoints have unavailable common-interval throughput. Report `elapsed_s` also includes history construction and sampler shutdown, and is not the throughput denominator.
+
+Raw producer timings and finish reasons are retained. Summary diagnostics sum draft, accepted, delivered, round, verify and replay counters and each verify-row histogram bucket. Acceptance and delivered-per-round use summed paired counts; missing fields remain unavailable rather than observed zeros. These reporting changes do not establish any speedup.
