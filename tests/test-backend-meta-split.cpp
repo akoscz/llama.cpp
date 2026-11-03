@@ -367,12 +367,12 @@ static bool test_stream_view(ggml_backend_dev_t device, ggml_type type, bool sin
     return ok;
 }
 
-static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool sparse, bool long_context = false) {
+static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool sparse, bool long_context = false, bool masked_sparse = false) {
     ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
     if (host_devices[0]) { std::copy(host_devices.begin(), host_devices.end(), devices); }
     auto backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
     auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    const int64_t cells = long_context ? 409600 : 256;
+    const int64_t cells = long_context ? 409600 : masked_sparse ? 8192 : 256;
     const int64_t selected = long_context ? 2080 : 32;
     const int64_t owners[] = {1, 0, 2, 1};
     std::vector<float> result[2];
@@ -394,6 +394,7 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
         for (auto input : {q, selection}) { ggml_set_input(input); ggml_backend_meta_split_input(input, 3, owners, 4); }
         auto out = sparse ? ggml_flash_attn_ext_sparse(ctx, q, k, v, selection, 1.0f/sqrtf(512.0f)) :
             ggml_flash_attn_ext(ctx, q, k, v, selection, 1.0f/sqrtf(512.0f), 0.0f, 0.0f);
+        if (masked_sparse) { ggml_flash_attn_ext_set_n_kv_max(out, 2080); }
         ggml_set_output(out);
         auto graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
@@ -446,7 +447,10 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
                 ggml_backend_tensor_set(selection, ids.data(), 0, ggml_nbytes(selection));
             } else {
                 std::vector<ggml_fp16_t> mask(ggml_nelements(selection));
-                for (size_t i = 0; i < mask.size(); ++i) { mask[i] = ggml_fp32_to_fp16(i % cells < size_t(cells - 7 - iteration) ? 0.0f : -INFINITY); }
+                for (size_t i = 0; i < mask.size(); ++i) {
+                    const bool selected_cell = i % cells < size_t(cells - 7 - iteration) && (!masked_sparse || i % 4 == 0);
+                    mask[i] = ggml_fp32_to_fp16(selected_cell ? 0.0f : -INFINITY);
+                }
                 ggml_backend_tensor_set(selection, mask.data(), 0, ggml_nbytes(selection));
             }
             GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
@@ -941,6 +945,7 @@ int main(int argc, char ** argv) {
         if (!ggml_backend_dev_mapped_buffer_type(gpu)) { printf("mapped host KV unsupported on this backend\n"); return 77; }
         bool ok = true;
         for (int64_t q : {1, 3, 16}) { ok = test_host_attention(gpu, q, false) && test_host_attention(gpu, q, true, true) && ok; }
+        for (int64_t q : {3, 512}) { ok = test_host_attention(gpu, q, false, false, true) && ok; }
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
         }

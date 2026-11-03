@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <type_traits>
 
 // the override must exist: without it &llm_graph_input_kpool::can_reuse names the
@@ -126,7 +127,7 @@ static void test_host_kv_graph_transition() {
     auto & h = model->hparams;
     h.n_layer_all = 1;
     h.n_embd = 512;
-    h.n_head_arr.fill(1);
+    h.n_head_arr.fill(8);
     h.n_head_kv_arr.fill(1);
     h.n_embd_head_k_full = h.n_embd_head_v_full = 512;
     h.n_lora_kv = 512;
@@ -135,46 +136,73 @@ static void test_host_kv_graph_transition() {
     h.indexer_kpool = 32;
     auto cpu = ggml_backend_cpu_init();
 
-    // The fifth 512-token prompt chunk, three-row MTP verification and single-token decode all enter sparse attention here.
-    for (const uint32_t tokens : {512u, 3u, 1u}) {
-        llama_memory_hybrid memory(*model, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false,
-                2560, 256, 0, LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32,
-                1, 1, 0, false, false, [](int32_t) { return true; },
-                [](int32_t) { return false; }, [](int32_t) { return true; }, GGML_TYPE_Q8_0);
-        llama_memory_hybrid_context mctx(&memory);
-        llama_seq_id seq = 0;
-        std::vector<llama_pos> positions(tokens);
-        std::vector<int32_t> n_seq_id(tokens, 1);
-        std::vector<llama_seq_id *> seq_id(tokens, &seq);
-        for (uint32_t i = 0; i < tokens; ++i) { positions[i] = 2560 - tokens + i; }
-        for (int mode = 0; mode < 3; ++mode) {
-            // CPU storage lets this test exercise the actual graph builder without requiring mapped GPU memory.
-            set_host_kv(mode ? "1" : "0");
-            llm_graph_result result(256);
-            result.reset();
-            llm_graph_params params {};
-            params.hparams = h;
-            params.cparams.n_ctx = 2560;
-            params.cparams.n_seq_max = 1;
-            params.cparams.n_seq_devices = 1;
-            params.cparams.flash_attn = mode != 2;
-            params.ubatch.n_tokens = params.ubatch.n_seq_tokens = tokens;
-            params.ubatch.n_seqs = params.ubatch.n_seqs_unq = params.ubatch.n_pos = 1;
-            params.ubatch.pos = positions.data();
-            params.ubatch.n_seq_id = n_seq_id.data();
-            params.ubatch.seq_id = seq_id.data();
-            params.ubatch.seq_id_unq = &seq;
-            params.backend_cpu = cpu;
-            params.res = &result;
-            llm_graph_context graph(params);
-            auto * mask = ggml_new_tensor_4d(graph.ctx0, GGML_TYPE_F16, 2560, tokens, 1, 1);
-            const bool scoring = llama_kpool_needs_scoring(2560, 2560, h.indexer_top_k, h.indexer_kpool);
-            CHECK(scoring, "fresh prompt must enter sparse attention");
-            auto * input = graph.build_inp_kpool(&mctx, mask, scoring);
-            CHECK(bool(input->tail_cells) == (mode == 1),
-                    "host KV sparse graph unavailable: tokens=%u host=%d flash=%d", tokens, mode != 0, mode != 2);
+    // Host storage must keep the resident attention kernel before and after the direct-index cutoff.
+    for (const uint32_t cells : {2560u, 8192u, 32768u}) {
+        for (const uint32_t tokens : {512u, 3u, 1u}) {
+            llama_memory_hybrid memory(*model, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false,
+                    cells, 256, 0, LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32,
+                    1, 1, 0, false, false, [](int32_t) { return true; },
+                    [](int32_t) { return false; }, [](int32_t) { return true; }, GGML_TYPE_Q8_0);
+            llama_memory_hybrid_context mctx(&memory);
+            llama_seq_id seq = 0;
+            std::vector<llama_pos> positions(tokens);
+            std::vector<int32_t> n_seq_id(tokens, 1);
+            std::vector<llama_seq_id *> seq_id(tokens, &seq);
+            for (uint32_t i = 0; i < tokens; ++i) { positions[i] = cells - tokens + i; }
+            for (int mode = 0; mode < 3; ++mode) {
+                // CPU storage lets this test exercise the actual graph builder without requiring mapped GPU memory.
+                set_host_kv(mode ? "1" : "0");
+                llm_graph_result result(256);
+                result.reset();
+                llm_graph_params params {};
+                params.hparams = h;
+                params.cparams.n_ctx = cells;
+                params.cparams.n_seq_max = 1;
+                params.cparams.n_seq_devices = 1;
+                params.cparams.flash_attn = mode != 2;
+                params.ubatch.n_tokens = params.ubatch.n_seq_tokens = tokens;
+                params.ubatch.n_seqs = params.ubatch.n_seqs_unq = params.ubatch.n_pos = 1;
+                params.ubatch.pos = positions.data();
+                params.ubatch.n_seq_id = n_seq_id.data();
+                params.ubatch.seq_id = seq_id.data();
+                params.ubatch.seq_id_unq = &seq;
+                params.backend_cpu = cpu;
+                params.res = &result;
+                llm_graph_context graph(params);
+                auto * mask = ggml_new_tensor_4d(graph.ctx0, GGML_TYPE_F16, cells, tokens, 1, 1);
+                const bool scoring = llama_kpool_needs_scoring(cells, cells, h.indexer_top_k, h.indexer_kpool);
+                CHECK(scoring, "fresh prompt must enter sparse attention");
+                auto * input = graph.build_inp_kpool(&mctx, mask, scoring);
+                const bool direct = mode != 2 && (cells == 32768 || (cells == 8192 && tokens < 512));
+                CHECK(bool(input->tail_cells) == direct,
+                        "host storage changed attention selection: cells=%u tokens=%u host=%d flash=%d", cells, tokens, mode != 0, mode != 2);
+                if (mode == 2) { continue; }
+                llm_graph_input_attn_k attn(h, params.cparams, mctx.get_attn());
+                attn.self_k_idxs = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I64, tokens);
+                attn.self_kq_mask_cnv = mask;
+                auto * q = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_F32, 512, 8, tokens);
+                auto * k = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_F32, 512, 1, tokens);
+                auto * top_k = ggml_new_tensor_3d(graph.ctx0, GGML_TYPE_I32, 2048, tokens, 1);
+                try {
+                    auto * out = graph.build_attn_sparse(&attn, nullptr, nullptr, nullptr, q, k, k, nullptr,
+                            nullptr, nullptr, top_k, input->sel_mask, input->cand_mask, input->n_tail, 1.0f, 0, input->tail_cells);
+                    ggml_build_forward_expand(graph.gf, out);
+                    bool found = false;
+                    for (int i = 0; i < ggml_graph_n_nodes(graph.gf); ++i) {
+                        auto * node = ggml_graph_node(graph.gf, i);
+                        if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) {
+                            found = true;
+                            CHECK((node->op == GGML_OP_FLASH_ATTN_EXT_SPARSE) == direct,
+                                    "attention kernel differs: cells=%u tokens=%u host=%d", cells, tokens, mode != 0);
+                        }
+                    }
+                    CHECK(found, "missing flash attention node");
+                } catch (const std::runtime_error & error) {
+                    CHECK(false, "attention graph refused: cells=%u tokens=%u host=%d: %s", cells, tokens, mode != 0, error.what());
+                }
+            }
+            set_host_kv("0");
         }
-        set_host_kv("0");
     }
     ggml_backend_free(cpu);
     set_host_kv(had_previous ? saved.c_str() : nullptr);
