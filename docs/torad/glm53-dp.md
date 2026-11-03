@@ -1,6 +1,6 @@
 # GLM-5.3-Flash with data-parallel attention
 
-Experimental work in [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), stacked on #92. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. Memory capacity and speed on that hardware have not been measured. Do not treat the bandwidth estimates as benchmark results.
+Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The limited four-card results below do not qualify that capacity or throughput. Do not treat the bandwidth estimates as benchmark results.
 
 ## What `-sm dp` does
 
@@ -10,11 +10,12 @@ The first implementation requires GLM5NEXT, equal device shares, all layers on G
 
 ## Build
 
-Use the PR branch, a CUDA toolkit supporting the target cards, and the same build on every comparison:
+Use main, a CUDA toolkit supporting the target cards, and the same pinned build on every comparison:
 
 ```sh
-git fetch origin train/glm53-dp
-git switch train/glm53-dp
+git fetch origin main
+git switch main
+git merge --ff-only origin/main
 cmake -S . -B build-dp -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build-dp --parallel 6 --target llama-server llama-perplexity test-llama-archs test-speculative-mtp test-backend-ops test-backend-meta-split test-backend-meta-allreduce-copy
 build-dp/bin/llama-server --list-devices
