@@ -2,6 +2,12 @@
 
 Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The limited four-card results below do not qualify that capacity or throughput. Do not treat the bandwidth estimates as benchmark results.
 
+## Convergence baseline validation
+
+Runtime source `f089c9cb4bc285a11e510e1c4336b95aca449b08` passed CPU and CUDA builds, 35 focused CPU CTests, the three tensor-mode regressions on CPU/CUDA, and 108 expert-partition cases on CPU and each local RTX 5080 / RTX 5070 Ti. The portable `engine-f089c9c` package passed Rig's Ubuntu 22.04 driver-only installation/decode gate with the small stories260K-f32 test model. Later baseline commits change documentation only.
+
+The full CUDA GLM architecture command still reproduces the known unsplit-prefix discrepancy, max_abs `2.96160579e-06`. The Meta teardown warning and four-card host gather bottleneck remain. These component checks do not qualify the full model, forty-slot capacity, or two concurrent 400K sessions with the six-slot 1M tensor configuration.
+
 ## What `-sm dp` does
 
 Each sequence belongs to device `seq_id % device_count`. Its attention cache, recurrent state, k-pool and MTP hidden-state storage stay on that device. Dense weights are replicated. Routed experts are divided by expert index; a gather before each expert block and a reduction after it combine their work. A single stream can be slower than tensor parallelism because its dense path runs on one card.
