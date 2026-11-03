@@ -1330,6 +1330,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             return ret;
         }
 
+        if (tensor->op == GGML_OP_KPOOL_MASK && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            const int mode = ggml_get_op_params_i32(tensor, 0);
+            const bool indices = mode == GGML_KPOOL_MASK_INDICES && ggml_get_op_params_i32(tensor, 2) > 0;
+            GGML_ASSERT(mode >= GGML_KPOOL_MATERIALIZE_FACTS || indices);
+            // Resident slots cover the whole cache; the rows select only this ubatch's device-local slots.
+            auto ret = src_ss[1];
+            ret.axis = mode == GGML_KPOOL_MATERIALIZE_BIAS ? GGML_BACKEND_SPLIT_AXIS_2 :
+                mode == GGML_KPOOL_MATERIALIZE_FACTS || indices ? GGML_BACKEND_SPLIT_AXIS_3 : GGML_BACKEND_SPLIT_AXIS_1;
+            for (size_t j = 0; j < n_bufs; ++j) { GGML_ASSERT(ret.ne[j] == 0 || src_ss[0].ne[j] > 0); }
+            return ret;
+        }
+
         // A complete tensor on one device stays local even when a reshape removes its singleton split axis.
         if (!(tensor->flags & GGML_TENSOR_FLAG_META) && tensor->op != GGML_OP_MUL_MAT_ID && tensor->op != GGML_OP_PAD &&
                 (tensor->op != GGML_OP_SET_ROWS || src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
@@ -2808,13 +2821,21 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
+    // Incremental metadata patches use the same device intervals as checkpoint transfers.
+    if (ggml_backend_meta_outer_ranges(tensor, split_state, n_backends, offset, size,
+            [&](size_t rank, size_t local, size_t source, size_t bytes) {
+                ggml_backend_tensor_set_async(ggml_backend_meta_simple_backend(backend, rank),
+                    ggml_backend_meta_buffer_simple_tensor(tensor, rank), (const char *) data + source, local, bytes);
+            })) { return; }
+
     // A copy of the caller's data goes to each device as it is (a mirror) or as one chunk (a split in one segment, set
     // whole). The rest (a partial sum's shares, made on the host; several segments; a split set from an offset) the
     // buffer's set writes synchronously, once the devices have finished the work queued before it.
     const bool mirrored = split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     const bool chunked  = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
         split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_3) && split_state.n_segments == 1 && split_state.nr[0] == 1 &&
-        offset == 0 && ggml_is_contiguous(tensor);
+        offset == 0 && ggml_is_contiguous(tensor) && size %
+            (split_state.axis == GGML_BACKEND_SPLIT_AXIS_3 ? ggml_nbytes(tensor) : tensor->nb[split_state.axis + 1]) == 0;
     if (!mirrored && !chunked) {
         for (size_t j = 0; j < n_backends; j++) {
             ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));

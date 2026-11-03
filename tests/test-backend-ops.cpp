@@ -6112,10 +6112,13 @@ struct test_mul_mat_id : public test_case {
 
 struct test_mul_mat_id_partition : public test_mul_mat_id {
     const int first;
-    test_mul_mat_id_partition(ggml_type type, bool broadcast, int64_t tokens, int first)
-        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, broadcast, 256, tokens, 256), first(first) {}
+    const int local;
+    const bool fused;
+    test_mul_mat_id_partition(ggml_type type, bool broadcast, int64_t tokens, int first,
+            int total = 8, int used = 2, int local = 2, int64_t m = 256, int64_t k = 256, bool fused = false)
+        : test_mul_mat_id(type, GGML_TYPE_F32, total, used, broadcast, m, tokens, k), first(first), local(local), fused(fused) {}
 
-    std::string vars() override { return test_mul_mat_id::vars() + "," + VAR_TO_STR(first); }
+    std::string vars() override { return test_mul_mat_id::vars() + "," + VARS_TO_STR3(first, local, fused); }
 
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_PARTITION"; }
 
@@ -6124,8 +6127,15 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
         ggml_tensor * as = out->src[0];
-        out->src[0] = ggml_view_3d(ctx, as, k, m, 2, as->nb[1], as->nb[2], first*as->nb[2]);
+        out->src[0] = ggml_view_3d(ctx, as, k, m, local, as->nb[1], as->nb[2], first*as->nb[2]);
         ggml_mul_mat_id_set_expert_range(out, first, n_mats);
+        if (fused) {
+            out->src[0] = ggml_new_tensor_3d(ctx, type_a, k, m, local);
+            ggml_tensor * gate_weights = ggml_dup_tensor(ctx, out->src[0]);
+            ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, out->src[1], out->src[2]);
+            ggml_mul_mat_id_set_expert_range(gate, first, n_mats);
+            out = ggml_swiglu_split(ctx, ggml_clamp(ctx, gate, -INFINITY, 7.0f), ggml_clamp(ctx, out, -7.0f, 7.0f));
+        }
         return out;
     }
 
@@ -9833,25 +9843,26 @@ struct test_kpool_materialize : public test_case {
     const int n_rows;
     const bool empty;
     const bool direct;
+    const int streams;
     const int64_t capacity = 512, r = 4, cap = capacity/r + 2, n_kv = 256, n_pools = 70, n_dump = 16;
 
-    test_kpool_materialize(int mode, int n_rows, bool empty, bool direct = false)
-        : mode(mode), n_rows(n_rows), empty(empty), direct(direct) {}
+    test_kpool_materialize(int mode, int n_rows, bool empty, bool direct = false, int streams = 1)
+        : mode(mode), n_rows(n_rows), empty(empty), direct(direct), streams(streams) {}
 
-    std::string vars() override { return VARS_TO_STR4(mode, n_rows, empty, direct); }
+    std::string vars() override { return VARS_TO_STR5(mode, n_rows, empty, direct, streams); }
     double max_nmse_err() override { return 0.0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto * table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*capacity + cap*(r + 2));
-        auto * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, n_rows);
+        auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2*capacity + cap*(r + 2), streams == 1 ? 1 : streams + 1);
+        auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, streams == 1 ? 6 : 7, n_rows, streams);
         ggml_set_name(table, "resident_table");
         ggml_set_name(rows, "resident_rows");
         auto * out = ggml_kpool_materialize(ctx, table, rows, capacity, r, n_kv, n_pools, n_dump,
                 (ggml_kpool_materialize_mode) mode);
         if (direct) {
-            auto * mask_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_rows, 1);
-            auto * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 64, n_rows, 1);
-            auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, n_rows, 1);
+            auto * mask_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_rows, streams);
+            auto * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 64, n_rows, streams);
+            auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, n_rows, streams);
             ggml_set_name(mask_rows, "mask_rows");
             ggml_set_name(selected, "selected");
             ggml_set_name(tail, "tail");
@@ -9866,29 +9877,32 @@ struct test_kpool_materialize : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             std::vector<int32_t> data(ggml_nelements(t), 0);
             if (strcmp(t->name, "resident_table") == 0) {
-                std::fill(data.begin(), data.begin() + 2*capacity, -1);
-                if (!empty) {
+                for (int s = 0; s < t->ne[1]; ++s) {
+                    auto * table = data.data() + s*t->ne[0];
+                    std::fill_n(table, 2*capacity, -1);
+                    if (empty) { continue; }
                     for (int64_t p = 2; p < 63; ++p) {
                         for (int64_t j = 0; j < r; ++j) {
                             if (p%11 == 0 && j == 2) { continue; }
-                            const int64_t cell = (p*r + j)*37%capacity;
-                            data[cell] = (int32_t) ((7 + p)*r + j);
-                            data[2*capacity + p*r + j] = (int32_t) cell;
-                            data[2*capacity + cap*r + p]++;
+                            const int64_t cell = ((p*r + j)*37 + 19*s)%capacity;
+                            table[cell] = (int32_t) ((7 + p + 4*s)*r + j);
+                            table[2*capacity + p*r + j] = (int32_t) cell;
+                            table[2*capacity + cap*r + p]++;
                             if (p%11 != 0) {
-                                data[capacity + cell] = (int32_t) (7 + p);
-                                if (j == r - 1) { data[2*capacity + cap*(r + 1) + p] = (int32_t) cell; }
+                                table[capacity + cell] = (int32_t) (7 + p + 4*s);
+                                if (j == r - 1) { table[2*capacity + cap*(r + 1) + p] = (int32_t) cell; }
                             }
                         }
                     }
                 }
             } else if (strcmp(t->name, "resident_rows") == 0 || strcmp(t->name, "mask_rows") == 0) {
-                for (int i = 0; i < n_rows; ++i) {
-                    const int32_t q = 40 + 17*i, base = empty ? 0 : 9;
+                for (int i = 0; i < n_rows*streams; ++i) {
+                    const int slot = streams == 1 ? 0 : streams - i/n_rows;
+                    const int32_t q = 40 + 17*(i%n_rows) + 4*slot*r, base = empty ? 0 : 9 + 4*slot;
                     const int32_t tail = (q + 1)/r*r, vis = std::max<int32_t>(0, tail/r - base);
-                    if (t->ne[0] == 6) {
-                        const int32_t row[] = {q, base, tail, vis, empty ? 0 : 7, empty ? 0 : 61};
-                        std::copy_n(row, 6, data.data() + 6*i);
+                    if (t->ne[0] >= 6) {
+                        const int32_t row[] = {q, base, tail, vis, empty ? 0 : 7 + 4*slot, empty ? 0 : 61, slot};
+                        std::copy_n(row, t->ne[0], data.data() + t->ne[0]*i);
                     } else {
                         const int32_t row[] = {q, 0, tail, vis};
                         std::copy_n(row, 4, data.data() + 4*i);
@@ -10629,6 +10643,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    for (int64_t tokens : {1, 3, 8, 16}) {
+        for (int first : {0, 6}) {
+            test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, first, 8, 2, 2, 256, 256, true));
+        }
+    }
+    for (int local : {72, 144}) {
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, 512, 288 - local, 288, 8, local, 2048, 4096));
+        test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, 512, 0, 288, 8, local, 4096, 2048));
     }
     std::default_random_engine rng(0);
 
@@ -13357,8 +13380,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int rows : {1, 2, 3, 65}) {
             for (bool empty : {false, true}) {
                 test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty));
+                test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, false, 3));
                 if (mode == GGML_KPOOL_MATERIALIZE_FACTS) {
                     test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true));
+                    test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true, 3));
                 }
             }
         }

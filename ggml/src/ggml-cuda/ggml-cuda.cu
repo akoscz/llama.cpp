@@ -3336,12 +3336,47 @@ static void ggml_cuda_dp_expert_stats_free(ggml_backend_cuda_context & ctx) {
 }
 
 static __global__ void ggml_cuda_local_expert_ids(const int32_t * ids, int32_t * local,
-        int64_t n, int n_used, int64_t stride, int first, int count, unsigned long long * hits) {
+        int64_t n, int n_used, int64_t stride, int first, int count, int missing, unsigned long long * hits) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i < n) {
         const int expert = ids[(i/n_used)*stride + i % n_used] - first;
-        local[i] = expert >= 0 && expert < count ? expert : count;
-        if (hits && local[i] < count) { atomicAdd(hits + local[i], 1ULL); }
+        const bool owned = expert >= 0 && expert < count;
+        local[i] = owned ? expert : missing;
+        if (hits && owned) { atomicAdd(hits + expert, 1ULL); }
+    }
+}
+
+static void ggml_cuda_mul_mat_id_partition(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * ids = mm->src[2];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool vector = ggml_is_quantized(src0->type) && mm->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(!fusion || vector);
+    const int64_t n = ggml_nelements(ids);
+    ggml_cuda_pool_alloc<int32_t> local_ids(ctx.pool(), n);
+    auto * hits = ggml_cuda_dp_expert_counters(ctx, mm);
+    ggml_cuda_local_expert_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, local_ids.get(), n, ids->ne[0], ids->nb[1]/sizeof(int32_t),
+        ggml_get_op_params_i32(mm, 1), src0->ne[2], vector ? -1 : src0->ne[2], hits);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    ggml_tensor mapped = *ids;
+    mapped.data = local_ids.get();
+    mapped.nb[1] = mapped.ne[0]*sizeof(int32_t);
+    mapped.nb[2] = mapped.nb[1]*mapped.ne[1];
+    mapped.nb[3] = mapped.nb[2];
+    if (vector) {
+        // The temporary tensor's address can recur for unrelated routing buffers.
+        ctx.mmvq_moe_ids[ctx.curr_stream_no] = nullptr;
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, &mapped, dst, fusion);
+        ctx.mmvq_moe_ids[ctx.curr_stream_no] = nullptr;
+    } else if (ggml_is_quantized(src0->type)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, &mapped, dst);
+    } else {
+        ggml_cuda_mul_mat_f(ctx, src0, src1, &mapped, dst);
     }
 }
 
@@ -3358,26 +3393,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if (ggml_get_op_params_i32(dst, 2) > 0) {
-        GGML_ASSERT(ggml_is_contiguous(dst) && ids->nb[0] == sizeof(int32_t));
         GGML_ASSERT(!ggml_cuda_mul_mat_id_needs_sync(dst, cc));
-        const int64_t n = ggml_nelements(ids);
-        ggml_cuda_pool_alloc<int32_t> local_ids(ctx.pool(), n);
-        auto * hits = ggml_cuda_dp_expert_counters(ctx, dst);
-        ggml_cuda_local_expert_ids<<<(n + 255)/256, 256, 0, ctx.stream()>>>(
-            (const int32_t *) ids->data, local_ids.get(), n, ids->ne[0], ids->nb[1]/sizeof(int32_t),
-            ggml_get_op_params_i32(dst, 1), src0->ne[2], hits);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
-        ggml_tensor mapped = *ids;
-        mapped.data = local_ids.get();
-        mapped.nb[1] = mapped.ne[0]*sizeof(int32_t);
-        mapped.nb[2] = mapped.nb[1]*mapped.ne[1];
-        mapped.nb[3] = mapped.nb[2];
-        if (ggml_is_quantized(src0->type)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, &mapped, dst);
-        } else {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, &mapped, dst);
-        }
+        ggml_cuda_mul_mat_id_partition(ctx, dst, dst);
         return;
     }
 
@@ -5489,7 +5506,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(node, 2) > 0) { return 0; }
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(node, 2) > 0) {
+        for (const bool clamped : {false, true}) {
+            const bool matches = clamped
+                ? !ggml_env_switch("GGML_CUDA_GLU_LIMIT_FUSE_LEGACY") && ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU}, {})
+                : ggml_cuda_can_fuse(cgraph, i, {GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU}, {});
+            if (!matches) { continue; }
+            ggml_tensor * glu = cgraph->nodes[i + (clamped ? 4 : 2)];
+            ggml_tensor * gate = clamped ? glu->src[0]->src[0] : glu->src[0];
+            ggml_tensor * up = clamped ? glu->src[1]->src[0] : glu->src[1];
+            if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
+                    gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+                    ggml_get_op_params_i32(gate, 1) != ggml_get_op_params_i32(up, 1) ||
+                    ggml_get_op_params_i32(gate, 2) != ggml_get_op_params_i32(up, 2) ||
+                    !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+                    !ggml_cuda_should_fuse_mul_mat_vec_q(up, true, gate->src[0])) { continue; }
+            ggml_cuda_mm_fusion_args_host fusion{};
+            fusion.gate = gate->src[0];
+            fusion.glu_op = ggml_get_glu_op(glu);
+            fusion.glu_limit = clamped ? ggml_cuda_glu_limit(glu->src[0], glu->src[1]) : 0.0f;
+            ggml_cuda_mul_mat_id_partition(*cuda_ctx, up, glu, &fusion);
+            return clamped ? 4 : 2;
+        }
+        return 0;
+    }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading

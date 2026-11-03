@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -19,7 +20,7 @@ class llama_kv_cells;
 // Cache-owned tensors outlive graph allocator resets. Graph inputs retain shared
 // ownership when a new selection width replaces an old allocation.
 struct llama_kpool_backend_tensor {
-    llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count);
+    llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count, int64_t slots = 1, uint32_t devices = 1);
     ~llama_kpool_backend_tensor();
     llama_kpool_backend_tensor(const llama_kpool_backend_tensor &) = delete;
     llama_kpool_backend_tensor & operator=(const llama_kpool_backend_tensor &) = delete;
@@ -127,12 +128,16 @@ public:
     const view * serve(const llama_kv_cells & cells, llama_seq_id seq, uint32_t r, int64_t n_kv, int64_t n_pools);
 
     stats & get_stats() { return st; }
+    void reserve_views(size_t count) { n_views_max = std::max(n_views_max, count); }
+    std::shared_ptr<llama_kpool_backend_tensor> resident_bank(ggml_backend_buffer_type_t buft,
+            int64_t count, uint32_t slots, uint32_t devices);
 
 private:
     void sync(const llama_kv_cells & cells, uint32_t r);
 
     // a sequence past this many takes the maps built from the cells
-    static constexpr size_t n_views_max = 8;
+    size_t n_views_max = 8;
+    std::shared_ptr<llama_kpool_backend_tensor> bank;
 
     std::map<llama_seq_id, view> views;
 
@@ -329,7 +334,8 @@ public:
     ggml_backend_sched_t sched = nullptr;
     std::shared_ptr<llama_kpool_backend_tensor> resident_table;
     llama_seq_id resident_seq = -1;
-    ggml_tensor * resident_rows = nullptr; // [6, Q], see ggml_kpool_materialize
+    std::vector<llama_seq_id> resident_seqs; // bank users, in device/sequence order
+    ggml_tensor * resident_rows = nullptr; // [6,Q] or [7,Q,streams], see ggml_kpool_materialize
     uint64_t resident_upload_bytes = 0;
     uint64_t resident_upload_calls = 0;
     bool reuse_only = false;

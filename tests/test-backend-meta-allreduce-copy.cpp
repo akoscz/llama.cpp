@@ -28,6 +28,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,17 +66,21 @@ static int  n_pipelines       = 0;     // "initialized AllReduce pipeline" lines
 static bool last_one_stream   = false; // the last one's copy-engine receives run after its sends
 static bool last_card_to_card = false; // the last one's copy-engine receives come card to card
 static bool last_p2p          = false; // the last one's cards map each other's memory: its LL card-to-card limit is above 0
+static bool last_gather_peer  = false;
+static std::atomic<int> n_captures{0};
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
     if (strstr(text, "initialized AllReduce pipeline") != nullptr) {
         n_pipelines++;
         last_one_stream   = strstr(text, "receives after the sends") != nullptr;
         last_card_to_card = strstr(text, "receives card to card") != nullptr;
+        last_gather_peer = strstr(text, "large gather card to card") != nullptr;
         const char * ll   = strstr(text, "LL card to card up to ");
         unsigned long long ll_bytes = 0;
         last_p2p = ll != nullptr && sscanf(ll, "LL card to card up to %llu", &ll_bytes) == 1 && ll_bytes > 0;
         fputs(text, stderr);
     }
+    if (strstr(text, "ggml_backend_cuda_capture_end") && strstr(text, " nodes, ")) { ++n_captures; }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);
     }
@@ -202,6 +207,55 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & v)
     return err/sum;
 }
 
+static ggml_backend_meta_split_state mirrored(const ggml_tensor *, void *) {
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// Several gathers in one graph, followed by replay with new data, exercise the shared parity ring across captures.
+static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t rows) {
+    auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), mirrored, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    auto * ctx = ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, rows);
+    std::vector<int64_t> owned(devices.size(), 0);
+    owned.front() = 1;
+    owned.back() = rows - 1;
+    ggml_backend_meta_split_input(input, 1, owned.data(), owned.size());
+    ggml_set_input(input);
+    ggml_tensor * out = input;
+    for (int step = 0; step < 4; ++step) {
+        out = ggml_backend_meta_gather(ctx, ggml_scale(ctx, out, 2.0f));
+        if (step != 3) {
+            std::rotate(owned.begin(), owned.begin() + 1, owned.end());
+            out = ggml_backend_meta_scatter(ctx, out, 1, owned.data(), owned.size());
+        }
+    }
+    ggml_set_output(out);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    auto * alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    std::vector<float> values(ggml_nelements(input)), got(values.size());
+    bool ok = true;
+    const int captures_before = n_captures;
+    for (int iteration = 0; iteration < 6; ++iteration) {
+        for (size_t j = 0; j < values.size(); ++j) { values[j] = float(int((j + iteration*7) % 1024) - 512); }
+        ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+        const bool ran = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        ok = ok && ran;
+        if (!ran) { break; }
+        ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+        for (size_t j = 0; j < got.size(); ++j) { ok = ok && got[j] == 16.0f*values[j]; }
+    }
+    ok = ok && n_captures > captures_before;
+    printf("%s: %zu-rank gather graph, %lld rows, rotating empty ranks, %d captures\n",
+        ok ? "ok" : "FAIL", devices.size(), (long long) rows, n_captures.load() - captures_before);
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+}
+
 // Direct collectives check every rank, including tails and inactive ranks. The graph tests below check delayed producers.
 static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool require_p2p) {
     const int n = (int) devices.size();
@@ -251,7 +305,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             const bool peer_requested = route.p2p[0] != '0';
             const bool peer_active = last_p2p;
             if (last_one_stream != route.one_stream || (!peer_requested && (last_p2p || last_card_to_card)) ||
-                    (peer_requested && require_p2p && (!last_p2p || (route.copy[0] == '1' && !last_card_to_card)))) {
+                    (peer_requested && require_p2p && (!last_p2p || !last_gather_peer || (route.copy[0] == '1' && !last_card_to_card)))) {
                 fprintf(stderr, "FAIL: %d-rank %s did not select the required transport\n", n, route.name);
                 free(comm);
                 for (auto backend : backends) { ggml_backend_free(backend); }
@@ -269,7 +323,7 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                     return 1;
                 }
             }
-            std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079};
+            std::vector<int64_t> sizes = {1, 3, 17, 4097, 131079, 512*4096 + 3};
             if (route.copy[0] == '1') {
                 sizes.push_back(32*1024*1024/(bf16 ? 2 : 4) + 3);
             }
@@ -336,13 +390,16 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
                         }
                     }
                 }
-                if (ne <= 131079) {
+                if (ne <= 512*4096 + 3) {
                     std::vector<uint32_t> words(ne), want(ne), got(ne);
                     for (int iteration = 0; iteration < 6; ++iteration) {
-                        for (int64_t j = 0; j < ne; ++j) { want[j] = 0x7fc00000u | (uint32_t) (j + iteration); }
+                        for (int64_t j = 0; j < ne; ++j) {
+                            want[j] = iteration >= 4 && j % n == iteration % n ? 0 : 0x7fc00000u | (uint32_t) (j + iteration);
+                        }
                         for (int rank = 0; rank < n; ++rank) {
-                            tensors[rank]->flags = GGML_TENSOR_FLAG_COMPUTE;
-                            for (int64_t j = 0; j < ne; ++j) { words[j] = j % n == rank ? want[j] : 0; }
+                            const bool active = iteration < 4 || rank != iteration % n;
+                            tensors[rank]->flags = active ? GGML_TENSOR_FLAG_COMPUTE : 0;
+                            for (int64_t j = 0; j < ne; ++j) { words[j] = !active ? 0xffffffffu : j % n == rank ? want[j] : 0; }
                             ggml_backend_tensor_set(tensors[rank], words.data(), 0, words.size()*sizeof(uint32_t));
                         }
                         const bool ran = gather(comm, tensors.data());
@@ -365,6 +422,11 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
             }
             if (pair_comm) { free(pair_comm); }
             free(comm);
+            if (!bf16 && (strcmp(route.name, "peer copy") == 0 || strcmp(route.name, "host chunked") == 0)) {
+                set_env("GGML_CUDA_GRAPH_MAX", "0");
+                ok = test_gather_graph(devices, 512) && ok;
+                ok = test_gather_graph(devices, 513) && ok;
+            }
         }
     }
     for (auto backend : backends) { ggml_backend_free(backend); }

@@ -1496,10 +1496,15 @@ int64_t llama_kv_cache_set_input_kpool(
     return n_tail;
 }
 
-llama_kpool_backend_tensor::llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count) {
+llama_kpool_backend_tensor::llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count, int64_t slots, uint32_t devices) {
     ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
-    tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, count);
+    tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, count, slots);
     ggml_set_name(tensor, "kpool_owned_metadata");
+    if (devices > 1) {
+        std::vector<int64_t> counts(devices);
+        for (uint32_t d = 0; d < devices; ++d) { counts[d] = (slots + devices - 1 - d)/devices; }
+        ggml_backend_meta_split_input(tensor, 1, counts.data(), counts.size());
+    }
     buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     GGML_ASSERT(buffer);
 }
@@ -1550,6 +1555,14 @@ std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_views::view::resident(gg
     GGML_ASSERT(ggml_backend_buffer_get_type(storage->buffer) == buft);
     GGML_ASSERT(storage->tensor->ne[0] == (int64_t) resident_size());
     return storage;
+}
+
+std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_views::resident_bank(
+        ggml_backend_buffer_type_t buft, int64_t count, uint32_t slots, uint32_t devices) {
+    if (!bank) { bank = std::make_shared<llama_kpool_backend_tensor>(buft, count, slots, devices); }
+    GGML_ASSERT(ggml_backend_buffer_get_type(bank->buffer) == buft);
+    GGML_ASSERT(bank->tensor->ne[0] == count && bank->tensor->ne[1] == slots);
+    return bank;
 }
 
 void llama_kpool_draft::capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv,
@@ -1630,47 +1643,65 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     if (resident_table) {
         auto & views = mctx_attn->get_kv()->get_kpool_views();
         views.begin();
-        const auto & cells = mctx_attn->get_kv()->get_cells(resident_seq);
-        const auto * v = views.serve(cells, resident_seq, kpool, mask_cells->ne[0], pool_bias->ne[0]);
-        GGML_ASSERT(v && ubatch->n_seqs_unq == 1 && ubatch->seq_id_unq[0] == resident_seq);
+        const bool bank = !resident_seqs.empty();
+        GGML_ASSERT(bank ? resident_seqs.size() == ubatch->n_seqs_unq :
+                ubatch->n_seqs_unq == 1 && ubatch->seq_id_unq[0] == resident_seq);
         auto * backend = ggml_backend_sched_get_tensor_backend(sched, resident_table->tensor);
         GGML_ASSERT(backend);
         resident_table->begin_upload(backend);
-        resident_upload_bytes += v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
-            resident_table->upload(off, data, count);
-            ++resident_upload_calls;
-        });
+        const int64_t n_tps = ubatch->n_tokens/ubatch->n_seqs_unq;
+        if (tail_cells) std::fill_n((int32_t *) tail_cells->data, ggml_nelements(tail_cells), -1);
+        if (!reuse_only) std::fill_n((int32_t *) new_pool_cells->data, ggml_nelements(new_pool_cells), 0);
+        for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+            const auto seq = ubatch->seq_id_unq[s];
+            GGML_ASSERT(!bank || resident_seqs[s] == seq);
+            const auto & cells = mctx_attn->get_kv()->get_cells(seq);
+            const auto * v = views.serve(cells, seq, kpool, mask_cells->ne[0], pool_bias->ne[0]);
+            GGML_ASSERT(v);
+            int64_t slot = bank ? seq/n_seq_devices : 0;
+            int64_t bank_slot = slot;
+            for (uint32_t d = 0; bank && d < uint32_t(seq)%n_seq_devices; ++d) {
+                bank_slot += (resident_table->tensor->ne[1] + n_seq_devices - 1 - d)/n_seq_devices;
+            }
+            GGML_ASSERT(bank_slot >= 0 && bank_slot < resident_table->tensor->ne[1]);
+            const size_t table_offset = bank_slot*resident_table->tensor->ne[0];
+            resident_upload_bytes += v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+                resident_table->upload(table_offset + off, data, count);
+                ++resident_upload_calls;
+            });
+            const int64_t base = v->n ? cells.seq_pos_min(seq)/kpool : 0;
+            const int64_t run = v->n ? cells.seq_pos_max(seq)/kpool - base + 1 : 0;
+            auto * params = (int32_t *) resident_rows->data;
+            const int width = resident_rows->ne[0];
+            for (int64_t row = 0; row < n_tps; ++row) {
+                const int64_t i = s*n_tps + row;
+                const int32_t tail = (ubatch->pos[i] + 1)/kpool*kpool;
+                params[width*i + 0] = ubatch->pos[i];
+                params[width*i + 1] = base;
+                params[width*i + 2] = tail;
+                params[width*i + 3] = std::max<int64_t>(0, tail/kpool - base);
+                params[width*i + 4] = v->b_lo;
+                params[width*i + 5] = run;
+                if (bank) params[width*i + 6] = slot;
+            }
+            kpool_stream_out o;
+            o.mask_rows = (int32_t *) mask_rows->data + s*n_tps*4;
+            o.tail_cells = tail_cells ? (int32_t *) tail_cells->data + s*n_tps*tail_cells->ne[0] : nullptr;
+            o.n_tail = tail_cells ? tail_cells->ne[0] : 0;
+            o.n_kv = mask_cells->ne[0];
+            o.n_pools = pool_bias->ne[0];
+            o.n_tps = n_tps;
+            o.r = kpool;
+            if (!reuse_only) {
+                o.new_cells = (int32_t *) new_pool_cells->data + s*new_pool_cells->ne[0];
+                o.new_reps = (int64_t *) new_pool_reps->data + s*n_new_max;
+                o.n_new_max = n_new_max;
+                o.strm_row = (bank ? slot : (int64_t) mctx_idx->get_strm(s))*mctx_idx->get_kv()->get_size();
+            }
+            const auto tail = kpool_stream_from_view(o, *v, cells, seq, ubatch, s, rebuild);
+            GGML_ASSERT(tail <= n_tail);
+        }
         resident_table->end_upload();
-        const int64_t base = v->n ? cells.seq_pos_min(resident_seq)/kpool : 0;
-        const int64_t run = v->n ? cells.seq_pos_max(resident_seq)/kpool - base + 1 : 0;
-        auto * params = (int32_t *) resident_rows->data;
-        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            const int32_t tail = (ubatch->pos[i] + 1)/kpool*kpool;
-            params[6*i + 0] = ubatch->pos[i];
-            params[6*i + 1] = base;
-            params[6*i + 2] = tail;
-            params[6*i + 3] = std::max<int64_t>(0, tail/kpool - base);
-            params[6*i + 4] = v->b_lo;
-            params[6*i + 5] = run;
-        }
-        kpool_stream_out o;
-        o.mask_rows = (int32_t *) mask_rows->data;
-        o.tail_cells = tail_cells ? (int32_t *) tail_cells->data : nullptr;
-        o.n_tail = tail_cells ? tail_cells->ne[0] : 0;
-        if (tail_cells) std::fill_n(o.tail_cells, ggml_nelements(tail_cells), -1);
-        o.n_kv = mask_cells->ne[0];
-        o.n_pools = pool_bias->ne[0];
-        o.n_tps = ubatch->n_tokens;
-        o.r = kpool;
-        if (!reuse_only) {
-            o.new_cells = (int32_t *) new_pool_cells->data;
-            o.new_reps = (int64_t *) new_pool_reps->data;
-            o.n_new_max = n_new_max;
-            o.strm_row = (int64_t) mctx_idx->get_strm(0)*mctx_idx->get_kv()->get_size();
-            std::fill_n(o.new_cells, ggml_nelements(new_pool_cells), 0);
-        }
-        const auto tail = kpool_stream_from_view(o, *v, cells, resident_seq, ubatch, 0, rebuild);
-        GGML_ASSERT(tail <= n_tail);
         if (rebuild) mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
         return;
     }

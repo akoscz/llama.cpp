@@ -1687,6 +1687,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     ggml_cuda_q8_layout q8_layout = {};
+    int64_t n_experts_total = 0;
 };
 
 // MUL_MAT_ID picks its tile width for the columns an expert gets on average and launches only the experts' non-empty
@@ -1714,7 +1715,8 @@ static int64_t mmq_ncols_tile(const mmq_args & args) {
     if (!args.ids_dst || ggml_cuda_mmq_moe_tiles_legacy()) {
         return args.ncols_max;
     }
-    const double  mean   = double(args.ncols_dst) / double(args.nchannels_y);
+    const int64_t n_experts = args.n_experts_total > 0 ? args.n_experts_total : args.nchannels_y;
+    const double  mean   = double(args.ncols_dst) / double(n_experts);
     const int64_t spread = int64_t(std::ceil(mean + 3.0*std::sqrt(mean)));
     const int64_t ncols  = ggml_cuda_mmq_moe_ncols() > 0 ? ggml_cuda_mmq_moe_ncols() : spread;
     return std::min({args.ncols_max, int64_t(128), ncols});
