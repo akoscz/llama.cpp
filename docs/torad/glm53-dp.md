@@ -1,6 +1,24 @@
 # GLM-5.3-Flash with data-parallel attention
 
-Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The limited four-card results below do not qualify that capacity or throughput. Do not treat the bandwidth estimates as benchmark results.
+Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline and extended by the November 3 completion work below. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The selected model is the BoldingBuilds uncensored pack. Capacity and numerical qualification remain separate requirements; a successful boot or component test does not qualify concurrent 400K sessions.
+
+## November 3 completion candidate
+
+Runtime source `8fae0c4009cf0b9f49cb62e521091c6a647b18be` adds three paths:
+
+- Partitioned experts estimate work from the global expert count. Small batches can use the existing vector and fused gate/up/clamp kernels, with non-local expert IDs masked before dispatch. Fusion retains the existing shape, stride and memory-alias checks.
+- Large gathers push the original words into peer inboxes and read them locally. The parity protocol supports captured replay; hosts without the required peer mappings retain the staged fallback. The initialization line names the selected large-gather route.
+- Resident k-pool metadata uses a cache-owned bank split by sequence owner. Graphs select the active sequences' local tables and upload journal patches only to the owning device. This changes metadata storage and transfer, not attention or recurrent arithmetic.
+
+The CPU tests cover logical two/four-rank GLM execution, tensor-mode regressions, and resident metadata with 40/41 slots, including rollback, restore and direct sparse indices. The portable CUDA build targets SM120a. On four RTX PRO 6000 Max-Q cards (Vast box 58990727, driver 615.71.09), the corrected artifact passes four/two-card collective and captured-replay checks, 124 expert cases, 80 resident-metadata cases, synthetic GLM/MTP checks, and all 12 fused expert cases under Compute Sanitizer with zero memory errors. No measured serving profile is established by these component checks.
+
+The second physical run passed four/two-card direct collectives and captured gather replay. An artifact timestamp mistake omitted four added fused expert cases and the final equivalent metadata-upload refactor: its 120 expert cases and eight fused sanitizer cases must not be described as the final 124/12-case coverage. The corrected artifact is `c284cc188078bcfd5f52983298f6af5c0a3e24bdb4f85b084bf10d9de1ae8941`.
+
+At 2K, the corrected artifact matches the prior `cd47dc9` reference within the native reference format's precision in both layouts: tensor KL 0.000000, DP KL -0.000001, and 100% top-token agreement for each. The small negative value is the tool's quantized-reference floor, not a negative mathematical divergence. Four-card DP versus tensor remains 0.013567. The earlier artifact's controls give 0.013251 for changing only tensor microbatch 512 to 1024, and 0.010915 for four-card versus two-card DP. Cross-layout results do not meet the requested absolute 1e-6 bar. A batch-shape control explains why final KL alone cannot identify a faulty operator; it does not waive that bar.
+
+Bounded captures of the first 512-row evaluation locate the first observed arithmetic differences. Two-card tensor and DP have identical input, hyper-connection and attention-normalization tensors. Their first QKV projection differs by at most 2.38418579e-6 after aligning the layouts: tensor stores `[Q0,K0,V0,Q1,K1,V1]`, while DP stores `[Q0,Q1,K0,K1,V0,V1]`. Comparing the raw buffers without that permutation would report a packing difference as a numerical error. Two-card and four-card DP are bit-identical through the first three dense blocks and the first MoE input. The first MoE block's output differs by at most 2.38418579e-7. These captures support arithmetic-order sensitivity; they do not establish that every final-logit difference is harmless or satisfy the absolute KL limit. All 219 capture files/manifests were verified by SHA-256 against the remote originals.
+
+Expert counters work with `-lv 4`. The four-card diagnostic prompt recorded 44,759 / 41,283 / 40,569 / 48,109 hits, totaling 174,720 for 520 rows, eight selected experts and 42 routed layers. These instrumented prompt counts establish work on every rank, not balance or throughput under 36/40 concurrent sessions.
 
 ## Convergence baseline validation
 
@@ -31,11 +49,13 @@ Record `git rev-parse HEAD`, the GGUF hashes, driver/toolkit versions and `nvidi
 
 ## Model pack
 
-The requested [Unsloth UD-IQ3_XXS pack](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-IQ3_XXS) at revision `a38483c8cd5df544f53d70fb281afe97369d5ab6` has four shards, totaling about 120.37 GB. Its first shard contains metadata only. Download all four into the same directory. The fork accepts its `glm5-next` architecture name and metadata prefix as well as the existing `glm5next` spelling.
+The current qualification uses [BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF](https://huggingface.co/BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF/tree/1bc0afadd92f4ff9fc2b1281a95a7921b058d35d/IQ3_XXS), revision `1bc0afadd92f4ff9fc2b1281a95a7921b058d35d`: three IQ3_XXS shards totaling 134,305,522,848 bytes. Use the matching 1,128,047,744-byte F16 projector when testing the served configuration. Rig's head file pins all four SHA-256 hashes. This is the same pack as the two-card baseline.
 
-The pack label does not describe every tensor: its target experts use IQ2_S, IQ3_S and IQ4_XS; its MTP experts use Q2_K/Q3_K. These formats are supported by the CUDA DP expert path. They differ from the Q8_0 MTP weights assumed in the original capacity estimate and from Rig's existing BoldingBuilds uncensored IQ3_XXS pack. Keep each pack's quality, acceptance and performance evidence separate.
+The original brief's [Unsloth UD-IQ3_XXS pack](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-IQ3_XXS) at revision `a38483c8cd5df544f53d70fb281afe97369d5ab6` has four shards, totaling about 120.37 GB. Its first shard contains metadata only. Download all four into the same directory. The fork accepts its `glm5-next` architecture name and metadata prefix as well as the existing `glm5next` spelling. Its weight budget does not establish capacity for the selected larger pack.
 
-The tensor headers imply approximately 25.58 GiB of target experts, 0.61 GiB of MTP experts and 7.33 GiB of replicated weights per card under four-way DP, before buffers, caches and runtime allocations. These are weight-byte calculations, not measured VRAM peaks. Local metadata-only loading validates all 1,412 tensor names/shapes including MTP; it does not validate the weight payloads or model outputs.
+The Unsloth pack label does not describe every tensor: its target experts use IQ2_S, IQ3_S and IQ4_XS; its MTP experts use Q2_K/Q3_K. These formats are supported by the CUDA DP expert path. They differ from the Q8_0 MTP weights assumed in the original capacity estimate and from Rig's selected BoldingBuilds uncensored IQ3_XXS pack. Keep each pack's quality, acceptance and performance evidence separate.
+
+The Unsloth tensor headers imply approximately 25.58 GiB of target experts, 0.61 GiB of MTP experts and 7.33 GiB of replicated weights per card under four-way DP, before buffers, caches and runtime allocations. These are weight-byte calculations, not measured VRAM peaks. Local metadata-only loading validates all 1,412 tensor names/shapes including MTP; it does not validate the weight payloads or model outputs.
 
 ## Candidate serving command
 
@@ -54,7 +74,7 @@ export GGML_CUDA_AR_BF16_THRESHOLD=0
 # Optional qualification counter; prints per-layer/per-device expert hits at clean shutdown.
 export GGML_CUDA_DP_EXPERT_STATS=1
 
-GLM_MODEL=/path/to/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf
+GLM_MODEL=/path/to/GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf
 GLM_SLOTS=4
 GLM_CTX=$((GLM_SLOTS * 442368))
 
@@ -64,14 +84,14 @@ build-dp/bin/llama-server -m "$GLM_MODEL" \
   -ctk q8_0 -ctv q8_0 -ctki q8_0 -cts q8_0 \
   --spec-type draft-mtp --spec-draft-n-max 2 -ubd 512 -ctkd q8_0 -ctvd q8_0 \
   -fa on --jinja --chat-template-file models/templates/GLM-5.3-Flash.jinja \
-  --metrics --host 127.0.0.1 --port 8080
+  -lv 4 --metrics --host 127.0.0.1 --port 8080
 ```
 
 Set `GLM_MODEL` to the actual first shard; the filename above is a placeholder. Keep the remaining shards beside it. The pack must contain the MTP block. Add the pack's matching `--mmproj` when serving image inputs. Do not add `--kv-unified`.
 
 Draft Q8 and recurrent Q8 are capacity candidates, not a measured quality recommendation. Qualify them against F16 draft cache and F32 recurrent state; the existing two-card Rig recipe uses F16 draft cache after a prior Q8 reply divergence. Changing either format changes the memory budget. Preserve the same template, tool definitions, message history and sampling settings in A/B runs.
 
-After the F32-wire run passes, unset `GGML_CUDA_AR_BF16_THRESHOLD` and repeat quality and performance measurements. Disable expert counters for timing runs. Counters accumulate one hit per selected routed expert at the up projection, including graph replay; `first` identifies the first expert on that device, and `counts` follows expert-index order. Counts include warmup and prompt/decode work until clean shutdown.
+After the F32-wire run passes, unset `GGML_CUDA_AR_BF16_THRESHOLD` and repeat quality and performance measurements. Disable expert counters for timing runs. Counter output requires `-lv 4` because the common logger maps backend information messages to trace verbosity. Counters accumulate one hit per selected routed expert at the up projection, including graph replay; `first` identifies the first expert on that device, and `counts` follows expert-index order. Counts include warmup and prompt/decode work until clean shutdown.
 
 ## Qualification and capacity
 
