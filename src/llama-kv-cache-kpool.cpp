@@ -334,21 +334,25 @@ static int64_t kpool_stream_from_view(
 
     const uint16_t * fill = v.fill.data() + off;
 
-    std::copy_n(v.slot.data() + off*r, n_run*r, o.pool_cells);
-    std::fill(o.pool_cells + n_run*r, o.pool_cells + o.n_pools*r, 0);
+    if (o.pool_cells) {
+        std::copy_n(v.slot.data() + off*r, n_run*r, o.pool_cells);
+        std::fill(o.pool_cells + n_run*r, o.pool_cells + o.n_pools*r, 0);
+    }
 
     int64_t n_new = 0;
 
     // the fallback of an unused slot when no spare cell is left: recomputing a complete pool is idempotent
     const int32_t * any_rep_src = nullptr;
 
-    if (o.pool_reps) {
-        std::copy_n(v.reps.data() + off, n_run, o.pool_reps);
-        std::fill(o.pool_reps + n_run, o.pool_reps + o.n_pools, 0);
+    if (o.new_reps) {
+        if (o.pool_reps) {
+            std::copy_n(v.reps.data() + off, n_run, o.pool_reps);
+            std::fill(o.pool_reps + n_run, o.pool_reps + o.n_pools, 0);
+        }
 
         for (int64_t p = 0; p < n_run; ++p) {
             if (fill[p] == r) {
-                any_rep_src = o.pool_cells + p*r;
+                any_rep_src = v.slot.data() + (off + p)*r;
                 break;
             }
         }
@@ -358,7 +362,7 @@ static int64_t kpool_stream_from_view(
             // fail loudly, clamping would serve a stale key
             GGML_ASSERT(n_new < o.n_new_max && "k-pool: more pools completed than the fixed bound");
 
-            const int32_t * member = o.pool_cells + p*r;
+            const int32_t * member = v.slot.data() + (off + p)*r;
 
             std::copy(member, member + r, o.new_cells + n_new*r);
 
@@ -405,7 +409,7 @@ static int64_t kpool_stream_from_view(
     int64_t n_done     = 0;
     int64_t n_tail_max = 0;
 
-    if (o.mask_rows) {
+    if (o.mask_cells) {
         kpool_facts_cells(o.mask_cells, v.pos_at.data(), v.pblk.data(), (int32_t) b_base, o.n_kv);
     }
 
@@ -470,13 +474,14 @@ static int64_t kpool_stream_from_view(
 
             tail_max = std::max(tail_max, n_tail);
 
-            float * q_pool_bias = o.pool_bias + ii*o.n_pools;
-            const int64_t n_vis = std::min(n_run, bo_vis);
-
-            for (int64_t p = 0; p < n_vis; ++p) {
-                q_pool_bias[p] = fill[p] == r ? 0.0f : -INFINITY;
+            if (o.pool_bias) {
+                float * q_pool_bias = o.pool_bias + ii*o.n_pools;
+                const int64_t n_vis = std::min(n_run, bo_vis);
+                for (int64_t p = 0; p < n_vis; ++p) {
+                    q_pool_bias[p] = fill[p] == r ? 0.0f : -INFINITY;
+                }
+                std::fill(q_pool_bias + n_vis, q_pool_bias + o.n_pools, -INFINITY);
             }
-            std::fill(q_pool_bias + n_vis, q_pool_bias + o.n_pools, -INFINITY);
         }
 
         std::lock_guard<std::mutex> lock(merge);
@@ -487,7 +492,7 @@ static int64_t kpool_stream_from_view(
     // exactly one partition per row, or a query reads another sequence's pools
     GGML_ASSERT(n_done == o.n_tps && "every query must belong to a sequence of the ubatch");
 
-    if (o.pool_reps) {
+    if (o.new_reps) {
         // the fixed row count means unused slots must name a safe destination: a spare cell each (their members stay cell 0)
         kpool_spare_cells spare = { cells, (llama_pos) r, o.new_reps, n_new, o.strm_row, {} };
 
@@ -1127,6 +1132,9 @@ void llama_kpool_compress(
 void llama_kpool_views::view::rebuild(const llama_kv_cells & c, llama_seq_id seq) {
     built = true;
     ok    = false;
+    full_upload = true;
+    dirty_cells.clear();
+    dirty_pools.clear();
 
     const uint32_t size = c.size();
 
@@ -1206,6 +1214,10 @@ bool llama_kpool_views::view::insert(uint32_t j, llama_pos p) {
         return false;
     }
 
+    if (!full_upload) {
+        dirty_cells.push_back(j);
+        dirty_pools.push_back((uint32_t) bi);
+    }
     at        = (int32_t) j;
     pos_at[j] = p;
 
@@ -1213,6 +1225,7 @@ bool llama_kpool_views::view::insert(uint32_t j, llama_pos p) {
 
     if (++fill[bi] == r) {
         for (uint32_t k = 0; k < r; ++k) {
+            if (!full_upload) dirty_cells.push_back(slot[bi*r + k]);
             pblk[slot[bi*r + k]] = (int32_t) b;
         }
 
@@ -1226,9 +1239,14 @@ void llama_kpool_views::view::remove(uint32_t j) {
     const llama_pos p  = pos_at[j];
     const int64_t   bi = p/r - b_lo;
 
+    if (!full_upload) {
+        dirty_cells.push_back(j);
+        dirty_pools.push_back((uint32_t) bi);
+    }
     // a complete pool has every slot filled, so each of its cells drops the pool's mark
     if (fill[bi] == r) {
         for (uint32_t k = 0; k < r; ++k) {
+            if (!full_upload) dirty_cells.push_back(slot[bi*r + k]);
             pblk[slot[bi*r + k]] = -1;
         }
 
@@ -1268,7 +1286,57 @@ bool llama_kpool_views::view::apply(const llama_kv_cells & c, llama_seq_id seq, 
         }
     }
 
+    // A view can be used only by the legacy path for many evaluations. Bound
+    // its pending journal; the next resident consumer then initializes once.
+    if (dirty_cells.size() + dirty_pools.size() > pos_at.size()) {
+        full_upload = true;
+        dirty_cells.clear();
+        dirty_pools.clear();
+    }
     return true;
+}
+
+size_t llama_kpool_views::view::emit_patches(
+        const std::function<void(size_t, const int32_t *, size_t)> & write) const {
+    GGML_ASSERT(ok);
+    size_t bytes = 0;
+    auto put = [&](size_t offset, const int32_t * data, size_t count) {
+        if (!count) return;
+        write(offset, data, count);
+        bytes += count*sizeof(int32_t);
+    };
+    const size_t pool_offset = 2*pos_at.size();
+    const size_t fill_offset = pool_offset + slot.size();
+    const size_t reps_offset = fill_offset + cap;
+    if (full_upload) {
+        put(0, pos_at.data(), pos_at.size());
+        put(pos_at.size(), pblk.data(), pblk.size());
+        put(pool_offset, slot.data(), slot.size());
+        const std::vector<int32_t> wide_fill(fill.begin(), fill.end());
+        put(fill_offset, wide_fill.data(), wide_fill.size());
+        put(reps_offset, reps.data(), reps.size());
+    } else {
+        auto unique = [](std::vector<uint32_t> & ids) {
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        };
+        unique(dirty_cells);
+        unique(dirty_pools);
+        for (uint32_t j : dirty_cells) {
+            put(j, &pos_at[j], 1);
+            put(pos_at.size() + j, &pblk[j], 1);
+        }
+        for (uint32_t p : dirty_pools) {
+            put(pool_offset + p*r, &slot[p*r], r);
+            const int32_t f = fill[p];
+            put(fill_offset + p, &f, 1);
+            put(reps_offset + p, &reps[p], 1);
+        }
+    }
+    full_upload = false;
+    dirty_cells.clear();
+    dirty_pools.clear();
+    return bytes;
 }
 
 void llama_kpool_views::sync(const llama_kv_cells & cells, uint32_t r) {
@@ -1428,8 +1496,88 @@ int64_t llama_kv_cache_set_input_kpool(
     return n_tail;
 }
 
+llama_kpool_backend_tensor::llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count) {
+    ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, count);
+    ggml_set_name(tensor, "kpool_owned_metadata");
+    buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    GGML_ASSERT(buffer);
+}
+
+llama_kpool_backend_tensor::~llama_kpool_backend_tensor() {
+    if (upload_pending) ggml_backend_event_synchronize(uploaded);
+    if (uploaded) ggml_backend_event_free(uploaded);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
+void llama_kpool_backend_tensor::begin_upload(ggml_backend_t backend) {
+    GGML_ASSERT(backend);
+    if (upload_pending) {
+        ggml_backend_event_synchronize(uploaded);
+        upload_pending = false;
+    }
+    if (upload_backend != backend) {
+        if (uploaded) ggml_backend_event_free(uploaded);
+        uploaded = ggml_backend_event_new(ggml_backend_get_device(backend));
+        upload_backend = backend;
+    }
+    staging.clear();
+}
+
+void llama_kpool_backend_tensor::upload(size_t offset, const int32_t * data, size_t count) {
+    staging.emplace_back(data, data + count);
+    ggml_backend_tensor_set_async(upload_backend, tensor, staging.back().data(), offset*sizeof(int32_t), count*sizeof(int32_t));
+}
+
+void llama_kpool_backend_tensor::end_upload() {
+    if (staging.empty()) return;
+    if (uploaded) {
+        ggml_backend_event_record(uploaded, upload_backend);
+        upload_pending = true;
+    } else {
+        // Backends without events retain an explicit ordered, synchronous fallback.
+        ggml_backend_synchronize(upload_backend);
+        staging.clear();
+    }
+}
+
+std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_views::view::resident(ggml_backend_buffer_type_t buft) const {
+    if (!storage) {
+        storage = std::make_shared<llama_kpool_backend_tensor>(buft, resident_size());
+        full_upload = true;
+    }
+    GGML_ASSERT(ggml_backend_buffer_get_type(storage->buffer) == buft);
+    GGML_ASSERT(storage->tensor->ne[0] == (int64_t) resident_size());
+    return storage;
+}
+
+void llama_kpool_draft::capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv,
+        ggml_tensor * source, int64_t row_index, ggml_backend_t backend) {
+    if (!active()) return;
+    GGML_ASSERT(source->type == GGML_TYPE_I32 && ggml_is_contiguous(source));
+    auto & store = stores[seq];
+    const auto buft = ggml_backend_buffer_get_type(source->buffer);
+    if (!store || store->tensor->ne[0] != source->ne[0] || ggml_backend_buffer_get_type(store->buffer) != buft) {
+        store = std::make_shared<llama_kpool_backend_tensor>(buft, source->ne[0]);
+    }
+    ggml_context * ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    auto * view = ggml_view_1d(ctx, source, source->ne[0], row_index*source->ne[0]*sizeof(int32_t));
+    GGML_ASSERT(ggml_backend_view_init(view) == GGML_STATUS_SUCCESS);
+    // Copy before the source graph can reset, ordered on its producing backend.
+    if (backend) ggml_backend_tensor_copy_async(backend, backend, view, store->tensor);
+    else ggml_backend_tensor_copy(view, store->tensor);
+    ggml_free(ctx);
+    rows[seq] = {pos, step, n_kv, {}, store};
+}
+
+std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_draft::backend_row(llama_seq_id seq) const {
+    const auto it = rows.find(seq);
+    return it == rows.end() ? nullptr : it->second.backend;
+}
+
 void llama_kpool_draft::capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells) {
-    if (active()) rows[seq] = {pos, step, n_kv, cells};
+    if (active()) rows[seq] = {pos, step, n_kv, cells, nullptr};
 }
 
 bool llama_kpool_draft::can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const {
@@ -1439,7 +1587,7 @@ bool llama_kpool_draft::can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int
         const auto found = rows.find(ubatch.seq_id[i][0]);
         if (found == rows.end()) return false;
         const auto & row = found->second;
-        if (row.n_kv != n_kv || (int64_t) row.cells.size() != width || step <= row.step ||
+        if (row.n_kv != n_kv || row.width() != width || step <= row.step ||
             (int64_t) ubatch.pos[i] != (int64_t) row.pos + step - row.step ||
             (ubatch.pos[i] + 1)/kpool != (row.pos + 1)/kpool) return false;
     }
@@ -1448,8 +1596,13 @@ bool llama_kpool_draft::can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int
 
 void llama_kpool_draft::copy(const llama_ubatch & ubatch, int32_t * dst) const {
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        const auto & cells = rows.at(ubatch.seq_id[i][0]).cells;
-        dst = std::copy(cells.begin(), cells.end(), dst);
+        const auto & row = rows.at(ubatch.seq_id[i][0]);
+        if (row.backend) {
+            ggml_backend_tensor_get(row.backend->tensor, dst, 0, row.width()*sizeof(int32_t));
+            dst += row.width();
+        } else {
+            dst = std::copy(row.cells.begin(), row.cells.end(), dst);
+        }
     }
 }
 
@@ -1460,8 +1613,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
 
     if (draft_top_k) {
         GGML_ASSERT(draft && draft->can_reuse(*ubatch, mctx_attn->get_n_kv(), draft_top_k->ne[0], kpool));
-        GGML_ASSERT(ggml_backend_buffer_is_host(draft_top_k->buffer));
-        draft->copy(*ubatch, (int32_t *) draft_top_k->data);
+        if (draft_rows.empty()) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(draft_top_k->buffer));
+            draft->copy(*ubatch, (int32_t *) draft_top_k->data);
+        }
     }
 
     if (pool_cells == nullptr) {
@@ -1469,6 +1624,54 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
             mctx_attn->get_kv()->set_kpool_dirty(ubatch->seq_id_unq[s]);
         }
+        return;
+    }
+
+    if (resident_table) {
+        auto & views = mctx_attn->get_kv()->get_kpool_views();
+        views.begin();
+        const auto & cells = mctx_attn->get_kv()->get_cells(resident_seq);
+        const auto * v = views.serve(cells, resident_seq, kpool, mask_cells->ne[0], pool_bias->ne[0]);
+        GGML_ASSERT(v && ubatch->n_seqs_unq == 1 && ubatch->seq_id_unq[0] == resident_seq);
+        auto * backend = ggml_backend_sched_get_tensor_backend(sched, resident_table->tensor);
+        GGML_ASSERT(backend);
+        resident_table->begin_upload(backend);
+        resident_upload_bytes += v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+            resident_table->upload(off, data, count);
+            ++resident_upload_calls;
+        });
+        resident_table->end_upload();
+        const int64_t base = v->n ? cells.seq_pos_min(resident_seq)/kpool : 0;
+        const int64_t run = v->n ? cells.seq_pos_max(resident_seq)/kpool - base + 1 : 0;
+        auto * params = (int32_t *) resident_rows->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const int32_t tail = (ubatch->pos[i] + 1)/kpool*kpool;
+            params[6*i + 0] = ubatch->pos[i];
+            params[6*i + 1] = base;
+            params[6*i + 2] = tail;
+            params[6*i + 3] = std::max<int64_t>(0, tail/kpool - base);
+            params[6*i + 4] = v->b_lo;
+            params[6*i + 5] = run;
+        }
+        kpool_stream_out o;
+        o.mask_rows = (int32_t *) mask_rows->data;
+        o.tail_cells = tail_cells ? (int32_t *) tail_cells->data : nullptr;
+        o.n_tail = tail_cells ? tail_cells->ne[0] : 0;
+        if (tail_cells) std::fill_n(o.tail_cells, ggml_nelements(tail_cells), -1);
+        o.n_kv = mask_cells->ne[0];
+        o.n_pools = pool_bias->ne[0];
+        o.n_tps = ubatch->n_tokens;
+        o.r = kpool;
+        if (!reuse_only) {
+            o.new_cells = (int32_t *) new_pool_cells->data;
+            o.new_reps = (int64_t *) new_pool_reps->data;
+            o.n_new_max = n_new_max;
+            o.strm_row = (int64_t) mctx_idx->get_strm(0)*mctx_idx->get_kv()->get_size();
+            std::fill_n(o.new_cells, ggml_nelements(new_pool_cells), 0);
+        }
+        const auto tail = kpool_stream_from_view(o, *v, cells, resident_seq, ubatch, 0, rebuild);
+        GGML_ASSERT(tail <= n_tail);
+        if (rebuild) mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
         return;
     }
 

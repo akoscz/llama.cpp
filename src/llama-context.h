@@ -321,6 +321,7 @@ private:
     llama_memory_ptr memory;
 
     struct mtp_index_pending {
+        ggml_backend_t backend = nullptr;
         ggml_tensor * tensor = nullptr;
         uint64_t generation = 0;
         int64_t n_kv = 0;

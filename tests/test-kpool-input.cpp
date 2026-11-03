@@ -1258,8 +1258,21 @@ static void run_draft_rounds(std::mt19937 & rng) {
         std::vector<int32_t> a(width), b(width);
         for (int j = 0; j < width; ++j) { a[j] = rng()%128; b[j] = 128 + rng()%128; }
         draft.advance(0);
-        draft.capture(2, base, n_kv, a);
-        draft.capture(7, other, n_kv, b);
+        if (round % 2) {
+            ggml_context * ctx = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+            auto * source = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, 2);
+            auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+            ggml_backend_tensor_set(source, a.data(), 0, width*sizeof(int32_t));
+            ggml_backend_tensor_set(source, b.data(), width*sizeof(int32_t), width*sizeof(int32_t));
+            // Separate captures model two microbatches. Destroy graph storage immediately.
+            draft.capture_backend(2, base, n_kv, source, 0);
+            draft.capture_backend(7, other, n_kv, source, 1);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        } else {
+            draft.capture(2, base, n_kv, a);
+            draft.capture(7, other, n_kv, b);
+        }
         for (int step = 1; step < r + 2; ++step) {
             draft.advance(step);
             ubatch_data ud;
@@ -1387,9 +1400,164 @@ static void run_direct_indices(std::mt19937 & rng) {
     printf("direct indices: 2048 rows match SEL + scatter + CAND\n");
 }
 
+static ggml_backend_t resident_test_backend() {
+    static ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(cpu, 1);
+    return cpu;
+}
+
+static void check_resident_materialization(pool & w, llama_seq_id seq, const llama_kpool_views::view & v,
+        const std::vector<int32_t> & uploaded, int step) {
+    auto * cpu = resident_test_backend();
+    const int64_t capacity = w.cells_of(seq).size();
+    const int64_t nk = std::min<int64_t>(capacity, std::max<int64_t>(32, (w.cells_of(seq).used_max_p1()+31)/32*32));
+    const int32_t base = v.n ? w.cells_of(seq).seq_pos_min(seq)/v.r : 0;
+    const int32_t run = v.n ? w.cells_of(seq).seq_pos_max(seq)/v.r - base + 1 : 0;
+    const int64_t nr = 1 + step%3, np = std::min<int64_t>(v.cap, std::max<int64_t>(2, run + step%3)), nd = 2;
+    ubatch_data ud;
+    for (int64_t i = 0; i < nr; ++i) ud.add(seq, std::max<int64_t>(0, w.cells_of(seq).seq_pos_max(seq) - nr + 1 + i));
+    const auto * ub = ud.get();
+    maps ref(nk, 1, nr, 1, v.r, true, false, false, nd, 0xa5, np, true);
+    const uint32_t stream = 0;
+    llama_kpool_set_input([&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); }, nullptr,
+            nullptr, ref.pool_cells, nullptr, ref.pool_bias, nullptr, nullptr,
+            ref.pool_reps, ref.new_pool_cells, ref.new_pool_reps, &stream, capacity, false, ub, v.r,
+            ref.mask_cells, ref.mask_rows, ref.tail_cells);
+    ggml_context * ctx = ggml_init({24*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    auto * table = v.resident(ggml_backend_cpu_buffer_type())->tensor;
+    CHECK(memcmp(table->data, uploaded.data(), ggml_nbytes(table)) == 0, "actual backend uploads differ from shadow");
+    auto * params = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, nr);
+    auto * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, nr, 1);
+    auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 3, nr, 1);
+    auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    auto * p = (int32_t *) params->data;
+    for (int64_t i = 0; i < nr; ++i) {
+        p[6*i] = ub->pos[i]; p[6*i+1] = base;
+        p[6*i+2] = (ub->pos[i]+1)/v.r*v.r;
+        p[6*i+3] = std::max<int32_t>(0, p[6*i+2]/v.r - base);
+        p[6*i+4] = v.b_lo; p[6*i+5] = run;
+        for (int j = 0; j < 16; ++j) ((int32_t *) selected->data)[16*i+j] = j < 2 ? 0 : j == 2 ? nk : (step*13+j*17)%(nk+nd*v.r);
+        std::copy_n((int32_t *) ref.tail_cells->data + i*nk, 3, (int32_t *) tail->data + i*3);
+    }
+    auto * facts = ggml_kpool_materialize(ctx, table, params, capacity, v.r, nk, np, nd, GGML_KPOOL_MATERIALIZE_FACTS);
+    auto * cells = ggml_kpool_materialize(ctx, table, params, capacity, v.r, nk, np, nd, GGML_KPOOL_MATERIALIZE_CELLS);
+    auto * reps = ggml_kpool_materialize(ctx, table, params, capacity, v.r, nk, np, nd, GGML_KPOOL_MATERIALIZE_REPS);
+    auto * bias = ggml_kpool_materialize(ctx, table, params, capacity, v.r, nk, np, nd, GGML_KPOOL_MATERIALIZE_BIAS);
+    // Caller visibility is deliberately independent of materialization params.
+    // Invalid partitions/early query bounds must not be replaced by params.
+    auto * visibility = (int32_t *) ref.mask_rows->data;
+    if (step%5 == 0) visibility[1] = -1;
+    if (step%7 == 0) visibility[0] = 0;
+    if (step%11 == 0) visibility[3] = 0;
+    auto * fused = ggml_kpool_indices(ctx, facts, ref.mask_rows, selected, tail, nd*v.r, 32);
+    auto * explicit_facts = ggml_dup(ctx, facts);
+    auto * explicit_ids = ggml_kpool_indices(ctx, explicit_facts, ref.mask_rows, selected, tail, nd*v.r, 32);
+    auto * reference_ids = ggml_kpool_indices(ctx, ref.mask_cells, ref.mask_rows, selected, tail, nd*v.r, 32);
+    auto * graph = ggml_new_graph(ctx);
+    for (auto * t : {facts, cells, reps, bias, fused, explicit_ids, reference_ids}) {
+        ggml_set_output(t);
+        ggml_build_forward_expand(graph, t);
+    }
+    auto * alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    CHECK(ggml_gallocr_alloc_graph(alloc, graph), "resident materialization allocate");
+    CHECK(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "resident materialization compute");
+    for (const auto & tensors : {std::make_pair(facts, ref.mask_cells), std::make_pair(cells, ref.pool_cells),
+            std::make_pair(reps, ref.pool_reps), std::make_pair(bias, ref.pool_bias),
+            std::make_pair(fused, explicit_ids), std::make_pair(fused, reference_ids)}) {
+        CHECK(ggml_nbytes(tensors.first) == ggml_nbytes(tensors.second), "resident materialization output shape");
+        CHECK(memcmp(tensors.first->data, tensors.second->data, ggml_nbytes(tensors.first)) == 0,
+                "resident materialization/reference mismatch step=%d seq=%d op=%d", step, seq, (int) tensors.first->op);
+    }
+    ggml_gallocr_free(alloc);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
+// Apply precisely the ranges destined for the backend, retaining poisoned storage
+// across changing run extents and A -> B -> A consumers.
+static void run_resident_patches(std::mt19937 & rng) {
+    pool w(2048, 3, true, rng);
+    llama_kpool_views views;
+    std::map<llama_seq_id, std::vector<int32_t>> shadow;
+    uint64_t calls = 0, bytes = 0;
+    for (int step = 0; step < 4000; ++step) {
+        w.random_op();
+        views.begin();
+        for (llama_seq_id seq = 0; seq < 3; ++seq) {
+            auto * v = views.serve(w.cells_of(seq), seq, 4, 2048, 514);
+            if (!v) continue;
+            auto & dst = shadow[seq];
+            dst.resize(v->resident_size(), 0x5a5a5a5a);
+            const auto storage = v->resident(ggml_backend_cpu_buffer_type());
+            storage->begin_upload(resident_test_backend());
+            const size_t emitted = v->emit_patches([&](size_t offset, const int32_t * data, size_t count) {
+                CHECK(offset + count <= dst.size(), "resident patch outside storage");
+                std::copy_n(data, count, dst.begin() + offset);
+                storage->upload(offset, data, count);
+                ++calls;
+                bytes += count*sizeof(int32_t);
+            });
+            storage->end_upload();
+            CHECK(emitted <= dst.size()*sizeof(int32_t), "patch bytes exceed full initialization");
+            size_t at = 0;
+            for (const auto * values : { &v->pos_at, &v->pblk, &v->slot }) {
+                CHECK(std::equal(values->begin(), values->end(), dst.begin() + at), "resident table differs at step %d", step);
+                at += values->size();
+            }
+            CHECK(std::equal(v->fill.begin(), v->fill.end(), dst.begin() + at), "resident fill differs");
+            at += v->fill.size();
+            CHECK(std::equal(v->reps.begin(), v->reps.end(), dst.begin() + at), "resident reps differ");
+            // Independent canonical reference from authoritative cells, including
+            // physical cell zero and incomplete pools; no view table reads.
+            std::vector<int32_t> reference(dst.size(), 0);
+            const auto & cells = w.cells_of(seq);
+            std::fill_n(reference.begin(), 2*cells.size(), -1);
+            const size_t slots = 2*cells.size();
+            const size_t fills = slots + v->cap*v->r;
+            const size_t reps = fills + v->cap;
+            for (uint32_t j = 0; j < cells.size(); ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq)) continue;
+                const int32_t pos = cells.pos_get(j);
+                reference[j] = pos;
+                reference[slots + pos - v->b_lo*v->r] = j;
+                ++reference[fills + pos/v->r - v->b_lo];
+            }
+            for (uint32_t b = 0; b < v->cap; ++b) {
+                if (reference[fills + b] != (int32_t) v->r) continue;
+                reference[reps + b] = reference[slots + b*v->r + v->r - 1];
+                for (uint32_t k = 0; k < v->r; ++k) {
+                    reference[cells.size() + reference[slots + b*v->r + k]] = v->b_lo + b;
+                }
+            }
+            CHECK(reference == dst, "emitted resident bytes differ from cell reference at step %d", step);
+            check_resident_materialization(w, seq, *v, dst, step);
+            CHECK(v->emit_patches([](size_t, const int32_t *, size_t) { CHECK(false, "clean view emitted bytes"); }) == 0,
+                    "clean view byte count");
+        }
+    }
+    pool steady(4096, 1, true, rng);
+    llama_kpool_views sv;
+    steady.append(0, 1024);
+    for (int step = 0; step < 100; ++step) {
+        const auto before = steady.p_next(0);
+        steady.append(0, 1 + step%3);
+        sv.begin();
+        const auto * v = sv.serve(steady.cells_of(0), 0, 4, 4096, 1026);
+        CHECK(v, "steady resident view unavailable");
+        const auto n = v->emit_patches([](size_t, const int32_t *, size_t) {});
+        if (step) CHECK(n <= 256, "small append emitted %zu bytes", n);
+        steady.rollback(0, before);
+        sv.begin();
+        v = sv.serve(steady.cells_of(0), 0, 4, 4096, 1026);
+        CHECK(v->emit_patches([](size_t, const int32_t *, size_t) {}) <= 256, "rollback emitted full table");
+    }
+    printf("resident patches: %llu writes, %llu actual callback bytes\n", (unsigned long long) calls, (unsigned long long) bytes);
+}
+
 int main() {
     std::mt19937 rng(20260930);
 
+    run_resident_patches(rng);
     run_direct_indices(rng);
     run_draft_rounds(rng);
 

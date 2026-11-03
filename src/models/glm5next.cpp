@@ -407,6 +407,13 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         return nullptr;
     }
 
+    // Same completed-pool boundary: raw stores above remain necessary for the
+    // next fresh scoring step, but no compression or scoring metadata is used.
+    if (inp_kp->reuse_only) {
+        GGML_ASSERT(!inp_kp->rebuild && inp_kp->draft_top_k);
+        return inp_kp->draft_top_k;
+    }
+
     ggml_tensor * kbuf = mctx_idx->get_k(ctx0, il);
 
     const int64_t n_kv     = kbuf->ne[2];

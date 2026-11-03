@@ -797,24 +797,26 @@ static bool test_draft_vocab(const llm_arch arch, const size_t seed, const std::
     return true;
 }
 
+static void set_env(const char * name, const char * value);
+
 static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split) {
     auto gguf = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true, true);
     auto pair = get_model_and_ctx(gguf.get(), nullptr, seed, devs, split_mode, false, tensor_split, true);
     auto * model = pair.first.get();
-    int scores = 0;
+    int counts[2] = {0, 0};
+    int & scores = counts[0];
     llama_context_params params = llama_context_default_params();
     params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     params.n_ctx = 128;
     params.n_batch = params.n_ubatch = 64;
     params.n_threads = params.n_threads_batch = 4;
     params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
-        if (ask && std::string(t->name).find("indexer_top_k_pools") == 0) {
-            ++*static_cast<int *>(data);
-        }
+        if (ask && std::string(t->name).find("indexer_top_k_pools") == 0) ++static_cast<int *>(data)[0];
+        if (ask && std::string(t->name).find("indexer_pool_members") == 0) ++static_cast<int *>(data)[1];
         return false;
     };
-    params.cb_eval_user_data = &scores;
+    params.cb_eval_user_data = counts;
     llama_context_ptr ctx(llama_init_from_model(model, params));
     params.cb_eval = nullptr;
     params.cb_eval_user_data = nullptr;
@@ -826,19 +828,36 @@ static bool test_glm_mtp_index(const size_t seed, const std::vector<ggml_backend
     const int n_embd = llama_model_n_embd(model);
     std::vector<float> hidden(40*n_embd, 0.1f);
     get_mtp_logits(model, ctx.get(), tokens, hidden);
-    get_mtp_logits(model, reference.get(), tokens, hidden);
+    const auto reference_logits = [&](const std::vector<llama_token> & input, llama_pos pos) {
+        const char * old = std::getenv("LLAMA_KPOOL_RESIDENT_LEGACY");
+        const std::string saved = old ? old : "";
+        set_env("LLAMA_KPOOL_RESIDENT_LEGACY", "1");
+        auto result = get_mtp_logits(model, reference.get(), input, hidden, pos);
+        set_env("LLAMA_KPOOL_RESIDENT_LEGACY", old ? saved.c_str() : nullptr);
+        return result;
+    };
+    reference_logits(tokens, 0);
     const auto step = [&](int i, int pos, bool fresh) {
-        scores = 0;
+        scores = counts[1] = 0;
         if (!llama_mtp_draft_step(ctx.get(), i)) {
             return false;
         }
+        if (!fresh && !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY") &&
+                !static_cast<llama_memory_hybrid *>(llama_get_memory(ctx.get()))->get_mtp_index()->backend_row(0)) {
+            LOG_ERR("MTP reuse did not retain an owned backend selection\n");
+            return false;
+        }
         const auto logits = get_mtp_logits(model, ctx.get(), {7}, hidden, pos);
-        const auto expected = get_mtp_logits(model, reference.get(), {7}, hidden, pos);
+        const auto expected = reference_logits({7}, pos);
         if ((scores > 0) != fresh || !std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); })) {
             LOG_ERR("MTP step %d at %d: expected fresh=%d, indexer ran %d times\n", i, pos, fresh, scores);
             return false;
         }
-        // Reuse must keep writing raw and compressed keys. When scoring resumes,
+        if (!fresh && !ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") && counts[1] != 0) {
+            LOG_ERR("reused MTP step unnecessarily compressed %d pool tensors\n", counts[1]);
+            return false;
+        }
+        // Reuse must keep writing raw keys. When scoring resumes,
         // the result must agree with a context that scored at every earlier step.
         if (fresh && nmse(expected, logits) > 1e-4) return false;
         return true;
@@ -879,7 +898,8 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
         params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         params.n_ctx = 256;
         params.n_seq_max = 3;
-        params.n_batch = params.n_ubatch = 128;
+        params.n_batch = 128;
+        params.n_ubatch = split_capture ? 1 : 128;
         params.kv_unified = unified;
         params.n_threads = params.n_threads_batch = 4;
         params.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
@@ -917,7 +937,7 @@ static bool test_glm_mtp_index_sequences(const size_t seed, const std::vector<gg
             const std::vector<llama_pos> offsets = {seqs[0] - 1, seqs[1] - 1};
             const auto actual = get_mtp_logits(model, ctx.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
             const auto expected = get_mtp_logits(model, reference.get(), {7, 19}, hidden, 40 + step, seqs, offsets);
-            const int scoring_ubatches = step == 0 ? (!unified && split_capture ? 2 : 1) :
+            const int scoring_ubatches = step == 0 ? (split_capture ? 2 : 1) :
                 step == 2 || step == 3 ? 1 : 0;
             if (step == 0) scores_per_ubatch = scores/scoring_ubatches;
             const int expected_scores = scores_per_ubatch*scoring_ubatches;
@@ -2750,8 +2770,13 @@ int main(int argc, char ** argv) {
     std::string diagnostic_dir, diagnostic_device;
     std::string dp_device;
     bool glm_alias_only = false;
+    bool glm_kpool_only = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--glm-kpool-only") == 0) {
+            glm_kpool_only = true;
+            continue;
+        }
         if (strcmp(argv[i], "--glm-arch-alias") == 0) {
             glm_alias_only = true;
             continue;
@@ -2804,6 +2829,11 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (glm_kpool_only) {
+            ggml_backend_load_all();
+            return test_glm_mtp_index(seed, {}, LLAMA_SPLIT_MODE_LAYER, {}) &&
+                   test_glm_mtp_index_sequences(seed, {}, LLAMA_SPLIT_MODE_LAYER, {}) ? 0 : 1;
+        }
         if (glm_alias_only || (arch == LLM_ARCH_GLM5NEXT && out.empty())) {
             ggml_backend_load_all();
             if (!test_glm_arch_alias(seed)) { return 1; }
