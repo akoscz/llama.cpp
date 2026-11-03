@@ -4364,11 +4364,13 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         static const bool direct_indices = !ggml_env_switch("LLAMA_KPOOL_DIRECT_INDICES_LEGACY");
         const int64_t tail_bound = std::max<int64_t>(1, inp->n_tail);
         const int64_t direct_bound = llama_kpool_n_kv_max((int64_t) kpool*n_dump, tail_bound);
+        // Host KV requires compact indices from the first sparse step, even below the device-cache profitability cutoff.
         if (direct_indices && !ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY") && inp->mask_cells && cparams.flash_attn && !hparams.use_alibi &&
                 hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
                 (int64_t) hparams.indexer_kpool*n_dump + tail_bound <= GGML_KPOOL_INDICES_MAX &&
                 n_tps <= 65535 && n_stream <= 65535 &&
-                n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps, 8)*direct_bound)) {
+                (ggml_env_switch("LLAMA_KV_HOST") ||
+                 n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps, 8)*direct_bound))) {
             auto * tail = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
             auto * selected = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
             auto * probe = ggml_kpool_indices(ctx0, inp->mask_cells, inp->mask_rows, selected, tail,

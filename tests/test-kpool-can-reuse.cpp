@@ -5,13 +5,18 @@
 // per step, a fresh CUDA graph capture per step, zero replays (479/479 reuse
 // verdicts false on a 150-token probe, "CUDA Graph id reused" never logged).
 //
-// CPU-only: tensor shapes plus the pure shape predicate, no model, no GPU.
+// CPU-only: graph construction and reuse, without model weights or GPU execution.
 
 #include "../src/llama-kv-cache-kpool.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-model.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <type_traits>
 
 // the override must exist: without it &llm_graph_input_kpool::can_reuse names the
@@ -103,7 +108,80 @@ static llm_graph_input_kpool_dims base_dims() {
     return d;
 }
 
+static void set_host_kv(const char * value) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_KV_HOST", value ? value : "");
+#else
+    if (value) { setenv("LLAMA_KV_HOST", value, 1); }
+    else { unsetenv("LLAMA_KV_HOST"); }
+#endif
+}
+
+static void test_host_kv_graph_transition() {
+    const char * previous = getenv("LLAMA_KV_HOST");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    set_host_kv("0");
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_GLM5NEXT, llama_model_default_params()));
+    auto & h = model->hparams;
+    h.n_layer_all = 1;
+    h.n_embd = 512;
+    h.n_head_arr.fill(1);
+    h.n_head_kv_arr.fill(1);
+    h.n_embd_head_k_full = h.n_embd_head_v_full = 512;
+    h.n_lora_kv = 512;
+    h.indexer_head_size = 128;
+    h.indexer_top_k = 2048;
+    h.indexer_kpool = 32;
+    auto cpu = ggml_backend_cpu_init();
+
+    // The fifth 512-token prompt chunk, three-row MTP verification and single-token decode all enter sparse attention here.
+    for (const uint32_t tokens : {512u, 3u, 1u}) {
+        llama_memory_hybrid memory(*model, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false,
+                2560, 256, 0, LLAMA_SWA_TYPE_NONE, GGML_TYPE_F32, GGML_TYPE_F32,
+                1, 1, 0, false, false, [](int32_t) { return true; },
+                [](int32_t) { return false; }, [](int32_t) { return true; }, GGML_TYPE_Q8_0);
+        llama_memory_hybrid_context mctx(&memory);
+        llama_seq_id seq = 0;
+        std::vector<llama_pos> positions(tokens);
+        std::vector<int32_t> n_seq_id(tokens, 1);
+        std::vector<llama_seq_id *> seq_id(tokens, &seq);
+        for (uint32_t i = 0; i < tokens; ++i) { positions[i] = 2560 - tokens + i; }
+        for (int mode = 0; mode < 3; ++mode) {
+            // CPU storage lets this test exercise the actual graph builder without requiring mapped GPU memory.
+            set_host_kv(mode ? "1" : "0");
+            llm_graph_result result(256);
+            result.reset();
+            llm_graph_params params {};
+            params.hparams = h;
+            params.cparams.n_ctx = 2560;
+            params.cparams.n_seq_max = 1;
+            params.cparams.n_seq_devices = 1;
+            params.cparams.flash_attn = mode != 2;
+            params.ubatch.n_tokens = params.ubatch.n_seq_tokens = tokens;
+            params.ubatch.n_seqs = params.ubatch.n_seqs_unq = params.ubatch.n_pos = 1;
+            params.ubatch.pos = positions.data();
+            params.ubatch.n_seq_id = n_seq_id.data();
+            params.ubatch.seq_id = seq_id.data();
+            params.ubatch.seq_id_unq = &seq;
+            params.backend_cpu = cpu;
+            params.res = &result;
+            llm_graph_context graph(params);
+            auto * mask = ggml_new_tensor_4d(graph.ctx0, GGML_TYPE_F16, 2560, tokens, 1, 1);
+            const bool scoring = llama_kpool_needs_scoring(2560, 2560, h.indexer_top_k, h.indexer_kpool);
+            CHECK(scoring, "fresh prompt must enter sparse attention");
+            auto * input = graph.build_inp_kpool(&mctx, mask, scoring);
+            CHECK(bool(input->tail_cells) == (mode == 1),
+                    "host KV sparse graph unavailable: tokens=%u host=%d flash=%d", tokens, mode != 0, mode != 2);
+        }
+        set_host_kv("0");
+    }
+    ggml_backend_free(cpu);
+    set_host_kv(had_previous ? saved.c_str() : nullptr);
+}
+
 int main() {
+    test_host_kv_graph_transition();
     struct ggml_init_params gparams = { 16*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(gparams);
 

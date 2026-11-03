@@ -14,16 +14,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <vector>
 
 static constexpr int64_t n_cols = 64;
 static constexpr int64_t n_rows = 8;
 
-static int captured = 0;
+static std::atomic<int> captured {0};
 static unsigned long long expert_hits = 0;
 static ggml_backend_dev_t peer = nullptr;
 static std::array<ggml_backend_dev_t, 4> host_devices = {};
@@ -374,8 +376,9 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
     const int64_t selected = long_context ? 2080 : 32;
     const int64_t owners[] = {1, 0, 2, 1};
     std::vector<float> result[2];
-    const int captured_before = captured;
+    int captures[2] = {};
     for (int mapped = 0; mapped < 2; ++mapped) {
+        const int captured_before = captured;
         auto weights = ggml_init({ggml_tensor_overhead(), nullptr, true});
         auto cache = ggml_new_tensor_3d(weights, GGML_TYPE_Q8_0, 512, cells, 4);
         ggml_backend_meta_split_input(cache, 2, owners, 4);
@@ -422,6 +425,24 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
                         ids[row*selected + i] = int32_t(i*(cells/selected) + (row + iteration) % (cells/selected));
                     }
                 }
+                if (long_context) {
+                    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, 512);
+                    std::vector<float> sentinel(512);
+                    std::vector<uint8_t> quantized(row_bytes);
+                    for (int seq = 0; seq < 4; ++seq) {
+                        for (int64_t query = 0; query < queries; ++query) {
+                            for (int64_t i = 0; i < selected - 3 - iteration; i += 64) {
+                                const int32_t cell = ids[(seq*queries + query)*selected + i];
+                                std::seed_seq seed {seq, cell, iteration};
+                                std::mt19937 rng(seed);
+                                std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+                                for (auto & value : sentinel) { value = distribution(rng); }
+                                ggml_quantize_chunk(GGML_TYPE_Q8_0, sentinel.data(), quantized.data(), 0, 1, 512, nullptr);
+                                ggml_backend_tensor_set(cache, quantized.data(), seq*cache_bytes.size() + cell*row_bytes, row_bytes);
+                            }
+                        }
+                    }
+                }
                 ggml_backend_tensor_set(selection, ids.data(), 0, ggml_nbytes(selection));
             } else {
                 std::vector<ggml_fp16_t> mask(ggml_nelements(selection));
@@ -431,6 +452,7 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
             GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get(out, result[mapped].data() + iteration*ggml_nelements(out), 0, ggml_nbytes(out));
         }
+        captures[mapped] = captured - captured_before;
         ggml_backend_sched_free(sched);
         ggml_free(ctx);
         ggml_backend_buffer_free(buffer);
@@ -444,10 +466,10 @@ static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool
     }
     bool ok = std::isfinite(error) && error <= 1e-9*norm;
     if (ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_capture_end")) {
-        ok = ok && captured - captured_before >= 6;
+        ok = ok && captures[0] == 4 && captures[1] == 4;
     }
-    printf("%s mapped Q8 attention q=%lld cells=%lld sparse=%d, changed cache/selection over six replays, NMSE %.9g, %d captures\n",
-        ok ? "ok  " : "FAIL", (long long) queries, (long long) cells, sparse, error/norm, captured - captured_before);
+    printf("%s mapped Q8 attention q=%lld cells=%lld sparse=%d, changed cache/selection over six evaluations, NMSE %.9g, resident/mapped captures %d/%d\n",
+        ok ? "ok  " : "FAIL", (long long) queries, (long long) cells, sparse, error/norm, captures[0], captures[1]);
     ggml_backend_free(backend);
     ggml_backend_free(cpu);
     return ok;
