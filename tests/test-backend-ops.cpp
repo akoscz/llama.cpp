@@ -10543,7 +10543,8 @@ static void add_glm_q8_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_glm_q8_cases(test_cases);
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) {
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS,
+            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         for (int64_t tokens : {1, 17, 40}) {
             for (bool broadcast : {false, true}) {
                 for (int first : {0, 6}) {

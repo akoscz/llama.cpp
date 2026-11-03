@@ -16,11 +16,19 @@ Use the PR branch, a CUDA toolkit supporting the target cards, and the same buil
 git fetch origin train/glm53-dp
 git switch train/glm53-dp
 cmake -S . -B build-dp -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build-dp --parallel 6 --target llama-server llama-perplexity test-llama-archs test-speculative-mtp test-backend-meta-split test-backend-meta-allreduce-copy
+cmake --build build-dp --parallel 6 --target llama-server llama-perplexity test-llama-archs test-speculative-mtp test-backend-ops test-backend-meta-split test-backend-meta-allreduce-copy
 build-dp/bin/llama-server --list-devices
 ```
 
 Record `git rev-parse HEAD`, the GGUF hashes, driver/toolkit versions and `nvidia-smi topo -m` with each result. `GGML_CUDA_ALLREDUCE=internal` selects the fork's collective path. Check the initialization log for the actual path; the host-staged fallback is functional but does not establish PCIe peer-to-peer performance.
+
+## Model pack
+
+The requested [Unsloth UD-IQ3_XXS pack](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-IQ3_XXS) at revision `a38483c8cd5df544f53d70fb281afe97369d5ab6` has four shards, totaling about 120.37 GB. Its first shard contains metadata only. Download all four into the same directory. The fork accepts its `glm5-next` architecture name and metadata prefix as well as the existing `glm5next` spelling.
+
+The pack label does not describe every tensor: its target experts use IQ2_S, IQ3_S and IQ4_XS; its MTP experts use Q2_K/Q3_K. These formats are supported by the CUDA DP expert path. They differ from the Q8_0 MTP weights assumed in the original capacity estimate and from Rig's existing BoldingBuilds uncensored IQ3_XXS pack. Keep each pack's quality, acceptance and performance evidence separate.
+
+The tensor headers imply approximately 25.58 GiB of target experts, 0.61 GiB of MTP experts and 7.33 GiB of replicated weights per card under four-way DP, before buffers, caches and runtime allocations. These are weight-byte calculations, not measured VRAM peaks. Local metadata-only loading validates all 1,412 tensor names/shapes including MTP; it does not validate the weight payloads or model outputs.
 
 ## Candidate serving command
 
@@ -39,7 +47,7 @@ export GGML_CUDA_AR_BF16_THRESHOLD=0
 # Optional qualification counter; prints per-layer/per-device expert hits at clean shutdown.
 export GGML_CUDA_DP_EXPERT_STATS=1
 
-GLM_MODEL=/path/to/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00005.gguf
+GLM_MODEL=/path/to/GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf
 GLM_SLOTS=4
 GLM_CTX=$((GLM_SLOTS * 442368))
 
@@ -66,6 +74,8 @@ On the four-card host, run the component and synthetic-model checks before loadi
 
 ```sh
 build-dp/bin/test-backend-meta-allreduce-copy --direct 4 --require-p2p
+build-dp/bin/test-backend-ops test -o MUL_MAT_ID_PARTITION
+build-dp/bin/test-llama-archs --glm-arch-alias -s 1234
 GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
   build-dp/bin/test-llama-archs -a glm5next -s 1234
 GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
@@ -77,6 +87,8 @@ GGML_CUDA_AR_BF16_THRESHOLD=0 GGML_CUDA_ALLREDUCE=internal \
 The direct collective test covers host staging and peer paths on F32/BF16 wires, including tails and transfers larger than 32 MiB. `--require-p2p` fails if a requested peer path falls back to host memory. Without it, a fallback is labeled in the output. For three/four ranks it also runs an actual two-rank reference with the same two contributions and zero-valued extra ranks; this is bit-identical. Arbitrarily regrouping nonzero floating-point contributions is not guaranteed to preserve bits.
 
 The standard `-a glm5next` command includes DP 2 and DP 4 with default and Q8 caches. With fewer than four CUDA devices, repeated devices are labeled logical ranks; a CPU-only build uses logical CPU ranks. The full CPU command passes locally. On the local CUDA cards the DP configurations pass, then the existing unsplit generated-prefix rollback comparison fails; the executable from before this test integration reproduces that failure. The focused `--glm-dp-device` command isolates DP results but does not waive the unsplit failure.
+
+The expert-partition suite passes 108 cases on CPU and each local CUDA card, including all five expert formats in the pinned Unsloth pack and rows with no local experts. The architecture-alias regression compares identical CPU logits through user-supplied metadata and file loading.
 
 The MTP test compares every draft and greedy verification result with an unsplit model, and exercises forced acceptance of zero, one and two drafts after slot reuse. The untrained fixture has no naturally accepted greedy drafts; these are correctness checks, not an acceptance-rate benchmark. Run it under Compute Sanitizer as well. The backend handles failed CUDA graph updates by re-instantiating the graph; use `--report-api-errors no` to check device memory without counting that handled update result as a memory failure.
 

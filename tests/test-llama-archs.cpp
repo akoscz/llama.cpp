@@ -517,6 +517,62 @@ static bool test_glm_nextn_masked_rows(const size_t seed, const std::vector<ggml
 static bool test_glm_generated_prefixes(const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         llama_split_mode split_mode, const std::vector<float> & tensor_split, const std::string & diagnostic_dir, bool q8_cache = false);
 
+static void glm_use_hyphenated_metadata(gguf_context * ctx) {
+    gguf_context_ptr original(gguf_init_empty());
+    gguf_set_kv(original.get(), ctx);
+    for (int64_t i = 0; i < gguf_get_n_kv(original.get()); ++i) {
+        const std::string key = gguf_get_key(original.get(), i);
+        if (key.compare(0, 9, "glm5next.") != 0) { continue; }
+        const std::string renamed = "glm5-next." + key.substr(9);
+        switch (gguf_get_kv_type(original.get(), i)) {
+            case GGUF_TYPE_UINT32: gguf_set_val_u32(ctx, renamed.c_str(), gguf_get_val_u32(original.get(), i)); break;
+            case GGUF_TYPE_INT32:  gguf_set_val_i32(ctx, renamed.c_str(), gguf_get_val_i32(original.get(), i)); break;
+            case GGUF_TYPE_FLOAT32: gguf_set_val_f32(ctx, renamed.c_str(), gguf_get_val_f32(original.get(), i)); break;
+            case GGUF_TYPE_BOOL: gguf_set_val_bool(ctx, renamed.c_str(), gguf_get_val_bool(original.get(), i)); break;
+            case GGUF_TYPE_STRING: gguf_set_val_str(ctx, renamed.c_str(), gguf_get_val_str(original.get(), i)); break;
+            case GGUF_TYPE_ARRAY:
+                if (gguf_get_arr_type(original.get(), i) == GGUF_TYPE_STRING) {
+                    std::vector<const char *> values;
+                    for (size_t j = 0; j < gguf_get_arr_n(original.get(), i); ++j) {
+                        values.push_back(gguf_get_arr_str(original.get(), i, j));
+                    }
+                    gguf_set_arr_str(ctx, renamed.c_str(), values.data(), values.size());
+                } else {
+                    gguf_set_arr_data(ctx, renamed.c_str(), gguf_get_arr_type(original.get(), i),
+                        gguf_get_arr_data(original.get(), i), gguf_get_arr_n(original.get(), i));
+                }
+                break;
+            default: throw std::runtime_error("unexpected GLM fixture metadata type");
+        }
+        GGML_ASSERT(gguf_remove_key(ctx, key.c_str()) >= 0);
+    }
+    gguf_set_val_str(ctx, "general.architecture", "glm5-next");
+}
+
+static bool test_glm_arch_alias(const size_t seed) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5NEXT, true);
+    auto reference = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    const auto tokens = get_tokens(17, llama_vocab_n_tokens(llama_model_get_vocab(reference.first.get())), seed);
+    const auto expected = get_logits(reference.first.get(), reference.second.get(), tokens);
+    glm_use_hyphenated_metadata(metadata.get());
+    auto aliased = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    if (get_logits(aliased.first.get(), aliased.second.get(), tokens) != expected) { return false; }
+
+    const auto close_file = [](FILE * file) { fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+    if (!file) { throw std::runtime_error("cannot create GLM alias fixture file"); }
+    llama_model_saver saver(reference.first.get());
+    saver.add_kv_from_model();
+    saver.add_tensors_from_model();
+    glm_use_hyphenated_metadata(saver.gguf_ctx);
+    saver.save(file.get());
+    rewind(file.get());
+    auto loaded = get_model_and_ctx(nullptr, file.get(), seed, {});
+    const bool ok = get_logits(loaded.first.get(), loaded.second.get(), tokens) == expected;
+    printf("GLM architecture alias: user metadata and file logits %s\n", ok ? "identical" : "differ");
+    return ok;
+}
+
 static int test_glm_dp(const size_t seed, const std::vector<ggml_backend_dev_t> & devices, bool q8_cache = false, size_t selected_ranks = 0) {
     GGML_ASSERT(!devices.empty());
     const auto ranks_on = [&](size_t count) {
@@ -2685,8 +2741,13 @@ int main(int argc, char ** argv) {
     std::string out;
     std::string diagnostic_dir, diagnostic_device;
     std::string dp_device;
+    bool glm_alias_only = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--glm-arch-alias") == 0) {
+            glm_alias_only = true;
+            continue;
+        }
         if (strcmp(argv[i], "--glm-dp-device") == 0) {
             if (i + 1 == argc) return 1;
             dp_device = argv[++i];
@@ -2735,6 +2796,11 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (glm_alias_only || (arch == LLM_ARCH_GLM5NEXT && out.empty())) {
+            ggml_backend_load_all();
+            if (!test_glm_arch_alias(seed)) { return 1; }
+            if (glm_alias_only) { return 0; }
+        }
         if (!dp_device.empty()) {
             ggml_backend_load_all();
             std::vector<ggml_backend_dev_t> devices;

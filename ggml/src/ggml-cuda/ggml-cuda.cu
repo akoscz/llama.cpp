@@ -8311,8 +8311,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) {
-                    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16 &&
-                            a->type != GGML_TYPE_Q8_0 && a->type != GGML_TYPE_IQ3_XXS) { return false; }
+                    switch (a->type) {
+                        case GGML_TYPE_F32:
+                        case GGML_TYPE_F16:
+                        case GGML_TYPE_BF16:
+                        case GGML_TYPE_Q8_0:
+                        case GGML_TYPE_IQ3_XXS:
+                        case GGML_TYPE_IQ2_S:
+                        case GGML_TYPE_IQ3_S:
+                        case GGML_TYPE_IQ4_XS:
+                        case GGML_TYPE_Q2_K:
+                        case GGML_TYPE_Q3_K:
+                            break;
+                        default:
+                            return false;
+                    }
                     if (!ggml_is_contiguous(op) || op->src[2]->nb[0] != sizeof(int32_t) ||
                             ggml_cuda_mul_mat_id_needs_sync(op, ggml_cuda_info().devices[dev_ctx->device].cc)) { return false; }
                 }

@@ -577,7 +577,7 @@ llama_model_loader::llama_model_loader(
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(arch_name);
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
@@ -689,7 +689,7 @@ llama_model_loader::llama_model_loader(
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(arch_name);
 
         files.emplace_back(new llama_file(file));
         contexts.emplace_back(ctx);
@@ -707,7 +707,7 @@ llama_model_loader::llama_model_loader(
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(arch_name);
     }
 
     n_kv      = gguf_get_n_kv(metadata);
