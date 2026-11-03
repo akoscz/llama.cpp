@@ -64,14 +64,16 @@ static __global__ void k_kpool_mask(
 // One bounded sort per row; physical cell order matches dense-mask compaction.
 static __global__ void k_kpool_indices(
         const int32_t * cells, const int32_t * rows, const int32_t * selected, const int32_t * tail,
-        int32_t * dst, int nk, int np, int nr, int ntop, int ntail, int extra, int bound, int nsort) {
+        int32_t * dst, int nk, int np, int nr, int ntop, int ntail, int extra, int bound, int nsort,
+        int capacity, const int32_t * resident_rows) {
     extern __shared__ int32_t ids[];
     const int row = blockIdx.x;
     const int stream = blockIdx.y;
     const int32_t * f = rows + 4*(stream*nr + row);
     const bool live = f[1] >= 0 && f[1] < np;
     const int32_t * pos = cells + (int64_t(stream)*np + (live ? f[1] : 0))*2*nk;
-    const int32_t * pool = pos + nk;
+    const int32_t * pool = pos + (capacity ? capacity : nk);
+    const int32_t base = capacity ? resident_rows[1] : 0;
     for (int j = threadIdx.x; j < nsort; j += blockDim.x) {
         int32_t value = INT32_MAX;
         if (live && j < ntop+ntail) {
@@ -88,7 +90,8 @@ static __global__ void k_kpool_indices(
             } else if (cell < nk) {
                 const bool visible = uint32_t(pos[cell]) <= uint32_t(f[0]);
                 const bool in_tail = pos[cell] >= f[2];
-                const bool pooled = from_top && uint32_t(pool[cell]) < uint32_t(f[3]);
+                const int32_t block = capacity && pool[cell] >= 0 ? pool[cell] - base : pool[cell];
+                const bool pooled = from_top && uint32_t(block) < uint32_t(f[3]);
                 if (visible && (in_tail || pooled)) { value = cell; }
             }
         }
@@ -211,7 +214,47 @@ static __global__ void k_kpool_indices(
 #endif
 }
 
+static __global__ void k_kpool_materialize(const int32_t * table, const int32_t * rows, int32_t * dst,
+        int64_t n, int mode, int64_t capacity, int64_t r, int64_t nk, int64_t np) {
+    const int64_t cap = capacity/r + 2;
+    const int64_t run = rows[5], off = run ? int64_t(rows[1]) - rows[4] : 0;
+    if (run < 0 || run > np || off < 0 || off + run > cap) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        __builtin_trap();
+#else
+        asm("trap;");
+#endif
+    }
+    for (int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x)*blockDim.x) {
+        switch (mode) {
+            case GGML_KPOOL_MATERIALIZE_FACTS:
+                dst[i] = i < nk ? table[i] : table[capacity + i - nk] < 0 ? -1 : table[capacity + i - nk] - rows[1];
+                break;
+            case GGML_KPOOL_MATERIALIZE_CELLS:
+                dst[i] = i >= np*r ? int32_t(nk + i - np*r) : i < run*r ? table[2*capacity + off*r + i] : 0;
+                break;
+            case GGML_KPOOL_MATERIALIZE_REPS:
+                dst[i] = i < run ? table[2*capacity + cap*(r + 1) + off + i] : 0;
+                break;
+            case GGML_KPOOL_MATERIALIZE_BIAS: {
+                const int64_t p = i%np;
+                const int32_t * row = rows + 6*(i/np);
+                ((float *) dst)[i] = p < run && p < row[3] && table[2*capacity + cap*r + off + p] == r ? 0.0f : -INFINITY;
+            } break;
+        }
+    }
+}
+
 void ggml_cuda_op_kpool_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) >= GGML_KPOOL_MATERIALIZE_FACTS) {
+        const int64_t n = ggml_nelements(dst);
+        k_kpool_materialize<<<std::min<int64_t>((n + 255)/256, 4096), 256, 0, ctx.stream()>>>(
+            (const int32_t *) dst->src[0]->data, (const int32_t *) dst->src[1]->data, (int32_t *) dst->data, n,
+            ggml_get_op_params_i32(dst, 0), ggml_get_op_params_i32(dst, 1), ggml_get_op_params_i32(dst, 2),
+            ggml_get_op_params_i32(dst, 3), ggml_get_op_params_i32(dst, 4));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MASK_INDICES) {
         const ggml_tensor * cells = dst->src[0];
         const ggml_tensor * rows = dst->src[1];
@@ -222,11 +265,13 @@ void ggml_cuda_op_kpool_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         int nsort = 1;
         while (nsort < n) { nsort *= 2; }
         const dim3 grid(rows->ne[1], rows->ne[2]);
+        const int capacity = ggml_get_op_params_i32(dst, 2);
         k_kpool_indices<<<grid, 256, nsort*sizeof(int32_t), ctx.stream()>>>(
             (const int32_t *) cells->data, (const int32_t *) rows->data,
             (const int32_t *) selected->data, (const int32_t *) tail->data, (int32_t *) dst->data,
-            cells->ne[0], cells->ne[2], rows->ne[1], selected->ne[0], tail->ne[0],
-            ggml_get_op_params_i32(dst, 1), dst->ne[0], nsort);
+            capacity ? ggml_get_op_params_i32(dst, 3) : cells->ne[0], capacity ? 1 : cells->ne[2],
+            rows->ne[1], selected->ne[0], tail->ne[0], ggml_get_op_params_i32(dst, 1), dst->ne[0], nsort,
+            capacity, capacity ? (const int32_t *) dst->src[4]->data : nullptr);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

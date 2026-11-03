@@ -2791,6 +2791,27 @@ extern "C" {
             enum ggml_kpool_mask_mode mode,
             int64_t                   n_extra);
 
+    enum ggml_kpool_materialize_mode {
+        GGML_KPOOL_MATERIALIZE_FACTS = 3,
+        GGML_KPOOL_MATERIALIZE_CELLS = 4,
+        GGML_KPOOL_MATERIALIZE_REPS  = 5,
+        GGML_KPOOL_MATERIALIZE_BIAS  = 6,
+    };
+
+    // One sequence's resident I32 table: pos[kv_size], absolute pool[kv_size], slot[cap*kpool], fill[cap], reps[cap].
+    // cap = kv_size/kpool + 2. rows: I32 [6,Q], containing q, base, tail, visible pools, table base, run length.
+    // All rows share base, table base and run length. Outputs have the ordinary k-pool input layouts.
+    GGML_API struct ggml_tensor * ggml_kpool_materialize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * rows,
+            int64_t               kv_size,
+            int64_t               kpool,
+            int64_t               n_kv,
+            int64_t               n_pools,
+            int64_t               n_dump,
+            enum ggml_kpool_materialize_mode mode);
+
     // Selected: I32 [n_selected, n_rows, n_stream], with dump ids in [n_kv, n_kv+n_extra).
     // Tail: I32 [n_tail, n_rows, n_stream], physical cells or -1 padding. Result is sorted and unique, padded with -1.
     // bound >= n_selected + n_tail; CUDA supports at most GGML_KPOOL_INDICES_MAX input entries per row.

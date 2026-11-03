@@ -12278,7 +12278,10 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
     const ggml_tensor * rows = dst->src[1];
     const ggml_tensor * selected = dst->src[2];
     const ggml_tensor * tail = dst->src[3];
-    const int64_t nk = cells->ne[0], nr = rows->ne[1];
+    const int64_t capacity = ggml_get_op_params_i32(dst, 2);
+    const int64_t nk = capacity ? ggml_get_op_params_i32(dst, 3) : cells->ne[0], nr = rows->ne[1];
+    const int64_t n_ps = capacity ? 1 : cells->ne[2];
+    const int32_t base = capacity ? ((const int32_t *) dst->src[4]->data)[1] : 0;
     const int64_t extra = ggml_get_op_params_i32(dst, 1);
     std::vector<int32_t> ids;
     ids.reserve(selected->ne[0] + tail->ne[0]);
@@ -12287,9 +12290,9 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
         const int32_t * f = (const int32_t *) ((const char *) rows->data + row*rows->nb[1] + stream*rows->nb[2]);
         int32_t * out = (int32_t *) ((char *) dst->data + row*dst->nb[1] + stream*dst->nb[3]);
         ids.clear();
-        if (f[1] >= 0 && f[1] < cells->ne[2]) {
+        if (f[1] >= 0 && f[1] < n_ps) {
             const int32_t * pos = (const int32_t *) ((const char *) cells->data + f[1]*cells->nb[2] + stream*cells->nb[3]);
-            const int32_t * pool = pos + nk;
+            const int32_t * pool = pos + (capacity ? capacity : nk);
             for (const ggml_tensor * source : {selected, tail}) {
                 const int32_t * src = (const int32_t *) ((const char *) source->data + row*source->nb[1] + stream*source->nb[2]);
                 for (int64_t j = 0; j < source->ne[0]; ++j) {
@@ -12299,7 +12302,8 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
                     if (cell >= nk) { continue; }
                     const bool visible = (uint32_t) pos[cell] <= (uint32_t) f[0];
                     const bool in_tail = pos[cell] >= f[2];
-                    const bool pooled = source == selected && (uint32_t) pool[cell] < (uint32_t) f[3];
+                    const int32_t block = capacity && pool[cell] >= 0 ? pool[cell] - base : pool[cell];
+                    const bool pooled = source == selected && (uint32_t) block < (uint32_t) f[3];
                     if (visible && (in_tail || pooled)) { ids.push_back(cell); }
                 }
             }
@@ -12312,11 +12316,48 @@ static void ggml_compute_forward_kpool_indices(const ggml_compute_params * param
     }
 }
 
+static void ggml_compute_forward_kpool_materialize(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int mode = ggml_get_op_params_i32(dst, 0);
+    const int64_t capacity = ggml_get_op_params_i32(dst, 1), r = ggml_get_op_params_i32(dst, 2);
+    const int64_t nk = ggml_get_op_params_i32(dst, 3), np = ggml_get_op_params_i32(dst, 4);
+    const int64_t cap = capacity/r + 2;
+    const auto * table = (const int32_t *) dst->src[0]->data;
+    const auto * rows = (const int32_t *) dst->src[1]->data;
+    const int64_t run = rows[5], off = run ? (int64_t) rows[1] - rows[4] : 0;
+    GGML_ASSERT(run >= 0 && run <= np && off >= 0 && off + run <= cap);
+    auto * out = (int32_t *) dst->data;
+    for (int64_t i = params->ith; i < ggml_nelements(dst); i += params->nth) {
+        switch (mode) {
+            case GGML_KPOOL_MATERIALIZE_FACTS:
+                out[i] = i < nk ? table[i] : table[capacity + i - nk] < 0 ? -1 : table[capacity + i - nk] - rows[1];
+                break;
+            case GGML_KPOOL_MATERIALIZE_CELLS:
+                out[i] = i >= np*r ? (int32_t) (nk + i - np*r) :
+                    i < run*r ? table[2*capacity + off*r + i] : 0;
+                break;
+            case GGML_KPOOL_MATERIALIZE_REPS:
+                out[i] = i < run ? table[2*capacity + cap*(r + 1) + off + i] : 0;
+                break;
+            case GGML_KPOOL_MATERIALIZE_BIAS: {
+                const int64_t p = i%np;
+                const auto * row = rows + 6*(i/np);
+                GGML_ASSERT(row[1] == rows[1] && row[4] == rows[4] && row[5] == run && row[3] >= 0);
+                ((float *) dst->data)[i] = p < run && p < row[3] && table[2*capacity + cap*r + off + p] == r ? 0.0f : -INFINITY;
+            } break;
+            default: GGML_ABORT("invalid resident k-pool output");
+        }
+    }
+}
+
 // ggml_compute_forward_kpool_mask
 
 void ggml_compute_forward_kpool_mask(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) >= GGML_KPOOL_MATERIALIZE_FACTS) {
+        ggml_compute_forward_kpool_materialize(params, dst);
+        return;
+    }
     if (ggml_get_op_params_i32(dst, 0) == GGML_KPOOL_MASK_INDICES) {
         ggml_compute_forward_kpool_indices(params, dst);
         return;
