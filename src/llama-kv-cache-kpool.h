@@ -1,18 +1,39 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "llama-graph.h"
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_ubatch;
 class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cells;
+
+// Cache-owned tensors outlive graph allocator resets. Graph inputs retain shared
+// ownership when a new selection width replaces an old allocation.
+struct llama_kpool_backend_tensor {
+    llama_kpool_backend_tensor(ggml_backend_buffer_type_t buft, int64_t count);
+    ~llama_kpool_backend_tensor();
+    llama_kpool_backend_tensor(const llama_kpool_backend_tensor &) = delete;
+    llama_kpool_backend_tensor & operator=(const llama_kpool_backend_tensor &) = delete;
+    void begin_upload(ggml_backend_t backend);
+    void upload(size_t offset, const int32_t * data, size_t count);
+    void end_upload();
+    ggml_backend_t upload_backend = nullptr;
+    ggml_backend_event_t uploaded = nullptr;
+    bool upload_pending = false;
+    std::vector<std::vector<int32_t>> staging;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * tensor = nullptr;
+};
 
 // Transient, per-round MTP selections. A mutation of the owning memory invalidates
 // them; these are never serialized with a prompt cache.
@@ -23,10 +44,17 @@ public:
     bool active() const { return step >= 0; }
     uint64_t generation() const { return epoch; }
     void capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells);
+    void capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv, ggml_tensor * source, int64_t row, ggml_backend_t backend = nullptr);
+    std::shared_ptr<llama_kpool_backend_tensor> backend_row(llama_seq_id seq) const;
     bool can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const;
     void copy(const llama_ubatch & ubatch, int32_t * dst) const;
 private:
-    struct row { llama_pos pos; int32_t step; int64_t n_kv; std::vector<int32_t> cells; };
+    struct row {
+        llama_pos pos; int32_t step; int64_t n_kv; std::vector<int32_t> cells;
+        std::shared_ptr<llama_kpool_backend_tensor> backend;
+        int64_t width() const { return backend ? backend->tensor->ne[0] : (int64_t) cells.size(); }
+    };
+    std::map<llama_seq_id, std::shared_ptr<llama_kpool_backend_tensor>> stores;
     int32_t step = -1;
     uint64_t epoch = 0;
     std::map<llama_seq_id, row> rows;
@@ -67,6 +95,10 @@ public:
         std::vector<uint16_t> fill;   // [cap]   cells in the pool
         std::vector<int32_t>  reps;   // [cap]   cell of the last position of a complete pool, else 0
 
+        // Offsets/counts are I32 elements. The callback is the actual upload boundary.
+        std::shared_ptr<llama_kpool_backend_tensor> resident(ggml_backend_buffer_type_t buft) const;
+        size_t resident_size() const { return 2*pos_at.size() + slot.size() + 2*cap; }
+        size_t emit_patches(const std::function<void(size_t, const int32_t *, size_t)> & write) const;
         void rebuild(const llama_kv_cells & c, llama_seq_id seq);
 
         // false: the cells disagree with the tables (two cells at one position, a position off the tables); rebuild
@@ -77,6 +109,9 @@ public:
         void remove(uint32_t j);
 
         std::vector<std::pair<uint32_t, int32_t>> upd;
+        mutable std::shared_ptr<llama_kpool_backend_tensor> storage;
+        mutable bool full_upload = true;
+        mutable std::vector<uint32_t> dirty_cells, dirty_pools;
     };
 
     struct stats {
@@ -288,6 +323,18 @@ public:
 
     // exact, since pool_bias only holds 0.0f or -INFINITY. nullptr if the fused path is off
     ggml_tensor * pool_bias_f16 = nullptr; // F16 [n_pools, n_tps, 1, n_stream]
+
+    // The ordinary one-sequence stream uses one stable canonical allocation for
+    // every graph slot; only the mutation consumer's changed ranges are uploaded.
+    ggml_backend_sched_t sched = nullptr;
+    std::shared_ptr<llama_kpool_backend_tensor> resident_table;
+    llama_seq_id resident_seq = -1;
+    ggml_tensor * resident_rows = nullptr; // [6, Q], see ggml_kpool_materialize
+    uint64_t resident_upload_bytes = 0;
+    uint64_t resident_upload_calls = 0;
+    bool reuse_only = false;
+    std::vector<std::shared_ptr<llama_kpool_backend_tensor>> draft_rows;
+    std::vector<llama_seq_id> draft_seqs;
 
     llama_kpool_draft * draft = nullptr;
     ggml_tensor * draft_top_k = nullptr; // retained selection in the current batch's sequence order

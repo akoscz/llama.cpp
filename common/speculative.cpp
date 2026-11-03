@@ -1417,69 +1417,113 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// --spec-draft-mtp-adaptive selects low or n_max from the acceptance of the sequence's own drafts in the current request.
-// low is max(1, n_min) up to n_max; the request's remaining output limit can shorten a draft below n_min.
-// The depth holds for `window` observed rounds; a low-depth window ends in one full-depth probe to measure tokens past low.
-struct common_mtp_depth {
-    static constexpr int32_t window = 8;
-    static constexpr float   keep   = 15.0f / 16.0f; // weight left to an observation after each later round
-    static constexpr float   band   = 0.125f;        // hysteresis around the cost
+void common_mtp_service::invalidate() {
+    *this = {};
+}
 
-    int32_t low    = 1;
-    int32_t depth  = 0;
-    int32_t rounds = 0; // observed rounds in this request
-
-    int32_t n_drafted  = 0; // length of the draft whose verification is awaited (0: none)
-    int32_t n_verified = 0; // target batches of the sequence since that draft (2: a checkpoint replay)
-
-    // decayed sums and weights: the first draft token landed; the tokens past the first that landed in full-depth
-    // rounds whose first did, all of them and those a low-depth draft holds. All start as one round where every draft
-    // token landed
-    float first_sum = 0.0f, first_w = 0.0f;
-    float extra_sum = 0.0f, extra_w = 0.0f;
-    float low_sum   = 0.0f;
-
-    void reset(int32_t n_max, int32_t n_min) {
-        *this = {};
-        low       = std::max(1, std::min(n_min, n_max));
-        depth     = n_max;
-        first_sum = first_w = extra_w = 1.0f;
-        extra_sum = (float) (n_max - 1);
-        low_sum   = (float) (low - 1);
+void common_mtp_service::boundary(llama_seq_id seq, int depth, int low_depth, int full_depth, double now) {
+    if (seq < 0 || !std::isfinite(now) || now <= 0 || low_depth < 1 || low_depth >= full_depth || (depth != low_depth && depth != full_depth)) {
+        invalidate();
+        return;
     }
-
-    int32_t n_draft(int32_t n_max) const {
-        return depth == low && rounds % window == window - 1 ? n_max : depth;
-    }
-
-    void observe(int32_t n_max, float cost, int32_t n_accepted) {
-        first_sum = keep*first_sum + (n_accepted > 0 ? 1.0f : 0.0f);
-        first_w   = keep*first_w   + 1.0f;
-        extra_sum *= keep;
-        low_sum   *= keep;
-        extra_w   *= keep;
-        if (n_drafted == n_max && n_accepted > 0) {
-            extra_sum += (float) (n_accepted - 1);
-            low_sum   += (float) (std::min(n_accepted, low) - 1);
-            extra_w   += 1.0f;
-        }
-        if (++rounds % window != 0) {
-            return;
-        }
-        // the tokens a full-depth round gains past a low-depth round's, against that round's, and the time they add
-        // to it. At low = 1 this is p1*e/(1+p1) against (n_max-1)*cost
-        const float p1   = first_sum / first_w;
-        const float e    = extra_sum / extra_w;
-        const float e_lo = low_sum / extra_w;
-        const float gain = p1 * (e - e_lo) / (1.0f + p1 * (1.0f + e_lo));
-        const float cut  = (float) (n_max - low) * cost / (1.0f + (float) (low - 1) * cost);
-        if (depth == n_max && gain < cut * (1.0f - band)) {
-            depth = low;
-        } else if (depth == low && gain > cut * (1.0f + band)) {
-            depth = n_max;
+    if (owner >= 0) {
+        const double elapsed = now - start;
+        if (owner != seq || low != low_depth || full != full_depth || realized != chosen || verified != 1 || accepted < 0 || elapsed <= 0 || !std::isfinite(elapsed)) {
+            invalidate();
+        } else {
+            const int which = chosen == low ? 0 : 1;
+            samples[which][next[which]] = elapsed;
+            next[which] = (next[which] + 1) % history;
+            n_samples[which] = std::min(history, n_samples[which] + 1);
+            last[which] = serial;
         }
     }
-};
+    ++serial;
+    owner = seq;
+    chosen = depth;
+    low = low_depth;
+    full = full_depth;
+    start = now;
+    realized = verified = 0;
+    accepted = -1;
+}
+
+void common_mtp_service::drafted(llama_seq_id seq, int depth) {
+    if (owner != seq || depth != chosen) {
+        invalidate();
+        return;
+    }
+    realized = depth;
+}
+
+void common_mtp_service::verify(llama_seq_id seq, int rows) {
+    if (owner != seq || realized != chosen || rows != chosen + 1 || ++verified != 1 || accepted >= 0) {
+        invalidate();
+    }
+}
+
+void common_mtp_service::accept(llama_seq_id seq, int count, bool other) {
+    if (other || owner != seq || verified != 1 || count < 0 || count > realized || accepted >= 0) {
+        invalidate();
+        return;
+    }
+    accepted = count;
+}
+
+float common_mtp_service::relative_cost(float fallback) const {
+    double time[2];
+    for (int i = 0; i < 2; ++i) {
+        if (n_samples[i] < 3 || serial - last[i] > 4*common_mtp_depth::window) {
+            return fallback;
+        }
+        auto sorted = samples[i];
+        std::sort(sorted.begin(), sorted.begin() + n_samples[i]);
+        time[i] = sorted[n_samples[i] / 2];
+    }
+    // A short median window bounds the effect of scheduler stalls. This is wall-clock service time, including host work.
+    return (float) std::max(0.0, time[1] / time[0] - 1.0);
+}
+
+void common_mtp_depth::reset(int32_t n_max, int32_t n_min) {
+    *this = {};
+    low       = std::max(1, std::min(n_min, n_max));
+    depth     = n_max;
+    first_sum = first_w = extra_w = 1.0f;
+    extra_sum = (float) (n_max - 1);
+    low_sum   = (float) (low - 1);
+}
+
+int32_t common_mtp_depth::n_draft(int32_t n_max, bool timed) const {
+    if (rounds % window == window - 1) {
+        if (depth == low) return n_max;
+        if (timed) return low;
+    }
+    return depth;
+}
+
+void common_mtp_depth::observe(int32_t n_max, float cost, int32_t n_accepted, float service_cut) {
+    first_sum = keep*first_sum + (n_accepted > 0 ? 1.0f : 0.0f);
+    first_w   = keep*first_w   + 1.0f;
+    extra_sum *= keep;
+    low_sum   *= keep;
+    extra_w   *= keep;
+    if (n_drafted == n_max && n_accepted > 0) {
+        extra_sum += (float) (n_accepted - 1);
+        low_sum   += (float) (std::min(n_accepted, low) - 1);
+        extra_w   += 1.0f;
+    }
+    if (++rounds % window != 0) return;
+    const float p1   = first_sum / first_w;
+    const float e    = extra_sum / extra_w;
+    const float e_lo = low_sum / extra_w;
+    const float gain = p1 * (e - e_lo) / (1.0f + p1 * (1.0f + e_lo));
+    const float cut  = service_cut >= 0 ? service_cut : (float) (n_max - low) * cost / (1.0f + (float) (low - 1) * cost);
+    if (depth == n_max && gain < cut * (1.0f - band)) {
+        depth = low;
+    } else if (depth == low && gain > cut * (1.0f + band)) {
+        depth = n_max;
+    }
+}
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
@@ -1542,6 +1586,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_mtp_depth> depth; // per seq, with --spec-draft-mtp-adaptive
     std::vector<int32_t>          n_draft_max;
+    common_mtp_service service; // one pending cycle for the isolated ordinary-head workload
+    llama_pos service_pos = -1;
+    bool timing = false;
 
     // the token the head reads at an image or audio row, where the target read an embedding (LLAMA_TOKEN_NULL: such
     // rows stay out of the head, as for models whose media rows share positions under M-RoPE)
@@ -1611,6 +1658,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        timing = this->params.mtp_adaptive > 0.0f && !is_mem_shared && !chain_heads && !decode_only &&
+            !ggml_env_switch("LLAMA_MTP_TIMING_LEGACY");
 
         {
             const char * env = getenv("LLAMA_MTP_DEVICE_H");
@@ -1702,6 +1751,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        service.invalidate();
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1730,6 +1780,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        if (service.owner >= 0) {
+            bool ordinary = batch_in.token != nullptr && batch_in.n_tokens > 0 &&
+                std::count(generating.begin(), generating.end(), uint8_t(1)) == 1;
+            for (int k = 0; ordinary && k < batch_in.n_tokens; ++k) {
+                ordinary = batch_in.n_seq_id[k] == 1 && batch_in.seq_id[k][0] == service.owner &&
+                    batch_in.pos[k] == service_pos + k && batch_in.logits && batch_in.logits[k];
+            }
+            if (ordinary) service.verify(service.owner, batch_in.n_tokens);
+            else service.invalidate();
+        }
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1882,6 +1942,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
             if (!ok) {
+                service.invalidate();
                 return false;
             }
         }
@@ -1899,11 +1960,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int32_t i = 0; i < n_keep; ++i) {
                     device_rows.push_back(i_batch_beg[seq_id] + i);
                 }
-                device_rows.push_back(i_batch_end[seq_id]);
+                if (n_keep < i_batch_end[seq_id] - i_batch_beg[seq_id] + 1) {
+                    device_rows.push_back(i_batch_end[seq_id]);
+                }
             }
             device_kept.resize(device_rows.size() * n_embd);
             if (!llama_get_embeddings_nextn_rows(ctx_tgt, device_rows.data(), (int32_t) device_rows.size(), device_kept.data())) {
                 SPC_ERR("%s: the target's kept rows could not be read\n", __func__);
+                service.invalidate();
                 return false;
             }
         } else {
@@ -1919,8 +1983,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const int32_t n_keep = std::min(n_rows, verify_h_keep);
             const float * h_beg  = device ? device_kept.data() + i_kept * n_embd : h_tgt + (size_t) i_batch_beg[seq_id] * n_embd;
-            const float * h_end  = device ? h_beg + (size_t) n_keep * n_embd : h_tgt + (size_t) i_batch_end[seq_id] * n_embd;
-            i_kept += n_keep + 1;
+            const float * h_end  = device ? h_beg + (size_t) std::min(n_keep, n_rows - 1) * n_embd : h_tgt + (size_t) i_batch_end[seq_id] * n_embd;
+            i_kept += n_keep + (n_keep < n_rows ? 1 : 0);
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].assign(h_beg, h_beg + (size_t) n_keep * n_embd);
 
@@ -1945,6 +2009,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
         std::vector<float> chain_p(n_seq, 1.0f); // product of the chain's top-1 probabilities so far
+        const bool isolated = timing && std::count(generating.begin(), generating.end(), uint8_t(1)) == 1 &&
+            std::count_if(dparams.begin(), dparams.end(), [](const common_speculative_draft_params & dp) { return dp.drafting; }) == 1;
+        if (!isolated) service.invalidate();
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1958,7 +2025,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
-            n_draft_max[seq_id] = params.mtp_adaptive > 0.0f ? depth[seq_id].n_draft(params.n_max) : params.n_max;
+            n_draft_max[seq_id] = params.mtp_adaptive > 0.0f ? depth[seq_id].n_draft(params.n_max, isolated && generating[seq_id]) : params.n_max;
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1994,6 +2061,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                service.invalidate();
                 break;
             }
 
@@ -2011,6 +2079,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                if (i == 0 && isolated && generating[seq_id]) {
+                    const int chosen = n_draft_max[seq_id];
+                    if (params.n_min <= chosen && (dparams[seq_id].n_max <= 0 || dparams[seq_id].n_max >= chosen)) {
+                        // The getter already completed this step. The next such boundary includes target verification and catch-up.
+                        service.boundary(seq_id, chosen, depth[seq_id].low, params.n_max, (double) ggml_time_us());
+                        service_pos = dparams[seq_id].n_past;
+                    } else {
+                        service.invalidate();
+                    }
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2025,6 +2103,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    service.invalidate();
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2041,6 +2120,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 chain_p[seq_id] *= cur_p->data[0].p;
                 if (params.chain_p_min > 0.0f && chain_p[seq_id] < params.chain_p_min) {
+                    service.invalidate();
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2110,19 +2190,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_drafted = (int32_t) dp.result->size();
             depth[seq_id].n_drafted  = dp.n_max > 0 ? std::min(n_drafted, dp.n_max) : n_drafted;
             depth[seq_id].n_verified = 0;
+            if (service.owner >= 0) service.drafted(seq_id, depth[seq_id].n_drafted);
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            service.invalidate();
             return;
         }
 
         // a round counts once its draft is verified once: a checkpoint replay verifies it twice, and another
         // drafter's round is not this head's
         auto & d = depth[seq_id];
+        if (service.owner >= 0) service.accept(seq_id, n_accepted, is_other);
         if (params.mtp_adaptive > 0.0f && !is_other && d.n_drafted > 0 && d.n_verified == 1) {
-            d.observe(params.n_max, params.mtp_adaptive, std::min<int32_t>(n_accepted, d.n_drafted));
+            const float prior = (params.n_max - d.low)*params.mtp_adaptive / (1.0f + (d.low - 1)*params.mtp_adaptive);
+            const float cut = service.owner == seq_id ? service.relative_cost(prior) : -1.0f;
+            d.observe(params.n_max, params.mtp_adaptive, std::min<int32_t>(n_accepted, d.n_drafted), cut);
         }
         d.n_drafted  = 0;
         d.n_verified = 0;
@@ -2137,6 +2222,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // past every row a verification can accept: keep no row rather than a wrong one
             SPC_WRN("seq_id %d: accepted row %d of a %d-row batch was not kept\n", (int) seq_id, i_h, n_rows);
             pending_pos[seq_id] = -1;
+            service.invalidate();
             return;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -2162,6 +2248,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        service.invalidate();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -2181,6 +2268,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void end(llama_seq_id seq_id) override {
+        service.invalidate();
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             generating[seq_id] = 0;
             depth[seq_id].reset(params.n_max, params.n_min);

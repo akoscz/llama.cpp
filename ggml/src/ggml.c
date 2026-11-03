@@ -6799,6 +6799,44 @@ struct ggml_tensor * ggml_kpool_mask(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct ggml_tensor * ggml_kpool_materialize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * rows,
+        int64_t               kv_size,
+        int64_t               kpool,
+        int64_t               n_kv,
+        int64_t               n_pools,
+        int64_t               n_dump,
+        enum ggml_kpool_materialize_mode mode) {
+    GGML_ASSERT(kv_size > 0 && kv_size <= INT32_MAX && kpool > 0 && kpool <= INT32_MAX);
+    GGML_ASSERT(n_kv > 0 && n_kv <= kv_size && n_pools > 0 && n_pools <= INT32_MAX);
+    GGML_ASSERT(n_dump >= 0 && n_dump <= INT32_MAX && kpool*(n_pools + n_dump) <= INT32_MAX);
+    GGML_ASSERT(table->type == GGML_TYPE_I32 && ggml_is_vector(table) && ggml_is_contiguous(table));
+    GGML_ASSERT(table->ne[0] == 2*kv_size + (kv_size/kpool + 2)*(kpool + 2));
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+    GGML_ASSERT(rows->ne[0] == 6 && rows->ne[1] > 0 && rows->ne[2] == 1 && rows->ne[3] == 1);
+    struct ggml_tensor * result;
+    switch (mode) {
+        case GGML_KPOOL_MATERIALIZE_FACTS:
+            result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 2, 1, 1); break;
+        case GGML_KPOOL_MATERIALIZE_CELLS:
+            result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*(n_pools + n_dump), 1); break;
+        case GGML_KPOOL_MATERIALIZE_REPS:
+            result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_pools, 1); break;
+        case GGML_KPOOL_MATERIALIZE_BIAS:
+            result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, rows->ne[1], 1); break;
+        default: GGML_ABORT("invalid resident k-pool output");
+    }
+    const int32_t params[] = {(int32_t) mode, (int32_t) kv_size, (int32_t) kpool,
+            (int32_t) n_kv, (int32_t) n_pools, (int32_t) n_dump};
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op = GGML_OP_KPOOL_MASK;
+    result->src[0] = table;
+    result->src[1] = rows;
+    return result;
+}
+
 struct ggml_tensor * ggml_kpool_indices(
         struct ggml_context * ctx,
         struct ggml_tensor  * cells,
@@ -6824,6 +6862,13 @@ struct ggml_tensor * ggml_kpool_indices(
     result->src[3] = tail;
     ggml_set_op_params_i32(result, 0, GGML_KPOOL_MASK_INDICES);
     ggml_set_op_params_i32(result, 1, (int32_t) n_extra);
+    // Read canonical facts directly; the materialized N-cell snapshot has no other role here.
+    if (cells->op == GGML_OP_KPOOL_MASK && ggml_get_op_params_i32(cells, 0) == GGML_KPOOL_MATERIALIZE_FACTS) {
+        result->src[0] = cells->src[0];
+        result->src[4] = cells->src[1];
+        ggml_set_op_params_i32(result, 2, ggml_get_op_params_i32(cells, 1));
+        ggml_set_op_params_i32(result, 3, (int32_t) cells->ne[0]);
+    }
     return result;
 }
 

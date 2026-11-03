@@ -18,6 +18,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -777,8 +778,22 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
 
     draft = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_hyb->get_mtp_index() : nullptr;
     const auto dims = current_dims(mctx_attn, params.ubatch, params.cparams, params.hparams, kpool);
-    const bool reuse_selection = dims.scoring && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
+    const bool reuse_selection = dims.scoring && !dims.rebuild && draft && draft->can_reuse(params.ubatch, dims.n_kv, kpool*dims.n_dump, kpool);
     if ((draft_top_k != nullptr) != reuse_selection) return false;
+    if (!draft_rows.empty()) {
+        if (draft_rows.size() != params.ubatch.n_tokens) return false;
+        for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
+            if (draft_seqs[i] != params.ubatch.seq_id[i][0] ||
+                    draft_rows[i] != draft->backend_row(draft_seqs[i])) return false;
+        }
+    }
+    if (resident_table) {
+        if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return false;
+        auto & views = mctx_attn->get_kv()->get_kpool_views();
+        views.begin();
+        if (!views.serve(mctx_attn->get_kv()->get_cells(resident_seq), resident_seq, kpool, dims.n_kv, dims.n_pools)) return false;
+    }
+    sched = params.sched;
 
     return shapes_match(dims, *this);
 }
@@ -4171,6 +4186,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_attn, mctx_idx, kpool);
     inp->n_seq_devices = cparams.n_seq_devices;
+    inp->sched = sched;
     inp->draft = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? mctx_cur->get_mtp_index() : nullptr;
 
     inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
@@ -4206,18 +4222,64 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
-        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*(n_pools + n_dump), n_stream);
-        ggml_set_input(inp->pool_cells);
+        // A single sequence's canonical tables live with the cache, shared by every
+        // graph slot. Different layer devices or unsupported layouts keep the full
+        // input/reference path.
+        const llama_kpool_views::view * resident_view = nullptr;
+        if (!mctx_attn->is_full() && n_stream == 1 && n_ps == 1 && cparams.n_seq_devices == 1 &&
+                !ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") &&
+                !ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY") && !ggml_env_switch("LLAMA_KPOOL_INPUT_CHECK") &&
+                !ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY")) {
+            const auto * kv = mctx_attn->get_kv();
+            const auto layers = kv->get_layer_ids();
+            ggml_backend_buffer_type_t buft = layers.empty() ? nullptr :
+                ggml_backend_buffer_get_type(kv->get_k_storage(layers.front())->buffer);
+            for (auto layer : layers) {
+                if (ggml_backend_buffer_get_type(kv->get_k_storage(layer)->buffer) != buft) buft = nullptr;
+            }
+            if (buft) {
+                auto & views = kv->get_kpool_views();
+                views.begin();
+                resident_view = views.serve(kv->get_cells(ubatch.seq_id_unq[0]), ubatch.seq_id_unq[0], kpool, n_kv, n_pools);
+                if (resident_view) {
+                    inp->resident_seq = ubatch.seq_id_unq[0];
+                    inp->resident_table = resident_view->resident(buft);
+                    inp->resident_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 6, n_tps);
+                    auto * probe = ggml_kpool_materialize(ctx0, inp->resident_table->tensor, inp->resident_rows,
+                            kv->get_size(), kpool, n_kv, n_pools, n_dump, GGML_KPOOL_MATERIALIZE_FACTS);
+                    auto * device = ggml_backend_buft_get_device(buft);
+                    if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
+                    if (!device || !ggml_backend_dev_supports_op(device, probe)) {
+                        inp->resident_table.reset();
+                        inp->resident_rows = nullptr;
+                        resident_view = nullptr;
+                    } else {
+                        ggml_set_input(inp->resident_rows);
+                        ggml_set_name(inp->resident_rows, "kpool_resident_rows");
+                    }
+                }
+            }
+        }
+        auto materialize = [&](enum ggml_kpool_materialize_mode mode) {
+            return ggml_kpool_materialize(ctx0, inp->resident_table->tensor, inp->resident_rows,
+                    mctx_attn->get_kv()->get_size(), kpool, n_kv, n_pools, n_dump, mode);
+        };
+
+        inp->pool_cells = resident_view ? materialize(GGML_KPOOL_MATERIALIZE_CELLS) :
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*(n_pools + n_dump), n_stream);
+        if (!resident_view) ggml_set_input(inp->pool_cells);
         ggml_set_name(inp->pool_cells, "kpool_pool_cells");
 
         inp->pool_cells_3d = ggml_reshape_3d(ctx0, inp->pool_cells, kpool, n_pools + n_dump, n_stream);
 
-        inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
-        ggml_set_input(inp->pool_bias);
+        inp->pool_bias = resident_view ? materialize(GGML_KPOOL_MATERIALIZE_BIAS) :
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
+        if (!resident_view) ggml_set_input(inp->pool_bias);
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
         inp->pool_dump = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_dump, n_tps, n_stream);
-        ggml_set_input(inp->pool_dump);
+        if (resident_view) inp->pool_dump = ggml_fill(ctx0, inp->pool_dump, -FLT_MAX);
+        else ggml_set_input(inp->pool_dump);
         ggml_set_name(inp->pool_dump, "kpool_pool_dump");
 
         // the fused indexer wants f16; built once, shared by every indexer layer
@@ -4243,8 +4305,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             ggml_set_input(inp->cand_mask);
             ggml_set_name(inp->cand_mask, "kpool_cand_mask");
         } else {
-            inp->mask_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv, 2, n_ps, n_stream);
-            ggml_set_input(inp->mask_cells);
+            inp->mask_cells = resident_view ? materialize(GGML_KPOOL_MATERIALIZE_FACTS) :
+                    ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv, 2, n_ps, n_stream);
+            if (!resident_view) ggml_set_input(inp->mask_cells);
             ggml_set_name(inp->mask_cells, "kpool_mask_cells");
 
             inp->mask_rows = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);
@@ -4271,7 +4334,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         inp->n_tail    = llama_kpool_tail_max([kv = mctx_attn->get_kv()](llama_seq_id s) -> const llama_kv_cells & {
             return kv->get_cells(s);
         }, ubatch, kpool);
-        static const bool direct_indices = ggml_env_switch("LLAMA_KPOOL_DIRECT_INDICES");
+        static const bool direct_indices = !ggml_env_switch("LLAMA_KPOOL_DIRECT_INDICES_LEGACY");
         const int64_t tail_bound = std::max<int64_t>(1, inp->n_tail);
         const int64_t direct_bound = llama_kpool_n_kv_max((int64_t) kpool*n_dump, tail_bound);
         if (direct_indices && !ggml_env_switch("LLAMA_KPOOL_KQ_ADD_LEGACY") && inp->mask_cells && cparams.flash_attn && !hparams.use_alibi &&
@@ -4279,12 +4342,26 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 (int64_t) hparams.indexer_kpool*n_dump + tail_bound <= GGML_KPOOL_INDICES_MAX &&
                 n_tps <= 65535 && n_stream <= 65535 &&
                 n_kv >= std::max<int64_t>(4096, std::min<int64_t>(n_tps, 8)*direct_bound)) {
-            inp->tail_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
-            ggml_set_input(inp->tail_cells);
+            auto * tail = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, tail_bound, n_tps, n_stream);
+            auto * selected = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
+            auto * probe = ggml_kpool_indices(ctx0, inp->mask_cells, inp->mask_rows, selected, tail,
+                    kpool*n_dump, direct_bound);
+            bool supported = true;
+            for (auto layer : mctx_attn->get_kv()->get_layer_ids()) {
+                const auto buft = ggml_backend_buffer_get_type(mctx_attn->get_kv()->get_k_storage(layer)->buffer);
+                auto * device = ggml_backend_buft_get_device(buft);
+                if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
+                supported &= device && ggml_backend_dev_supports_op(device, probe);
+            }
+            if (supported) {
+                inp->tail_cells = tail;
+                ggml_set_input(inp->tail_cells);
+            }
         }
 
-        inp->pool_reps = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
-        ggml_set_input(inp->pool_reps);
+        inp->pool_reps = resident_view ? materialize(GGML_KPOOL_MATERIALIZE_REPS) :
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
+        if (!resident_view) ggml_set_input(inp->pool_reps);
         ggml_set_name(inp->pool_reps, "kpool_pool_reps");
 
         inp->new_pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_new_max, n_stream);
@@ -4295,14 +4372,32 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->new_pool_reps);
         ggml_set_name(inp->new_pool_reps, "kpool_new_pool_reps");
 
-        if (inp->draft && inp->draft->can_reuse(ubatch, n_kv, kpool*n_dump, kpool)) {
-            inp->draft_top_k = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
-            ggml_set_input(inp->draft_top_k);
+        if (!rebuild && inp->draft && inp->draft->can_reuse(ubatch, n_kv, kpool*n_dump, kpool)) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                auto row = inp->draft->backend_row(ubatch.seq_id[i][0]);
+                if (!row) { inp->draft_rows.clear(); break; }
+                inp->draft_rows.push_back(row);
+                inp->draft_seqs.push_back(ubatch.seq_id[i][0]);
+            }
+            if (!inp->draft_rows.empty()) {
+                ggml_tensor * joined = nullptr;
+                for (const auto & row : inp->draft_rows) {
+                    auto * t = ggml_reshape_2d(ctx0, row->tensor, kpool*n_dump, 1);
+                    joined = joined ? ggml_concat(ctx0, joined, t, 1) : t;
+                }
+                inp->draft_top_k = ggml_reshape_3d(ctx0, joined, kpool*n_dump, n_tps, n_stream);
+            } else {
+                inp->draft_seqs.clear();
+                inp->draft_top_k = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool*n_dump, n_tps, n_stream);
+                ggml_set_input(inp->draft_top_k);
+            }
             ggml_set_name(inp->draft_top_k, "kpool_mtp_top_k");
-            // The map builder still refreshes masks, the live tail, and new pooled
-            // keys. Keep its host scratch inputs allocated even when scoring is omitted.
-            for (auto * t : {inp->pool_cells, inp->pool_bias, inp->pool_dump, inp->pool_reps}) {
-                ggml_build_forward_expand(gf, t);
+            inp->reuse_only = resident_view != nullptr;
+            if (!inp->reuse_only) {
+                // Unsupported membership layouts retain the full reference builder.
+                for (auto * t : {inp->pool_cells, inp->pool_bias, inp->pool_dump, inp->pool_reps}) {
+                    ggml_build_forward_expand(gf, t);
+                }
             }
         }
     }

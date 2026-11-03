@@ -8715,6 +8715,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_KPOOL_MASK:
+            if (ggml_get_op_params_i32(op, 0) >= GGML_KPOOL_MATERIALIZE_FACTS) {
+                return ggml_get_op_params_i32(op, 0) <= GGML_KPOOL_MATERIALIZE_BIAS &&
+                    op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    (op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_F32);
+            }
             if (ggml_get_op_params_i32(op, 0) == GGML_KPOOL_MASK_INDICES) {
                 return op->type == GGML_TYPE_I32 && op->src[2] && op->src[3] &&
                     op->src[2]->ne[0] + op->src[3]->ne[0] <= GGML_KPOOL_INDICES_MAX &&

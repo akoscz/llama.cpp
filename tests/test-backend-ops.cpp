@@ -9828,6 +9828,83 @@ struct test_kpool_mask : public test_case {
     }
 };
 
+struct test_kpool_materialize : public test_case {
+    const int mode;
+    const int n_rows;
+    const bool empty;
+    const bool direct;
+    const int64_t capacity = 512, r = 4, cap = capacity/r + 2, n_kv = 256, n_pools = 70, n_dump = 16;
+
+    test_kpool_materialize(int mode, int n_rows, bool empty, bool direct = false)
+        : mode(mode), n_rows(n_rows), empty(empty), direct(direct) {}
+
+    std::string vars() override { return VARS_TO_STR4(mode, n_rows, empty, direct); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*capacity + cap*(r + 2));
+        auto * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, n_rows);
+        ggml_set_name(table, "resident_table");
+        ggml_set_name(rows, "resident_rows");
+        auto * out = ggml_kpool_materialize(ctx, table, rows, capacity, r, n_kv, n_pools, n_dump,
+                (ggml_kpool_materialize_mode) mode);
+        if (direct) {
+            auto * mask_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, n_rows, 1);
+            auto * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 64, n_rows, 1);
+            auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, n_rows, 1);
+            ggml_set_name(mask_rows, "mask_rows");
+            ggml_set_name(selected, "selected");
+            ggml_set_name(tail, "tail");
+            out = ggml_kpool_indices(ctx, out, mask_rows, selected, tail, n_dump*r, 96);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x6B71);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<int32_t> data(ggml_nelements(t), 0);
+            if (strcmp(t->name, "resident_table") == 0) {
+                std::fill(data.begin(), data.begin() + 2*capacity, -1);
+                if (!empty) {
+                    for (int64_t p = 2; p < 63; ++p) {
+                        for (int64_t j = 0; j < r; ++j) {
+                            if (p%11 == 0 && j == 2) { continue; }
+                            const int64_t cell = (p*r + j)*37%capacity;
+                            data[cell] = (int32_t) ((7 + p)*r + j);
+                            data[2*capacity + p*r + j] = (int32_t) cell;
+                            data[2*capacity + cap*r + p]++;
+                            if (p%11 != 0) {
+                                data[capacity + cell] = (int32_t) (7 + p);
+                                if (j == r - 1) { data[2*capacity + cap*(r + 1) + p] = (int32_t) cell; }
+                            }
+                        }
+                    }
+                }
+            } else if (strcmp(t->name, "resident_rows") == 0 || strcmp(t->name, "mask_rows") == 0) {
+                for (int i = 0; i < n_rows; ++i) {
+                    const int32_t q = 40 + 17*i, base = empty ? 0 : 9;
+                    const int32_t tail = (q + 1)/r*r, vis = std::max<int32_t>(0, tail/r - base);
+                    if (t->ne[0] == 6) {
+                        const int32_t row[] = {q, base, tail, vis, empty ? 0 : 7, empty ? 0 : 61};
+                        std::copy_n(row, 6, data.data() + 6*i);
+                    } else {
+                        const int32_t row[] = {q, 0, tail, vis};
+                        std::copy_n(row, 4, data.data() + 4*i);
+                    }
+                }
+            } else if (strcmp(t->name, "selected") == 0 || strcmp(t->name, "tail") == 0) {
+                const bool top = strcmp(t->name, "selected") == 0;
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = !top && i%5 == 0 ? -1 : (int32_t) (rng()%(n_kv + (top ? n_dump*r : 0)));
+                }
+            } else { continue; }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -13270,6 +13347,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     for (int n_extra : { 0, 4, 37 }) {
                         test_cases.emplace_back(new test_kpool_mask(n_kv, n_rows, n_ps, ns, n_extra, mode, r));
                     }
+                }
+            }
+        }
+    }
+
+    for (int mode : { GGML_KPOOL_MATERIALIZE_FACTS, GGML_KPOOL_MATERIALIZE_CELLS,
+            GGML_KPOOL_MATERIALIZE_REPS, GGML_KPOOL_MATERIALIZE_BIAS }) {
+        for (int rows : {1, 2, 3, 65}) {
+            for (bool empty : {false, true}) {
+                test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty));
+                if (mode == GGML_KPOOL_MATERIALIZE_FACTS) {
+                    test_cases.emplace_back(new test_kpool_materialize(mode, rows, empty, true));
                 }
             }
         }

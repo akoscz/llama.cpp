@@ -1856,6 +1856,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) eligible &= ubatch.n_seq_id[i] == 1;
         if (eligible) {
             mtp_index.tensor = res->t_mtp_index;
+            mtp_index.backend = ggml_backend_sched_get_tensor_backend(sched_gf, res->t_mtp_index);
             mtp_index.generation = draft->generation();
             mtp_index.n_kv = static_cast<llama_memory_hybrid_context *>(mctx)->get_attn()->get_n_kv();
             mtp_index.seqs.resize(ubatch.n_tokens);
@@ -4619,12 +4620,19 @@ void llama_context::mtp_index_capture() {
     if (!mtp_index.tensor) return;
     auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
     if (mtp_index.generation == draft->generation()) {
-        synchronize();
-        const int64_t width = mtp_index.tensor->ne[0];
-        std::vector<int32_t> row(width);
-        for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
-            ggml_backend_tensor_get(mtp_index.tensor, row.data(), i*width*sizeof(int32_t), width*sizeof(int32_t));
-            draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
+        if (mtp_index.backend && cparams.n_seq_devices == 1 && !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
+            for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
+                draft->capture_backend(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv,
+                        mtp_index.tensor, i, mtp_index.backend);
+            }
+        } else {
+            synchronize();
+            const int64_t width = mtp_index.tensor->ne[0];
+            std::vector<int32_t> row(width);
+            for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
+                ggml_backend_tensor_get(mtp_index.tensor, row.data(), i*width*sizeof(int32_t), width*sizeof(int32_t));
+                draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
+            }
         }
     }
     mtp_index.tensor = nullptr;

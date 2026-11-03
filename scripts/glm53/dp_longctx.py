@@ -19,6 +19,7 @@ import argparse
 from collections import defaultdict
 import concurrent.futures
 import json
+import math
 from pathlib import Path
 import random
 import statistics
@@ -216,6 +217,49 @@ def next_turn(messages, reply, path, question, step_chars=4000):
     return messages + [{"role": "assistant", "content": reply}, {"role": "user", "content": question}, call, result]
 
 
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def decode_rate(timing):
+    if "predicted_per_second" in timing:
+        rate = timing["predicted_per_second"]
+        return rate if finite_number(rate) and rate >= 0 else None
+    ms, n = timing.get("predicted_ms"), timing.get("predicted_n")
+    return max(n - 1, 0) * 1000 / ms if finite_number(ms) and ms > 0 and finite_number(n) else None
+
+
+def diagnostics(timings):
+    fields = ("draft_n", "draft_n_accepted", "draft_rounds", "draft_delivered_n", "draft_verify_attempts",
+              "draft_verify_rows_total", "draft_replay_attempts")
+    totals = {"requests": len(timings), "observations": {}}
+    for field in fields:
+        values = [t[field] for t in timings if finite_number(t.get(field))]
+        totals[field] = sum(values) if values else None
+        totals["observations"][field] = len(values)
+    histograms = [t["draft_verify_rows"] for t in timings if isinstance(t.get("draft_verify_rows"), dict)]
+    histogram = defaultdict(int)
+    for counts in histograms:
+        for bucket, count in counts.items():
+            histogram[bucket] += count
+    totals["draft_verify_rows"] = dict(histogram) if histograms else None
+    totals["observations"]["draft_verify_rows"] = len(histograms)
+    # Ratios require paired observations; absent diagnostics are not observed zeros.
+    for name, numerator, denominator in (("acceptance", "draft_n_accepted", "draft_n"),
+                                         ("delivered_per_round", "draft_delivered_n", "draft_rounds")):
+        paired = all(finite_number(t.get(numerator)) and finite_number(t.get(denominator)) for t in timings)
+        totals[name] = totals[numerator] / totals[denominator] if paired and totals[denominator] else None
+    return totals
+
+
+def request_interval(rows):
+    if not all(finite_number(r.get("request_start_s")) and finite_number(r.get("request_end_s"))
+               and r["request_end_s"] >= r["request_start_s"] for r in rows):
+        return None
+    elapsed = max(r["request_end_s"] for r in rows) - min(r["request_start_s"] for r in rows)
+    return elapsed if elapsed > 0 else None
+
+
 def summarize(results):
     """Per turn, over the streams: prompt sizes, cache hits, prefill time, decode speed; and every turn after the
     first that re-evaluated more than a quarter of its context (its slot lost the cache)."""
@@ -226,7 +270,8 @@ def summarize(results):
     for turn in sorted(by_turn):
         rows = by_turn[turn]
         timings = [r["timings"] for r in rows]
-        tps = [t["predicted_n"] / t["predicted_ms"] * 1000.0 for t in timings if t.get("predicted_ms", 0) > 0]
+        tps = [rate for t in timings if (rate := decode_rate(t)) is not None]
+        interval = request_interval(rows)
         turns.append({
             "turn": turn,
             "streams": len(rows),
@@ -235,8 +280,10 @@ def summarize(results):
             "cache_n_median": statistics.median(t.get("cache_n", 0) for t in timings),
             "prompt_ms_median": statistics.median(t["prompt_ms"] for t in timings),
             "prompt_ms_max": max(t["prompt_ms"] for t in timings),
-            "decode_tps_median": statistics.median(tps) if tps else 0.0,
-            "decode_tps_aggregate": sum(tps),
+            "decode_tps_median": statistics.median(tps) if tps else None,
+            "output_tps_aggregate": sum(t["predicted_n"] for t in timings) / interval if interval else None,
+            "request_elapsed_s": interval,
+            "diagnostics": diagnostics(timings),
             "wall_ms_max": max(r["wall_ms"] for r in rows),
         })
         if turn > 1:
@@ -286,7 +333,7 @@ def sample_memory(stop, samples, every):
         stop.wait(every)
 
 
-def run_stream(server, number, files, args, record, log, start):
+def run_stream(server, number, files, args, record, log, start, clock_origin):
     name = f"s{number:02d}"
     try:
         session = build_session(files, args.context_tokens, server.measure, TOOLS, seed=number + 1)
@@ -297,11 +344,13 @@ def run_stream(server, number, files, args, record, log, start):
     for turn in range(1, args.turns + 1):
         started = time.monotonic()
         response = server.chat(session, TOOLS, args.reply_tokens)
-        wall_ms = (time.monotonic() - started) * 1000.0
+        ended = time.monotonic()
+        wall_ms = (ended - started) * 1000.0
         choice = response["choices"][0]["message"]
         reply = choice.get("content") or ""
         timings = response.get("timings", {})
         record({"stream": name, "turn": turn, "wall_ms": wall_ms, "timings": timings,
+                "request_start_s": started - clock_origin, "request_end_s": ended - clock_origin,
                 "finish_reason": response["choices"][0].get("finish_reason"), "reply_chars": len(reply),
                 "tool_calls": len(choice.get("tool_calls") or [])})
         log(f"{name}: turn {turn} prompt_n={timings.get('prompt_n')} cache_n={timings.get('cache_n')} "
@@ -310,6 +359,10 @@ def run_stream(server, number, files, args, record, log, start):
         if turn < args.turns:
             session = next_turn(session, reply or "(no reply)", files[turn % len(files)],
                                 FOLLOW_UPS[(turn - 1) % len(FOLLOW_UPS)])
+
+
+def format_rate(value):
+    return f"{value:.2f}" if value is not None else "unavailable"
 
 
 def main(argv=None):
@@ -354,7 +407,7 @@ def main(argv=None):
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.streams) as pool:
         start = threading.Barrier(args.streams)
-        futures = [pool.submit(run_stream, server, i, files, args, record, log, start) for i in range(args.streams)]
+        futures = [pool.submit(run_stream, server, i, files, args, record, log, start, started) for i in range(args.streams)]
         failures = []
         for future in futures:
             try:
@@ -365,17 +418,17 @@ def main(argv=None):
     stop.set()
     sampler.join(timeout=15)
     summary = summarize(results) if results else {"turns": [], "cache_lost": []}
-    report = {"config": vars(args) | {"corpus": str(args.corpus), "out": str(args.out)},
+    report = {"metrics_version": 2, "config": vars(args) | {"corpus": str(args.corpus), "out": str(args.out)},
               "elapsed_s": time.monotonic() - started, "results": results, "summary": summary,
               "vram_peak_mib": peak(samples), "memory_samples": len(samples), "failures": failures, "log": lines}
     args.out.write_text(json.dumps(report, indent=2, default=str) + "\n")
     print("\n| turn | streams | prompt_n max | cache_n median | prefill ms median | prefill ms max | decode tok/s "
-          "median | decode tok/s aggregate |")
+          "median | output tok/s aggregate (request interval) |")
     print("|---|---|---|---|---|---|---|---|")
     for t in summary["turns"]:
         print(f"| {t['turn']} | {t['streams']} | {t['prompt_n_max']} | {t['cache_n_median']:.0f} | "
-              f"{t['prompt_ms_median']:.0f} | {t['prompt_ms_max']:.0f} | {t['decode_tps_median']:.2f} | "
-              f"{t['decode_tps_aggregate']:.2f} |")
+              f"{t['prompt_ms_median']:.0f} | {t['prompt_ms_max']:.0f} | {format_rate(t['decode_tps_median'])} | "
+              f"{format_rate(t['output_tps_aggregate'])} |")
     print(f"\ncache lost: {summary['cache_lost'] or 'none'}")
     print(f"VRAM peak MiB per card: {report['vram_peak_mib']} over {len(samples)} samples")
     if failures:
