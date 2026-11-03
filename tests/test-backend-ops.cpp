@@ -6084,9 +6084,11 @@ struct test_mul_mat_id : public test_case {
             GGML_ASSERT(n_used <= n_mats);
         }
 
+    virtual int weight_count() const { return n_mats; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, weight_count());
         ggml_set_name(as, "as");
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -6124,13 +6126,17 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
 
     bool run_whole_graph() override { return true; }
 
+    int weight_count() const override { return n_mats > 8 ? local : n_mats; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
         ggml_tensor * as = out->src[0];
-        out->src[0] = ggml_view_3d(ctx, as, k, m, local, as->nb[1], as->nb[2], first*as->nb[2]);
+        if (weight_count() != local) {
+            out->src[0] = ggml_view_3d(ctx, as, k, m, local, as->nb[1], as->nb[2], first*as->nb[2]);
+        }
         ggml_mul_mat_id_set_expert_range(out, first, n_mats);
         if (fused) {
-            out->src[0] = ggml_new_tensor_3d(ctx, type_a, k, m, local);
+            if (weight_count() != local) { out->src[0] = ggml_new_tensor_3d(ctx, type_a, k, m, local); }
             ggml_tensor * gate_weights = ggml_dup_tensor(ctx, out->src[0]);
             ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, out->src[1], out->src[2]);
             ggml_mul_mat_id_set_expert_range(gate, first, n_mats);
