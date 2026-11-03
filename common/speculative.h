@@ -3,6 +3,42 @@
 #include "llama.h"
 #include "common.h"
 
+#include <array>
+
+// Pure MTP policy and service-cycle observer. Timestamps are completed first-draft-step boundaries, in any common unit.
+struct common_mtp_service {
+    static constexpr int history = 5;
+    std::array<std::array<double, history>, 2> samples = {};
+    std::array<int, 2> n_samples = {};
+    std::array<int, 2> next = {};
+    std::array<uint64_t, 2> last = {};
+    uint64_t serial = 0;
+    llama_seq_id owner = -1;
+    int chosen = 0, low = 0, full = 0, realized = 0, verified = 0, accepted = -1;
+    double start = 0;
+
+    void invalidate();
+    void boundary(llama_seq_id seq, int depth, int low_depth, int full_depth, double now);
+    void drafted(llama_seq_id seq, int depth);
+    void verify(llama_seq_id seq, int rows);
+    void accept(llama_seq_id seq, int count, bool other = false);
+    float relative_cost(float fallback) const;
+};
+
+struct common_mtp_depth {
+    static constexpr int32_t window = 8;
+    static constexpr float keep = 15.0f / 16.0f;
+    static constexpr float band = 0.125f;
+    int32_t low = 1, depth = 0, rounds = 0;
+    int32_t n_drafted = 0, n_verified = 0; // awaited draft length and target batch count (two means replay)
+    // Decayed acceptance: first token, extra full-depth tokens, and extra tokens within low depth.
+    float first_sum = 0, first_w = 0, extra_sum = 0, extra_w = 0, low_sum = 0;
+
+    void reset(int32_t n_max, int32_t n_min);
+    int32_t n_draft(int32_t n_max, bool timed = false) const;
+    void observe(int32_t n_max, float cost, int32_t n_accepted, float service_cut = -1);
+};
+
 struct common_speculative;
 
 // comma separated list the provided types

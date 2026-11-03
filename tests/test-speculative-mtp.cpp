@@ -1,3 +1,4 @@
+// Fixed-cost histories run with LLAMA_MTP_TIMING_LEGACY=1; synthetic boundaries test service costs, and timed-driver tests default wiring.
 // The MTP drafter driven the way the server drives it: target verification batches, process, draft, accept, begin and
 // end, on a small GLM-5.3 model with its NextN head.
 //
@@ -32,6 +33,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -358,6 +361,104 @@ static bool fail(const char * what) {
     return false;
 }
 
+// Synthetic completion boundaries exercise the same observer and policy as the MTP driver.
+static bool test_service_timing(llama_model *) {
+    common_mtp_service service;
+    const auto round = [&](int seq, int chosen, double now, int accepted) {
+        service.boundary(seq, chosen, 1, 2, now);
+        service.drafted(seq, chosen);
+        service.verify(seq, chosen + 1);
+        service.accept(seq, accepted);
+    };
+    if (service.relative_cost(0.18f) != 0.18f) return fail("cold timing did not use the prior");
+    round(0, 1, 10, 1);
+    if (service.n_samples[0] != 0) return fail("accept closed an unfinished service cycle");
+    round(0, 2, 110, 2);
+    if (service.n_samples[0] != 1 || service.samples[0][0] != 100) return fail("the next first-step boundary omitted catch-up delay");
+    round(0, 1, 290, 1);
+    if (service.n_samples[0] != 1 || service.n_samples[1] != 1 || service.samples[1][0] != 180) return fail("a probe was charged to the following depth or counted twice");
+    round(0, 2, 390, 2);
+    round(0, 1, 570, 1);
+    round(0, 2, 670, 2);
+    round(0, 1, 850, 1);
+    if (std::abs(service.relative_cost(0.18f) - 0.8f) > 1e-6f) return fail("the measured ratio was converted a second time");
+    service.invalidate();
+    if (service.relative_cost(0.18f) != 0.18f) return fail("invalid timing kept a measured cost");
+    for (int kind = 0; kind < 8; ++kind) {
+        round(0, 2, 100, 2);
+        if (kind == 0) service.verify(0, 3); // replay
+        if (kind == 1) service.verify(1, 3); // foreign slot
+        if (kind == 2) service.verify(0, 2); // prompt/truncation
+        if (kind == 3) service.accept(0, 2, true); // another drafter
+        if (kind == 4) service.drafted(0, 1); // p_min/output cutoff
+        if (kind == 5) service.invalidate(); // begin/end/restore/error
+        const double next = kind == 6 ? 100 : kind == 7 ? std::numeric_limits<double>::infinity() : 200;
+        service.boundary(0, 1, 1, 2, next);
+        if (service.n_samples[0] || service.n_samples[1]) return fail("an invalid interval created a timing sample");
+        service.invalidate();
+    }
+    round(0, 2, 100, 2);
+    service.boundary(1, 1, 1, 2, 200);
+    if (service.n_samples[1]) return fail("a cross-slot boundary closed another slot's cycle");
+    service.invalidate();
+    service.boundary(0, 2, 1, 2, std::numeric_limits<double>::quiet_NaN());
+    service.drafted(0, 2);
+    service.verify(0, 3);
+    service.accept(0, 2);
+    service.boundary(0, 1, 1, 2, 300);
+    if (service.n_samples[1]) return fail("a nonfinite start created a sample");
+
+    service.invalidate();
+    for (int i = 0; i < 8; ++i) round(0, i % 2 ? 2 : 1, 100 + i*100, 1);
+    const float stable = service.relative_cost(0.18f);
+    round(0, 1, 1000000, 1);
+    if (service.relative_cost(0.18f) != stable) return fail("one scheduler stall dominated the service estimate");
+    for (int i = 1; i < 40; ++i) round(0, 1, 1000000 + i*100, 1);
+    if (service.relative_cost(0.18f) != 0.18f) return fail("stale full-depth samples did not fall back to the prior");
+
+    common_mtp_depth fixed;
+    fixed.reset(2, 0);
+    for (int i = 0; i < WINDOW; ++i) {
+        if (fixed.n_draft(2) != 2) return fail("fixed observation mode changed its first window");
+        fixed.n_drafted = 2;
+        fixed.observe(2, 0.18f, 0);
+    }
+    if (fixed.depth != 1) return fail("no valid timing samples disabled the fixed-cost fallback");
+
+    common_mtp_depth policy;
+    double now = 10000;
+    int previous = 0;
+    const auto run = [&](double full_time, int count, bool reset) {
+        if (reset) { policy.reset(2, 0); service.invalidate(); previous = 0; }
+        for (int i = 0; i < count; ++i) {
+            const int chosen = policy.n_draft(2, true);
+            now += previous == 2 ? full_time : 100;
+            service.boundary(0, chosen, 1, 2, now);
+            service.drafted(0, chosen);
+            service.verify(0, chosen + 1);
+            service.accept(0, chosen);
+            policy.n_drafted = chosen;
+            policy.observe(2, 0.18f, chosen, service.relative_cost(0.18f));
+            previous = chosen;
+        }
+        return policy.depth;
+    };
+    if (run(105, 128, true) != 2) return fail("cheap full rounds lost despite identical acceptance");
+    if (run(180, 128, true) != 1) return fail("expensive full rounds were not learned from low probes");
+    if (run(105, 128, false) != 2) return fail("unchanged acceptance did not recover after service cost fell");
+    if (run(350, 128, true) != 1 || service.relative_cost(0.18f) <= 1) return fail("relative cost above one was rejected");
+    policy.reset(4, 3);
+    for (int i = 0; i < 32; ++i) {
+        const int chosen = policy.n_draft(4, true);
+        if (chosen < 3) return fail("timed probes violated n_min");
+        policy.n_drafted = chosen;
+        policy.observe(4, 0.18f, 0, 1.0f);
+    }
+    policy.reset(2, 2);
+    if (policy.n_draft(2, true) != 2) return fail("equal low/full depths probed below n_min");
+    return true;
+}
+
 // set or clear an environment variable the drafter reads when it is created
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -369,6 +470,37 @@ static void set_env(const char * name, const char * value) {
         unsetenv(name);
     }
 #endif
+}
+
+// Three available slots with one active request still qualify. The cold full policy probes low on its eighth round.
+static bool test_timed_driver(llama_model * model) {
+    set_env("LLAMA_MTP_TIMING_LEGACY", nullptr);
+    server_rig rig(model, 0.18f);
+    set_env("LLAMA_MTP_TIMING_LEGACY", "1");
+    std::mt19937 rng(21);
+    rig.request(0, rng, 7);
+    for (int round = 0; round < WINDOW; ++round) {
+        const int len = rig.draft({0}).at(0);
+        if (len != (round == WINDOW - 1 ? 1 : N_MAX)) return fail("an isolated active slot did not make a low timing probe");
+        rig.verify({0});
+        rig.accept(0, len, rng);
+    }
+    // A truncated draft, replay and state restore retain the existing acceptance and kept-row contracts.
+    rig.seqs[0].draft.clear();
+    common_speculative_get_draft_params(rig.spec.get(), 0) = {true, 1, rig.seqs[0].n_past, rig.seqs[0].id_last,
+        &rig.seqs[0].prompt, &rig.seqs[0].draft};
+    common_speculative_draft(rig.spec.get());
+    if (rig.seqs[0].draft.size() != 1) return fail("timed drafting ignored the output limit");
+    llama_memory_seq_rm(llama_get_memory(rig.init->context()), 0, rig.seqs[0].n_past, -1);
+    rig.verify({0});
+    rig.verify({0});
+    rig.accept(0, 0, rng);
+    std::vector<uint8_t> state;
+    if (!common_speculative_get_state(rig.spec.get(), 0, state)) return fail("timed replay lost the kept row");
+    common_speculative_set_state(rig.spec.get(), 0, state);
+    std::vector<uint8_t> restored;
+    if (!common_speculative_get_state(rig.spec.get(), 0, restored) || restored != state) return fail("timed restore changed the kept row");
+    return true;
 }
 
 // a rig made with LLAMA_MTP_DEVICE_H=1: target steps of 64 rows, head steps of 32
@@ -1113,6 +1245,17 @@ static bool test_device_h_rows(llama_model * model) {
                 (long long) n_host, (long long) n_dev, N_SEQ*(N_MAX + 3));
         return fail("the device rig's target read more than the kept rows back to the host");
     }
+    const std::vector<std::pair<llama_seq_id, llama_tokens>> mixed = {
+        { 0, host.tokens(rng, 60) }, { 1, host.tokens(rng, 2) }, { 2, host.tokens(rng, 4) } };
+    const int64_t mixed_host = read(host, [&] { host.decode(mixed); });
+    const int64_t mixed_dev = read(dev, [&] { dev.decode(mixed); });
+    if (mixed_host != 66 || mixed_dev != N_MAX + 3 + 2 + 4) return fail("a fully kept sequence read its last hidden row twice");
+    for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
+        std::vector<uint8_t> a, b;
+        if (!common_speculative_get_state(host.spec.get(), seq, a) ||
+            !common_speculative_get_state(dev.spec.get(), seq, b) || a != b) return fail("deduplicated hidden rows changed the kept state");
+    }
+    if (host.logits != dev.logits) return fail("deduplicated hidden rows changed target logits");
     for (server_rig * rig : { &host, &dev }) {
         for (const auto & p : prompts) {
             rig->seqs[p.first].prompt = p.second;
@@ -1229,8 +1372,12 @@ int main(int argc, char ** argv) {
             return ok ? 0 : 1;
         }
         if (argc != 1) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,...]"); }
+        // These model histories assert the fixed-cost policy; synthetic tests cover measured service costs.
+        set_env("LLAMA_MTP_TIMING_LEGACY", "1");
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
+            { "service-timing", test_service_timing },
+            { "timed-driver", test_timed_driver },
             { "baseline",  test_baseline  },
             { "adaptive",  test_adaptive  },
             { "replay",    test_replay    },
