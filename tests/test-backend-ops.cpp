@@ -6144,7 +6144,7 @@ struct test_mul_mat_id_partition : public test_mul_mat_id {
         ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
         std::vector<int32_t> values(n_mats*n);
         for (int64_t row = 0; row < n; ++row) {
-            for (int slot = 0; slot < n_mats; ++slot) { values[row*n_mats + slot] = (2*row + slot) % n_mats; }
+            for (int slot = 0; slot < n_mats; ++slot) { values[row*n_mats + slot] = (2*row + slot*(n_mats > 8 ? 37 : 1)) % n_mats; }
         }
         ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
     }
@@ -10652,6 +10652,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int local : {72, 144}) {
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, 512, 288 - local, 288, 8, local, 2048, 4096));
         test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, false, 512, 0, 288, 8, local, 4096, 2048));
+    }
+    for (int64_t tokens : {3, 8}) {
+        for (int first : {0, 216}) {
+            test_cases.emplace_back(new test_mul_mat_id_partition(GGML_TYPE_IQ3_XXS, true, tokens, first, 288, 8, 72, 2048, 4096, true));
+        }
     }
     std::default_random_engine rng(0);
 
