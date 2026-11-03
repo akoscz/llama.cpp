@@ -21,7 +21,8 @@
 // cells are generated: rows near the bound, rows far under it (the -1 slots past a row's count), and a sequence's first
 // ubatch (row r on its r + 1 cells at the cache's end). The values are generated from a seed per case.
 //
-// Devices that are not CUDA are skipped, and with no CUDA device the test passes.
+// The default short suite skips non-CUDA devices. --direct-longctx requires all 16 cases per CUDA device.
+// --require-cuda rejects no-device runs; --cpu-only runs just the small CPU semantic checks.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -87,7 +88,13 @@ static std::vector<ggml_fp16_t> make_mask(const fattn_case & c, std::mt19937 & r
         count = std::max<int64_t>(1, std::min<int64_t>(count, n_kv_max));
 
         std::uniform_real_distribution<float> bias(-0.25f, 0.0f);
-        if (c.rows == ROWS_FIRST) {
+        if (c.kv == 400128 && c.nb <= 3) {
+            const int64_t high[] = {399999, 131073, 262145};
+            for (int64_t i = 0; i < count; ++i) {
+                const int64_t cell = i < 3 ? high[i] : i - 3;
+                m[row*c.kv + cell] = bias(rng);
+            }
+        } else if (c.rows == ROWS_FIRST) {
             for (int64_t i = 0; i < count; ++i) {
                 m[row*c.kv + c.kv - n_kv_max + i] = bias(rng);
             }
@@ -219,7 +226,7 @@ static double nmse(const std::vector<float> & y, const std::vector<float> & ref)
         err += (y[i] - ref[i]) * double(y[i] - ref[i]);
         sum += ref[i] * double(ref[i]);
     }
-    return err / sum;
+    return sum == 0.0 ? (err == 0.0 ? 0.0 : INFINITY) : err / sum;
 }
 
 static constexpr double max_nmse = 5e-4; // test-backend-ops' bound for FLASH_ATTN_EXT
@@ -272,7 +279,7 @@ static int64_t sparse_from(int64_t nb) {
 }
 
 static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_case & c, ggml_type type, bool reads_in_place,
-        uint32_t seed, bool direct = false) {
+        uint32_t seed, bool direct = false, bool empty_row = true, bool strict = false) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
@@ -296,15 +303,16 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
     std::vector<ggml_fp16_t> mask = make_mask(c, rng);
     if (direct) {
         for (auto & x : mask) { if (std::isfinite(ggml_fp16_to_fp32(x))) { x = ggml_fp32_to_fp16(0.0f); } }
-        std::fill(mask.begin(), mask.begin()+c.kv, ggml_fp32_to_fp16(-INFINITY));
+        if (empty_row) { std::fill(mask.begin(), mask.begin()+c.kv, ggml_fp32_to_fp16(-INFINITY)); }
     }
 
     fattn_graph g;
     build(g, backend, c, type, q, cache_q, cache_f16, mask, false, direct);
-    if (!ggml_backend_supports_op(backend, g.out_q) || !ggml_backend_supports_op(backend, g.out_f16)) {
+    if (!ggml_backend_supports_op(backend, g.out_q) || !ggml_backend_supports_op(backend, g.out_f16) ||
+            !ggml_backend_supports_op(backend, g.out_cpy)) {
         printf("  %s, kv %6" PRId64 ", %3" PRId64 " tokens, %2" PRId64 " heads, %" PRId64 " seq, %s: not supported, skipped\n",
                ggml_type_name(type), c.kv, c.nb, c.nh, c.ns, rows_name(c.rows));
-        return true;
+        return !strict;
     }
 
     const ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
@@ -326,33 +334,57 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t cpu, const fattn_cas
     const bool    sparse   = c.kv >= sparse_from(c.nb);
     const bool    in_place = (direct || sparse) && reads_in_place;
     const bool    no_copy  = alloc_q == ggml_nbytes(g.out_q);
-    const bool    finite   = all_finite(y_f16);
+    const bool    finite   = all_finite(y_q) && all_finite(y_f16) && all_finite(y_cpy);
     bool ok = diff_q < 0 && diff_cpy < 0 && no_copy == in_place && finite && e < max_nmse;
     if (direct) {
-        GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
-        ok &= first_bit_difference(y_q, get(g.out_q)) < 0;
-        ggml_tensor * ids = ggml_get_tensor(g.ctx_in, "direct_indices");
-        int32_t first = (int32_t) c.kv-1;
-        ggml_backend_tensor_set(ids, &first, 0, sizeof(first));
-        GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
-        const auto changed = get(g.out_f16);
-        first = -1;
-        ggml_backend_tensor_set(ids, &first, 0, sizeof(first));
-        GGML_ASSERT(ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS);
-        ok &= first_bit_difference(y_q, get(g.out_q)) < 0;
+        auto compute = [&](fattn_graph & graph) {
+            GGML_ASSERT(ggml_backend_graph_compute(backend, graph.gf) == GGML_STATUS_SUCCESS);
+            ggml_backend_synchronize(backend);
+            const auto quant = get(graph.out_q);
+            const auto f16 = get(graph.out_f16);
+            const auto copy = get(graph.out_cpy);
+            ok &= all_finite(quant) && all_finite(f16) && all_finite(copy);
+            ok &= first_bit_difference(quant, f16) < 0 && first_bit_difference(copy, f16) < 0;
+            return f16;
+        };
+        auto equivalent = [&](const std::vector<float> & a, const std::vector<float> & b) {
+            return sparse ? first_bit_difference(a, b) < 0 : nmse(a, b) < max_nmse;
+        };
+        ok &= first_bit_difference(y_f16, compute(g)) < 0;
         fattn_graph legacy;
         build(legacy, backend, c, type, q, cache_q, cache_f16, mask, false);
-        GGML_ASSERT(ggml_backend_graph_compute(backend, legacy.gf) == GGML_STATUS_SUCCESS);
-        const auto old = get(legacy.out_f16);
-        if (sparse) { ok &= first_bit_difference(y_f16, old) < 0; }
-        for (int64_t i = 0; i < D*c.nh; ++i) { ok &= y_q[i] == 0.0f && old[i] == 0.0f; }
-        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-        ggml_backend_tensor_set(ggml_get_tensor(legacy.ctx_in, "mask"), &zero, (c.kv-1)*sizeof(zero), sizeof(zero));
-        GGML_ASSERT(ggml_backend_graph_compute(backend, legacy.gf) == GGML_STATUS_SUCCESS);
-        const auto changed_ref = get(legacy.out_f16);
-        if (sparse) { ok &= first_bit_difference(changed, changed_ref) < 0; }
-        for (int64_t i = 0; i < D*c.nh; ++i) { ok &= std::isfinite(changed[i]) && fabsf(changed[i]-changed_ref[i]) < 1e-3f; }
-        printf("  direct indices, changed-input replay + empty row + legacy parity: %s\n", ok ? "ok" : "FAILED");
+        ok &= equivalent(y_f16, compute(legacy));
+
+        ggml_tensor * ids = ggml_get_tensor(g.ctx_in, "direct_indices");
+        std::vector<int32_t> original(size_t(n_kv_max*c.nb*c.ns));
+        ggml_backend_tensor_get(ids, original.data(), 0, ggml_nbytes(ids));
+        auto changed_ids = original;
+        int64_t count = 0;
+        while (count < n_kv_max && original[count] >= 0) { ++count; }
+        const int64_t slot = count == 0 ? 0 : count - 1;
+        int32_t high = int32_t(c.kv - 1);
+        while (std::find(original.begin(), original.begin() + count, high) != original.begin() + count) { --high; }
+        changed_ids[slot] = high;
+        std::sort(changed_ids.begin(), changed_ids.begin() + std::max<int64_t>(count, 1));
+        auto changed_mask = mask;
+        if (count > 0) { changed_mask[original[slot]] = ggml_fp32_to_fp16(-INFINITY); }
+        changed_mask[high] = ggml_fp32_to_fp16(0.0f);
+        ggml_backend_tensor_set(ids, changed_ids.data(), 0, ggml_nbytes(ids));
+        ggml_tensor * legacy_mask = ggml_get_tensor(legacy.ctx_in, "mask");
+        ggml_backend_tensor_set(legacy_mask, changed_mask.data(), 0, ggml_nbytes(legacy_mask));
+        const auto changed = compute(g);
+        const auto changed_ref = compute(legacy);
+        ok &= equivalent(changed, changed_ref);
+        ok &= first_bit_difference(y_f16, changed) >= 0;
+        if (empty_row) {
+            for (int64_t i = 0; i < D*c.nh; ++i) { ok &= y_q[i] == 0.0f; }
+        }
+        ggml_backend_tensor_set(ids, original.data(), 0, ggml_nbytes(ids));
+        ggml_backend_tensor_set(legacy_mask, mask.data(), 0, ggml_nbytes(legacy_mask));
+        ok &= first_bit_difference(y_f16, compute(g)) < 0;
+        ok &= equivalent(y_f16, compute(legacy));
+        printf("  direct indices, %s baseline, changed-input replay + legacy parity + restore: %s\n",
+               empty_row ? "empty row" : "nonempty", ok ? "ok" : "FAILED");
     }
     const char *  name     = ggml_type_name(type);
 
@@ -424,11 +456,28 @@ static bool run_direct_cpu(ggml_backend_t cpu, ggml_type type) {
     ggml_build_forward_expand(gf, got);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
     bool ok = ggml_gallocr_alloc_graph(alloc, gf) && ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS;
-    std::vector<float> a(ggml_nelements(ref)), b(a.size());
-    ggml_backend_tensor_get(ref, a.data(), 0, ggml_nbytes(ref));
-    ggml_backend_tensor_get(got, b.data(), 0, ggml_nbytes(got));
-    for (size_t i = 0; i < a.size(); ++i) { ok &= std::isfinite(b[i]) && a[i] == b[i]; }
-    for (int64_t i = 0; i < d*nh; ++i) { ok &= b[i] == 0.0f; }
+    auto compare = [&]() {
+        const auto a = get(ref), b = get(got);
+        ok &= all_finite(a) && all_finite(b) && first_bit_difference(a, b) < 0;
+        return b;
+    };
+    const auto original = compare();
+    for (int64_t i = 0; i < d*nh; ++i) { ok &= original[i] == 0.0f; }
+    auto changed_ids = iv;
+    auto changed_mask = mv;
+    changed_ids[0] = nk - 1;
+    changed_mask[nk - 1] = ggml_fp32_to_fp16(0.0f);
+    changed_ids[bound] = nk - 2;
+    changed_mask[nk] = ggml_fp32_to_fp16(-INFINITY);
+    changed_mask[2*nk - 2] = ggml_fp32_to_fp16(0.0f);
+    ggml_backend_tensor_set(ids, changed_ids.data(), 0, ggml_nbytes(ids));
+    ggml_backend_tensor_set(mask, changed_mask.data(), 0, ggml_nbytes(mask));
+    ok &= ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS;
+    ok &= first_bit_difference(original, compare()) >= 0;
+    ggml_backend_tensor_set(ids, iv.data(), 0, ggml_nbytes(ids));
+    ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
+    ok &= ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS;
+    ok &= first_bit_difference(original, compare()) < 0;
     ggml_gallocr_free(alloc);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -437,7 +486,21 @@ static bool run_direct_cpu(ggml_backend_t cpu, ggml_type type) {
 }
 
 int main(int argc, char ** argv) {
-    const bool direct_only = argc == 2 && strcmp(argv[1], "--direct-only") == 0;
+    bool direct_only = false, direct_longctx = false, require_cuda = false, cpu_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--direct-only") == 0) { direct_only = true; }
+        else if (strcmp(argv[i], "--direct-longctx") == 0) { direct_longctx = true; }
+        else if (strcmp(argv[i], "--require-cuda") == 0) { require_cuda = true; }
+        else if (strcmp(argv[i], "--cpu-only") == 0) { cpu_only = true; }
+        else {
+            fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            return 1;
+        }
+    }
+    if ((cpu_only && (require_cuda || direct_longctx || direct_only)) || (direct_only && direct_longctx)) {
+        fprintf(stderr, "incompatible test modes\n");
+        return 1;
+    }
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
 
@@ -467,9 +530,13 @@ int main(int argc, char ** argv) {
     cases.push_back({ 16640, 512, 64, 1, ROWS_FEW });
     cases.push_back({ 40960, 384, 32, 2, ROWS_FIRST });
 
-    bool ok = true;
+    bool ok = nmse({0.0f}, {0.0f}) == 0.0 && std::isinf(nmse({1.0f}, {0.0f}));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) { ok &= run_direct_cpu(cpu, type); }
-    int n_tested = 0;
+    if (cpu_only) {
+        ggml_backend_free(cpu);
+        return ok ? 0 : 1;
+    }
+    int n_tested = 0, longctx_passed = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
@@ -498,15 +565,34 @@ int main(int argc, char ** argv) {
                ggml_backend_dev_description(dev), cc->second / 100, cc->second % 100 / 10, arch / 10,
                reads_in_place ? "reads the cache in place" : "keeps its f16 copy");
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend == nullptr) {
+            printf("%s: backend initialization FAILED\n", name);
+            ok = false;
+            continue;
+        }
         for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            if (direct_longctx) {
+                auto run_longctx = [&](int64_t nb, rows_kind rows, bool empty) {
+                    const fattn_case c = {400128, nb, 32, 1, rows};
+                    const bool passed = run_case(backend, cpu, c, type, reads_in_place,
+                        0x400128u + uint32_t(nb) + (type == GGML_TYPE_Q4_0 ? 0x100u : 0u), true, empty, true);
+                    longctx_passed += passed ? 1 : 0;
+                    ok &= passed;
+                };
+                for (int64_t nb : {1, 2, 3}) {
+                    for (rows_kind rows : {ROWS_NEAR_BOUND, ROWS_FEW}) { run_longctx(nb, rows, false); }
+                }
+                for (int64_t nb : {1, 3}) { run_longctx(nb, ROWS_FEW, true); }
+                continue;
+            }
             for (size_t ic = 0; !direct_only && ic < cases.size(); ++ic) {
                 ok &= run_case(backend, cpu, cases[ic], type, reads_in_place,
-                               0x51A7u + uint32_t(ic) + (type == GGML_TYPE_Q4_0 ? 0x100u : 0u));
+                               0x51A7u + uint32_t(ic) + (type == GGML_TYPE_Q4_0 ? 0x100u : 0u), false, true, require_cuda);
             }
             for (const fattn_case & c : std::vector<fattn_case>{
                     {3840, 3, 32, 1, ROWS_FEW}, {16640, 3, 64, 2, ROWS_FEW},
                     {16640, 64, 32, 1, ROWS_FIRST}, {16640, 512, 64, 1, ROWS_FEW}}) {
-                ok &= run_case(backend, cpu, c, type, reads_in_place, 0xD1EC7u, true);
+                ok &= run_case(backend, cpu, c, type, reads_in_place, 0xD1EC7u, true, true, require_cuda);
             }
         }
         ggml_backend_free(backend);
@@ -515,7 +601,12 @@ int main(int argc, char ** argv) {
 
     if (n_tested == 0) {
         printf("no CUDA device, skipped\n");
-        return ok ? 0 : 1;
+        return ok && !require_cuda && !direct_longctx ? 0 : 1;
+    }
+    if (direct_longctx) {
+        ok &= longctx_passed == 16*n_tested;
+        printf("%d/%d long-context direct attention cases passed on %d CUDA device%s%s\n",
+               longctx_passed, 16*n_tested, n_tested, n_tested == 1 ? "" : "s", ok ? "" : " FAILED");
     }
     printf("%s\n", ok ? "OK" : "FAILED");
     return ok ? 0 : 1;

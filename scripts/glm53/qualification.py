@@ -128,6 +128,8 @@ def device_cases():
 
     for gpu in (0, 1):
         card = {"CUDA_VISIBLE_DEVICES": str(gpu)}
+        add(f"direct-attention-400k-gpu{gpu}", ["test-fattn-sparse-q8", "--direct-longctx", "--require-cuda"],
+            card, require=r"(?m)^16/16 long-context direct attention cases passed on 1 CUDA device$")
         add(f"q8-storage-gpu{gpu}", ["test-q8-backend-storage", "CUDA0"], card)
         add(f"q8-meta-fallback-gpu{gpu}", ["test-q8-backend-storage", "CUDA0", "--meta"],
             card | {"GGML_CUDA_Q8_SPLIT": "1"}, require="2/2 meta packed reader fallbacks passed")

@@ -124,6 +124,21 @@ class QualificationTest(unittest.TestCase):
             for publication in (0, 1):
                 self.assertEqual(counts[f"hc-publication-{publication}-gpu{gpu}"], 65)
 
+    def test_long_context_direct_attention_requires_real_devices(self):
+        cases = {case["name"]: case for case in device_cases()}
+        for gpu in (0, 1):
+            case = cases[f"direct-attention-400k-gpu{gpu}"]
+            self.assertEqual(case["argv"], ["test-fattn-sparse-q8", "--direct-longctx", "--require-cuda"])
+            self.assertEqual(case["env"]["CUDA_VISIBLE_DEVICES"], str(gpu))
+            receipt = case["require"]
+            self.assertRegex("16/16 long-context direct attention cases passed on 1 CUDA device", receipt)
+            for incomplete in ("no CUDA device, skipped", "15/16 long-context direct attention cases passed on 1 CUDA device",
+                               "0/0 long-context direct attention cases passed on 0 CUDA devices", "OK",
+                               "116/16 long-context direct attention cases passed on 1 CUDA device",
+                               "16/16 long-context direct attention cases passed on 1 CUDA device SKIPPED",
+                               "16/16 long-context direct attention cases passed on 2 CUDA devices"):
+                self.assertIsNone(re.search(receipt, incomplete), incomplete)
+
     def test_architecture_cases_require_every_device_to_match_the_cpu(self):
         # test-llama-archs exits 0 when every row is SKIP. On the two-card box each
         # card and the CPU must match the CPU logits and survive a save/load, and
