@@ -287,7 +287,7 @@ class ServingRecipeTest(unittest.TestCase):
         import serve
         self.serve = serve
 
-    def test_retained_recipe_has_no_experimental_profile(self):
+    def test_default_retains_the_two_card_tensor_recipe(self):
         args = self.serve.arguments(["--model", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf"])
         argv, env = self.serve.make_plan(args)
         self.assertEqual(argv, [str(self.serve.ROOT / "build/bin/llama-server"),
@@ -309,6 +309,45 @@ class ServingRecipeTest(unittest.TestCase):
             "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
         self.assertNotIn("--glm53-profile", argv)
+
+    def test_dp_capacity_recipe_keeps_each_slots_cache_on_one_owner(self):
+        for slots in (1, 4, 36, 40):
+            for depth in ("2", "off"):
+                with self.subTest(slots=slots, depth=depth):
+                    args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4",
+                                                 "--slots", str(slots), "--mtp-depth", depth])
+                    argv, env = self.serve.make_plan(args)
+                    expected = {"-sm": "dp", "-ts": "1,1,1,1", "-fit": "off", "-np": str(slots),
+                                "-c": str(slots * 442368), "-b": "2048", "-ub": "512", "--prompt-step": "512",
+                                "--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "-ctki": "q8_0", "-cts": "q8_0"}
+                    for flag, value in expected.items():
+                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                    self.assertNotIn("--kv-unified", argv)
+                    self.assertNotIn("--no-cache-idle-slots", argv)
+                    self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
+                    self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
+                    self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
+                    for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
+                        if depth == "off":
+                            self.assertNotIn(flag, argv)
+                        else:
+                            self.assertEqual(argv[argv.index(flag) + 1], value)
+                    if depth == "off":
+                        self.assertFalse(any(arg.startswith("--spec-") for arg in argv))
+                    else:
+                        self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
+
+    def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
+        args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
+        argv, _ = self.serve.make_plan(args)
+        self.assertEqual(argv[argv.index("-np") + 1], "36")
+        for options in (["--slots", "4"], ["--profile", "dp-4", "--slots", "0"],
+                        ["--profile", "dp-4", "--slots", "41"]):
+            with self.subTest(options=options):
+                args = self.serve.arguments(["--model", "/models/target.gguf", *options])
+                with self.assertRaisesRegex(ValueError, "slots"):
+                    self.serve.make_plan(args)
 
     def test_depth_and_responsiveness_options_are_independent(self):
         for depth, query in itertools.product(["1", "2", "off"], ["q8", "f32"]):

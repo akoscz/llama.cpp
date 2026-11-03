@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the documented GLM-5.3 Flash recipe; --dry-run prints JSON without starting a model."""
+"""Serve a documented GLM-5.3 Flash recipe; --dry-run prints JSON without starting a model."""
 import argparse
 import hashlib
 import json
@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "models/templates/GLM-5.3-Flash.jinja"
 DRAFT_VOCAB = ROOT / "scripts/glm53/assets/mtp-draft-vocab-98304.i32"
 DEFAULT_MTP_DEPTH = "2"
+DP_SLOT_CONTEXT = 442368
 # Inherited engine, profile and diagnostic overrides are removed before the exec; the server's own access controls stay.
 ENGINE_OVERRIDES = ("GGML_", "LLAMA_", "CUDA_", "NVIDIA_")
 SERVER_ACCESS_CONTROLS = frozenset({"LLAMA_API_KEY", "LLAMA_ARG_API_KEY_FILE",
@@ -29,16 +30,24 @@ def arguments(argv=None):
                         help="llama-server from this fork, with matching libraries beside it")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8102)
+    parser.add_argument("--profile", choices=["tensor-2", "dp-4"], default="tensor-2",
+                        help="Two-card tensor recipe or experimental four-card DP capacity recipe")
+    parser.add_argument("--slots", type=int, help="DP only: 1..40 private caches of 442368 cells each (default: 36)")
     parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
-    parser.add_argument("--prompt-step", type=int, default=1024, help="Prompt tokens per step alongside generation; 0 removes the cap")
+    parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
 def make_plan(args):
-    if not 1 <= args.port <= 65535 or args.prompt_step < 0:
+    dp = args.profile == "dp-4"
+    prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else 1024)
+    if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
+    if args.slots is not None and (not dp or not 1 <= args.slots <= 40):
+        raise ValueError("slots is supported only with --profile dp-4 and must be 1..40")
+    slots = (36 if args.slots is None else args.slots) if dp else 3
     if not args.host or any(char in args.host for char in "\n\r\0"):
         raise ValueError("host must be a nonempty address without control characters")
     server = args.server.expanduser().resolve()
@@ -47,25 +56,35 @@ def make_plan(args):
     argv = [str(server), "-m", own_path(args.model)]
     if args.mmproj:
         argv += ["--mmproj", own_path(args.mmproj)]
-    argv += ["-ngl", "99", "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on",
+    argv += ["-ngl", "99", "-sm", "dp" if dp else "tensor", "-ts", "1,1,1,1" if dp else "1,1",
+             "--jinja", "-fa", "on",
              "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ctki", "q8_0",
-             "-b", "2048", "-ub", "2048", "--prompt-step", str(args.prompt_step),
+             "-b", "2048", "-ub", "512" if dp else "2048", "--prompt-step", str(prompt_step),
              "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(TEMPLATE)]
+    if dp:
+        argv += ["-fit", "off", "-cts", "q8_0"]
     if args.mtp_depth != "off":
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", args.mtp_depth,
                  "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", "0.18"]
-    argv += ["-c", "524288", "-np", "3", "--kv-unified", "--cache-ram", "32768",
-             "--no-cache-idle-slots", "--metrics", "--host", args.host, "--port", str(args.port),
-             "--log-timestamps"]
+        if dp:
+            argv += ["-ubd", "512", "-ctkd", "q8_0", "-ctvd", "q8_0"]
+    argv += ["-c", str(slots * DP_SLOT_CONTEXT) if dp else "524288", "-np", str(slots)]
+    if not dp:
+        argv += ["--kv-unified"]
+    argv += ["--cache-ram", "32768"]
+    if not dp:
+        argv += ["--no-cache-idle-slots"]
+    argv += ["--metrics", "--host", args.host, "--port", str(args.port), "--log-timestamps"]
     env = {
-        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "0,1,2,3" if dp else "0,1",
         "GGML_CUDA_GRAPH_MAX": "0", "GGML_CUDA_ALLREDUCE": "internal",
         "LLAMA_INDEXER_Q8_QUERY": "1" if args.indexer_query == "q8" else "0",
         "LLAMA_MTP_DEVICE_H": "1", "LLAMA_TOK_EMBD_GPU": "1",
-        "LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0",
-        "GGML_CUDA_MMQ_L2_PF": "1", "GGML_SCHED_DEBUG": "0",
+        "GGML_SCHED_DEBUG": "0",
         "LD_LIBRARY_PATH": str(server.parent),
     }
+    if not dp:
+        env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     return argv, env
 
 
