@@ -20,6 +20,18 @@ Bounded captures of the first 512-row evaluation locate the first observed arith
 
 Expert counters work with `-lv 4`. The four-card diagnostic prompt recorded 44,759 / 41,283 / 40,569 / 48,109 hits, totaling 174,720 for 520 rows, eight selected experts and 42 routed layers. These instrumented prompt counts establish work on every rank, not balance or throughput under 36/40 concurrent sessions.
 
+### Capacity attempt and restore repair
+
+The same artifact ran the selected BoldingBuilds pack with its projector, non-unified Q8 caches and recurrent state, MTP depth 2, batch 2048 and microbatch/prompt-step 512. Forty slots loaded, but card 0 had only 1,544 MiB free (95,798 MiB used), below the required 4,096 MiB reserve. The harness rejected that configuration before active work; this was not an observed OOM.
+
+Thirty-six slots loaded with 6,832 MiB free on card 0. All 36 independent 30,720-token cold prompts completed with 64 output tokens each. This phase took 1,617.575 s and peaked at 92,468 MiB used on card 0, leaving 4,874 MiB. Native prefill rates were 19.74-22.31 tokens/s per request; decode was 0.617-1.697 tokens/s while other requests were still prefilling. These are not steady 36-way decode rates. A separate real tool call retained 4,316 cached tokens and processed 14 new tokens on the result turn.
+
+Four separate 409,088-token seeds completed at 2,111-2,159 prefill tokens/s each. Restoring the first seed into slot 4 retained its prefix, but the extension aborted in `ggml_backend_meta_set_tensor_async`: the outer-range byte sum did not equal the view's visible byte length. No 36-way 400K decode or second-turn result was obtained. Results were collected, stop was requested 4.27 s after compute ended, and the provider confirmed the box stopped at 19:10:57 UTC on November 3.
+
+Commit `dfc9ce76cdf9cf46fd916ff5ed66b0c7f630c2b5` fixes that byte calculation. A contiguous view containing one outer plane can retain an unused stride from its larger parent; its visible bytes, not that stride, determine the transfer interval. The existing stream-view test reproduces the same assertion on CPU before the fix. F32 and Q8 cases pass afterward, including a non-first local stream, asynchronous transfers, partial memset and checks that other streams remain unchanged. The full CPU meta-split and k-pool suites pass. The portable CUDA build passes; artifact SHA-256 is `cdc9cded2b5a0c8407dd8e12fab39ccb5095a096e30c65773efdd2aeee175b98`. Actual long-context restoration on GPUs remains pending for this repair.
+
+The slow cold workload also exposes a scheduling constraint: a balanced 512-row microbatch over 36 sequences supplies 14 tokens per sequence. KDA's chunked path requires at least 128, and its decay-precompute path at least 32. This identifies unavailable fast paths from source, not their share of measured runtime. No scheduling policy or KDA arithmetic was changed. Concurrent capacity, throughput and the strict numerical requirement remain unqualified; no four-card serving profile is promoted.
+
 ## Convergence baseline validation
 
 Runtime source `f089c9cb4bc285a11e510e1c4336b95aca449b08` passed CPU and CUDA builds, 35 focused CPU CTests, the three tensor-mode regressions on CPU/CUDA, and 108 expert-partition cases on CPU and each local RTX 5080 / RTX 5070 Ti. The portable `engine-f089c9c` package passed Rig's Ubuntu 22.04 driver-only installation/decode gate with the small stories260K-f32 test model. Later baseline commits change documentation only.
