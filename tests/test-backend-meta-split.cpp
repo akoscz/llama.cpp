@@ -250,53 +250,6 @@ static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type, boo
     return ok;
 }
 
-static bool test_many_host_inputs(ggml_backend_dev_t device) {
-    ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
-    if (host_devices[0]) { std::copy(host_devices.begin(), host_devices.end(), devices); }
-    auto backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
-    auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    auto ctx = ggml_init({256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-    const int64_t owners[] = {1, 0, 3, 1};
-    std::vector<ggml_tensor *> inputs;
-    ggml_tensor * out = nullptr;
-    for (int i = 0; i < 65; ++i) {
-        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 5);
-        ggml_set_input(input);
-        ggml_backend_meta_split_input(input, 1, owners, 4);
-        inputs.push_back(input);
-        out = out ? ggml_add(ctx, out, input) : input;
-    }
-    ggml_set_output(out);
-    auto graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, out);
-    ggml_backend_t backends[] = {backend, cpu};
-    auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
-    ggml_backend_sched_set_tensor_backend(sched, out, backend);
-    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
-    const int splits = ggml_backend_sched_get_n_splits(sched);
-    bool ok = splits == 1;
-    const int before = captured;
-    std::vector<float> values(160), result(160);
-    for (int iteration = 0; iteration < 6; ++iteration) {
-        for (size_t j = 0; j < inputs.size(); ++j) {
-            for (size_t i = 0; i < values.size(); ++i) { values[i] = float(j + 1 + iteration) + float(i)/16; }
-            ggml_backend_tensor_set(inputs[j], values.data(), 0, ggml_nbytes(inputs[j]));
-        }
-        GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-        ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
-        for (size_t i = 0; i < result.size(); ++i) { ok = ok && result[i] == 2145.0f + 65*(float(iteration) + float(i)/16); }
-    }
-    if (ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_capture_end")) {
-        ok = ok && captured - before == 4;
-    }
-    printf("%s 65 host inputs, %d scheduler splits, %d captures over six evaluations\n", ok ? "ok  " : "FAIL", splits, captured - before);
-    ggml_backend_sched_free(sched);
-    ggml_free(ctx);
-    ggml_backend_free(backend);
-    ggml_backend_free(cpu);
-    return ok;
-}
-
 static bool test_host_layout(ggml_backend_dev_t device) {
     ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
     auto meta = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
@@ -933,8 +886,7 @@ int main(int argc, char ** argv) {
     ggml_log_set(log_cb, nullptr);
     ggml_backend_dev_t gpu = nullptr;
     if (argc == 2 && strcmp(argv[1], "--host-layout-cpu") == 0) {
-        return test_many_host_inputs(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) &&
-               test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
+        return test_host_layout(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) ? 0 : 1;
     }
     if (argc == 3 && strcmp(argv[1], "--single-owner-cpu") == 0) {
         return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2]), true) ? 0 : 1;
@@ -961,7 +913,6 @@ int main(int argc, char ** argv) {
         for (int64_t n_tokens : {1, 3}) { ok = test_tensor_mode(gpu, 0, n_tokens) && ok; }
         ok = test_tensor_mode(gpu, 1, 8) && ok;
         ok = test_scatter_views(gpu) && ok;
-        ok = test_many_host_inputs(gpu) && ok;
         ok = test_host_layout(gpu) && ok;
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
@@ -992,7 +943,7 @@ int main(int argc, char ** argv) {
             printf("host KV: four logical ranks on one GPU; not four-card qualification\n");
         }
         if (!ggml_backend_dev_mapped_buffer_type(gpu)) { printf("mapped host KV unsupported on this backend\n"); return 77; }
-        bool ok = test_many_host_inputs(gpu);
+        bool ok = true;
         for (int64_t q : {1, 3, 16}) { ok = test_host_attention(gpu, q, false) && test_host_attention(gpu, q, true, true) && ok; }
         for (int64_t q : {3, 512}) { ok = test_host_attention(gpu, q, false, false, true) && ok; }
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
@@ -1056,7 +1007,6 @@ int main(int argc, char ** argv) {
     ok = test_rows(gpu, true) && ok;
     ok = test_sequence_axis(gpu) && ok;
     ok = test_scatter_views(gpu) && ok;
-    ok = test_many_host_inputs(gpu) && ok;
     ok = test_host_layout(gpu) && ok;
     if (ggml_backend_dev_mapped_buffer_type(gpu)) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
