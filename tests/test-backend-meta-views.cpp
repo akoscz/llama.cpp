@@ -19,8 +19,10 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static constexpr int64_t n_cols = 64;
@@ -142,10 +144,50 @@ static bool test_owned_cache_views(ggml_backend_dev_t gpu, ggml_type type) {
     return ok;
 }
 
-int main() {
+static bool test_mirrored_copies(ggml_backend_dev_t device) {
+    ggml_backend_dev_t devices[] = {device, device};
+    auto meta = ggml_backend_meta_device(devices, 2, mirrored, nullptr);
+    auto src_backend = ggml_backend_dev_init(meta, nullptr);
+    auto dst_backend = ggml_backend_dev_init(meta, nullptr);
+    auto src_ctx = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+    auto dst_ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    auto * base = ggml_new_tensor_2d(src_ctx, GGML_TYPE_I32, 64, 4);
+    auto * view = ggml_view_2d(src_ctx, base, 64, 2, base->nb[1], base->nb[1]);
+    auto * dst = ggml_new_tensor_2d(dst_ctx, GGML_TYPE_I32, 64, 2);
+    auto src_buf = ggml_backend_alloc_ctx_tensors_from_buft(src_ctx, ggml_backend_dev_buffer_type(meta));
+    auto dst_buf = ggml_backend_alloc_ctx_tensors_from_buft(dst_ctx, ggml_backend_dev_buffer_type(meta));
+    GGML_ASSERT(src_buf && dst_buf);
+    std::vector<int32_t> values(256), got(128);
+    bool ok = true;
+    for (int step = 0; step < 4; ++step) {
+        for (size_t i = 0; i < values.size(); ++i) { values[i] = (int32_t) (step*1000 + i); }
+        ggml_backend_tensor_set_async(src_backend, base, values.data(), 0, ggml_nbytes(base));
+        ggml_backend_tensor_copy_async(src_backend, dst_backend, view, dst);
+        ggml_backend_tensor_get_async(dst_backend, dst, got.data(), 0, ggml_nbytes(dst));
+        ggml_backend_synchronize(dst_backend);
+        for (size_t i = 0; i < got.size(); ++i) { ok &= got[i] == values[64 + i]; }
+        // The direct buffer route must exist too; a host-staged fallback is not this contract.
+        ok &= ggml_backend_buffer_copy_tensor(view, dst);
+    }
+    ggml_backend_synchronize(src_backend);
+    ggml_backend_buffer_free(src_buf);
+    ggml_free(src_ctx);
+    ggml_backend_tensor_get(dst, got.data(), 0, ggml_nbytes(dst));
+    for (size_t i = 0; i < got.size(); ++i) { ok &= got[i] == values[64 + i]; }
+    ggml_backend_buffer_free(dst_buf);
+    ggml_free(dst_ctx);
+    ggml_backend_free(dst_backend);
+    ggml_backend_free(src_backend);
+    printf("%s mirrored owned row copies after source release\n", ok ? "ok  " : "FAIL");
+    return ok;
+}
+
+int main(int argc, char ** argv) {
+    const bool cpu_only = argc == 2 && strcmp(argv[1], "--cpu") == 0;
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) ==
+                (cpu_only ? GGML_BACKEND_DEVICE_TYPE_CPU : GGML_BACKEND_DEVICE_TYPE_GPU)) {
             gpu = ggml_backend_dev_get(i);
         }
     }
@@ -176,7 +218,7 @@ int main() {
     ggml_backend_t backend_a = ggml_backend_dev_init(meta, nullptr);
     ggml_backend_t backend_b = ggml_backend_dev_init(meta, nullptr);
 
-    bool ok = true;
+    bool ok = test_mirrored_copies(gpu);
     {
         view_graph a(backend_a, cpu, w, 0);
         ok = a.compute(w_data, 1.0f, "two backends: A") && ok;

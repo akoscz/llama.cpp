@@ -2360,6 +2360,35 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 }
 
+static bool ggml_backend_meta_mirrored_copy(const ggml_tensor * src, const ggml_tensor * dst) {
+    if (!ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer) ||
+            ggml_backend_buffer_get_type(src->buffer) != ggml_backend_buffer_get_type(dst->buffer) ||
+            !ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (ggml_backend_meta_get_split_state(src, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            ggml_backend_meta_get_split_state(dst, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return false;
+    }
+    const size_t count = ggml_backend_meta_buffer_n_bufs(dst->buffer);
+    if (ggml_backend_meta_buffer_n_bufs(src->buffer) != count) { return false; }
+    for (size_t i = 0; i < count; ++i) {
+        if (!ggml_are_same_layout(ggml_backend_meta_buffer_simple_tensor(src, i),
+                                 ggml_backend_meta_buffer_simple_tensor(dst, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_backend_meta_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (buffer != dst->buffer || !ggml_backend_meta_mirrored_copy(src, dst)) { return false; }
+    for (size_t i = 0; i < ggml_backend_meta_buffer_n_bufs(buffer); ++i) {
+        ggml_backend_tensor_copy(ggml_backend_meta_buffer_simple_tensor(src, i), ggml_backend_meta_buffer_simple_tensor(dst, i));
+    }
+    return true;
+}
+
 static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
     for (size_t i = 0; i < n_buffers; i++) {
@@ -2384,7 +2413,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
     /* .get_tensor_2d   = */ nullptr,
-    /* .cpy_tensor      = */ nullptr,
+    /* .cpy_tensor      = */ ggml_backend_meta_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
 };
@@ -2829,6 +2858,23 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             GGML_ABORT("fatal error");
         }
     }
+}
+
+static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    if (!backend_src || !backend_dst || !ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst) ||
+            !ggml_backend_meta_mirrored_copy(src, dst) ||
+            ggml_backend_get_device(backend_src) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) ||
+            ggml_backend_get_device(backend_dst) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer))) {
+        return false;
+    }
+    const size_t count = ggml_backend_meta_buffer_n_bufs(dst->buffer);
+    if (ggml_backend_meta_n_backends(backend_src) != count || ggml_backend_meta_n_backends(backend_dst) != count) { return false; }
+    for (size_t i = 0; i < count; ++i) {
+        ggml_backend_tensor_copy_async(ggml_backend_meta_simple_backend(backend_src, i), ggml_backend_meta_simple_backend(backend_dst, i),
+                ggml_backend_meta_buffer_simple_tensor(src, i), ggml_backend_meta_buffer_simple_tensor(dst, i));
+    }
+    return true;
 }
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3587,7 +3633,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ nullptr,
+    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
