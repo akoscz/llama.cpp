@@ -233,27 +233,34 @@ static bool test_gather_graph(std::vector<ggml_backend_dev_t> devices, int64_t r
     ggml_set_output(out);
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
-    auto * alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    auto * cpu = ggml_backend_cpu_init();
+    ggml_backend_t backends[] = {backend, cpu};
+    auto * sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_backend_sched_set_tensor_backend(sched, input, backend);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_backend_sched_set_tensor_backend(sched, ggml_graph_node(graph, i), backend);
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
     std::vector<float> values(ggml_nelements(input)), got(values.size());
     bool ok = true;
     const int captures_before = n_captures;
     for (int iteration = 0; iteration < 6; ++iteration) {
         for (size_t j = 0; j < values.size(); ++j) { values[j] = float(int((j + iteration*7) % 1024) - 512); }
         ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
-        const bool ran = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        const bool ran = ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
         ok = ok && ran;
         if (!ran) { break; }
         ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
         for (size_t j = 0; j < got.size(); ++j) { ok = ok && got[j] == 16.0f*values[j]; }
     }
-    ok = ok && n_captures > captures_before;
-    printf("%s: %zu-rank gather graph, %lld rows, rotating empty ranks, %d captures\n",
-        ok ? "ok" : "FAIL", devices.size(), (long long) rows, n_captures.load() - captures_before);
-    ggml_gallocr_free(alloc);
+    const bool captured = n_captures > captures_before;
+    printf("%s: %zu-rank gather graph, %lld rows, rotating empty ranks, values %s, %d captures\n",
+        ok && captured ? "ok" : "FAIL", devices.size(), (long long) rows, ok ? "equal" : "differ", n_captures.load() - captures_before);
+    ggml_backend_sched_free(sched);
     ggml_free(ctx);
     ggml_backend_free(backend);
-    return ok;
+    ggml_backend_free(cpu);
+    return ok && captured;
 }
 
 // Direct collectives check every rank, including tails and inactive ranks. The graph tests below check delayed producers.
