@@ -4243,6 +4243,10 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             for (auto layer : layers) {
                 if (ggml_backend_buffer_get_type(kv->get_k_storage(layer)->buffer) != buft) buft = nullptr;
             }
+            if (buft && ggml_env_switch("LLAMA_KV_HOST")) {
+                // Keep hot selection metadata on the owning GPU when latent history lives in RAM.
+                buft = ggml_backend_dev_buffer_type(ggml_backend_buft_get_device(buft));
+            }
             if (buft) {
                 auto & views = kv->get_kpool_views();
                 if (cparams.n_seq_devices > 1) { views.reserve_views(cparams.n_seq_max); }
@@ -4495,6 +4499,9 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     const bool direct = tail_cells && cparams.flash_attn && !kq_b && !kq_add && !hparams.use_alibi &&
         hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
         sel_mask->op == GGML_OP_KPOOL_MASK;
+    if (ggml_env_switch("LLAMA_KV_HOST") && !direct) {
+        throw std::runtime_error("host KV requires direct sparse indices; legacy k-pool mask paths are unsupported");
+    }
     ggml_tensor * sparse_indices = nullptr;
     ggml_tensor * mask_top_k = nullptr;
     if (direct) {

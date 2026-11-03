@@ -388,11 +388,11 @@ struct ggml_backend_meta_buffer_type_context {
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -497,6 +497,35 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
     };
     auto result = meta_bufts.emplace(dev, meta_buft);
     return &result.first->second;
+}
+
+ggml_backend_buffer_type_t ggml_backend_dev_mapped_buffer_type(ggml_backend_dev_t dev) {
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return ggml_backend_dev_buffer_type(dev);
+    }
+    if (!ggml_backend_dev_is_meta(dev)) {
+        using factory = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+        auto fn = (factory) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_mapped_buffer_type");
+        return fn ? fn(dev) : nullptr;
+    }
+    static std::mutex mutex;
+    static std::map<ggml_backend_dev_t, ggml_backend_buffer_type> buffers;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto found = buffers.find(dev);
+        if (found != buffers.end()) { return &found->second; }
+    }
+    std::vector<ggml_backend_buffer_type_t> simple;
+    for (size_t i = 0; i < ggml_backend_meta_dev_n_devs(dev); ++i) {
+        auto buft = ggml_backend_dev_mapped_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i));
+        if (!buft) { return nullptr; }
+        simple.push_back(buft);
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = buffers.find(dev);
+    if (found != buffers.end()) { return &found->second; }
+    return &buffers.emplace(dev, ggml_backend_buffer_type{ggml_backend_meta_buffer_type_iface, dev,
+        new ggml_backend_meta_buffer_type_context(std::move(simple))}).first->second;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev) {

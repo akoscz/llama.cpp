@@ -79,13 +79,13 @@ python3 scripts/glm53/serve.py --profile dp-4 --slots 4 \
   --server build-dp/bin/llama-server --model /path/to/first-shard.gguf \
   --mmproj /path/to/matching-projector.gguf --dry-run
 
-# Capacity candidate: 40 private contexts, no speculative draft context.
-python3 scripts/glm53/serve.py --profile dp-4 --slots 40 --mtp-depth off \
+# Resident capacity candidate with MTP retained.
+python3 scripts/glm53/serve.py --profile dp-4 --slots 36 --mtp-depth 2 \
   --server build-dp/bin/llama-server --model /path/to/first-shard.gguf \
   --mmproj /path/to/matching-projector.gguf
 ```
 
-The second command is unqualified. The preceding 40-slot MTP run allocated 2,295 MiB of draft KV and 1,721.25 MiB of draft indexer cache per card, in addition to draft compute. Removing those 4,016.25 MiB of caches could cover the observed 2,552 MiB reserve deficit, but active peak memory and decode speed still require measurement. MTP-off does not imply that the pack's MTP weights disappear. It removes draft execution and its context; it does not reduce the advertised target context or prove the strict quality bar. The launcher tests cover both draft settings, context accounting and private-cache flags; they do not establish GPU capacity.
+The second command is unqualified for 36 concurrent 400K sessions. The team configuration keeps MTP enabled. The previous 40-slot MTP-off proposal is withdrawn; its projected savings were not measured. The launcher retains its explicit draft-off option for independent experiments, but neither the capacity calculator nor the host-KV recipe relies on it.
 
 The launcher removes inherited engine overrides for reproducibility. Use the raw command below for controlled wire-format and expert-counter diagnostics instead of expecting inherited environment variables to override the launcher.
 
@@ -123,11 +123,39 @@ Draft Q8 and recurrent Q8 are capacity candidates, not a measured quality recomm
 
 After the F32-wire run passes, unset `GGML_CUDA_AR_BF16_THRESHOLD` and repeat quality and performance measurements. Disable expert counters for timing runs. Counter output requires `-lv 4` because the common logger maps backend information messages to trace verbosity. Counters accumulate one hit per selected routed expert at the up projection, including graph replay; `first` identifies the first expert on that device, and `counts` follows expert-index order. Counts include warmup and prompt/decode work until clean shutdown.
 
+## Experimental host KV with MTP retained
+
+`--kv-host` enables `LLAMA_KV_HOST=1` for the four-card MTP-2 recipe. Each owner's target and draft Q8 MLA latent history is stored in pinned, mapped host RAM. The indexer, KDA state and resident k-pool selection tables remain on the owning GPU. CUDA copies the selected canonical Q8 rows into bounded GPU scratch before attention, preserving selection order and the existing attention arithmetic. The small dense span copies its visible cache. GPU writes, rollback and checkpoint transfers retain the existing cache layout. The target and draft each reserve their own scratch.
+
+This is fixed host storage with per-operation staging. It does not implement a persistent GPU hot-row cache, pressure-triggered eviction, overlap with indexing, physical prefix sharing, or PCP/DCP. Every sparse attention call transfers its selected rows; PCIe cost and MTP acceptance need remote measurement. CUDA capture and 400K attention checks are provided in `test-backend-meta-split --host-kv-four`, which requires four GPU devices and prints their identities. `--host-kv` uses four logical ranks on one GPU and is not four-card qualification. The CPU suite covers ownership, writes, checkpoint transfers and attention outputs with changing selections. Unsupported backends return no mapped buffer type; direct sparse indices and Q8 pooled MLA are required.
+
+The launcher requires a host-memory budget, rejects insufficient available RAM before starting, and permits up to the engine's 256 slots in this experimental mode. The budget excludes the model, 32 GiB RAM prompt cache and system allocations. The slot limit is an input bound, not a capacity claim. Example for inspecting the 72-slot estimate without starting the server:
+
+```sh
+python3 scripts/glm53/serve.py --profile dp-4 --kv-host --slots 72 \
+  --host-budget-mib 200000 --mtp-depth 2 \
+  --server build-dp/bin/llama-server --model /path/to/first-shard.gguf \
+  --mmproj /path/to/matching-projector.gguf --dry-run
+```
+
+`scripts/glm53/capacity.py` fits fixed and per-owner-slot allocation from two measured MTP-2 boots of the same pack. At 442,368 cells, target plus draft latent history is 2,754 MiB per slot; the resident indexer is another 2,065.5 MiB. The observed increase from 36 to 40 slots is 5,288 MiB per card, so the estimate retains 468.5 MiB per owned slot for recurrent state and other incremental allocations. It subtracts only the offloaded latent bytes, adds 1,113.125 MiB/card for target and draft staging, and checks the busiest card, host budget and explicit margins.
+
+For box 58990727's 36/40-slot boots, a 4,096 MiB reserve plus 2,048 MiB growth allowance gives 36 resident slots or 72 host-KV slots. Seventy-two require 198,288 MiB (193.64 GiB) of RAM just for latent history. Increasing the growth allowance to 4,096 MiB gives 68 host-KV slots. These are linear projections, not measured full-context capacity or decode rates. Growth at 400K, allocator reuse, graph captures and host metadata can change the limit. The calculator marks both capacity and quality unqualified.
+
+```sh
+python3 scripts/glm53/capacity.py \
+  --lower-slots 36 --lower-memory cold-36-loaded.memory.json \
+  --upper-slots 40 --upper-memory cold-40-loaded.memory.json \
+  --host-kv --host-budget-mib 200000 --peak-extra-mib 4096
+```
+
+No GPU execution of this new host-KV path or serving measurement is claimed yet. The existing strict cross-layout KL requirement remains unmet. Keep this candidate out of Rig's placed profile and engine pin until component, MTP/restore, quality and active-memory checks pass remotely.
+
 ## Further capacity approaches checked on November 3
 
 Chinese-language searches covered Zhihu and Linux.do. Exa's public MCP endpoint returned HTTP 403, so these results came from the available web search, with implementation claims checked against original sources. Relevant leads were the [Tair team's hierarchical-cache article](https://zhuanlan.zhihu.com/p/2048808646793023819), the [Chinese ECHO discussion](https://zhuanlan.zhihu.com/p/2065819907154093188), and [GLM deployment reports](https://linux.do/t/topic/2878743). They are leads, not measurements of this fork or the selected pack.
 
-- **Disable drafting for the capacity workload.** The launch option above is ready for measurement. SGLang's own [Flash cookbook](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx) separates low-latency MTP and high-throughput recipes with speculation off. This supports testing the workload-specific tradeoff; its throughput is not transferable to our four PCIe cards. Our measured draft allocations provide the local memory reason to try it.
+- **Draft-off is not the selected strategy.** SGLang's [Flash cookbook](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/autoregressive/GLM/GLM-5.3-Flash.mdx) separates low-latency MTP and high-throughput recipes with speculation off. The team requirement here explicitly keeps MTP; its caches and scratch remain in our estimate.
 - **Active sparse-KV offload is a new implementation direction.** [HiSparse](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/hisparse_guide.mdx) retains full sparse-attention history in pinned CPU RAM and retrieves selected rows into a small GPU working set. Its current SGLang route requires prefill/decode disaggregation; shared-index prefetch has additional restrictions, including no speculation. [ECHO](https://www.usenix.org/conference/osdi26/presentation/liu-guangda) provides another primary design: GPU-graph-compatible eviction/recall and lossless prefetch overlapped with indexing. Neither is an existing llama.cpp flag or a validated port to this hybrid model.
 - **Pressure-triggered offload preserves the ordinary fast path.** [vLLM's Hybrid HiSparse](https://vllm-project.github.io/2026/09/08/glm53-part1-hybrid-sparse-offloading.html) leaves KV resident while there is room, then releases older pages into a host-backed sparse working set. Active indexer history still consumes GPU memory. That implementation supports speculative decoding through replayable resolver plans. It is demonstrated on GLM-5.3, not this Flash GGUF pack. A fork implementation would need exact Q8 row transfers, device-owned indexer/KDA state, bounded host RAM, capture-safe miss handling, and correct pool compression, rollback and checkpoint restoration. The likely capacity gain is an inference; PCIe traffic and miss rates must be measured.
 - **Context parallelism offers a different way to use the cards for a single long prompt.** [vLLM's PCP/DCP design](https://vllm-project.github.io/2026/10/23/glm53-part2-pcp-dcp-hisparse.html) distributes prompt work and persistent KV by token. It adds communication and temporary gathered KV during prefill. Relative to our existing DP ownership, sharding a cache does not remove another four copies: DP already stores one copy across the box. The potential benefit is spreading an unusually long prompt's work and storage across owners. Their GLM-5.3 H200 measurements do not establish the cost on four PCIe cards or the KDA integration needed here.

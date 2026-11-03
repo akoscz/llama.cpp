@@ -365,6 +365,32 @@ class ServingRecipeTest(unittest.TestCase):
             else:
                 self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
 
+    def test_host_capacity_requires_mtp_and_a_sufficient_ram_budget(self):
+        base = ["--model", "/model.gguf", "--profile", "dp-4", "--kv-host", "--slots", "72"]
+        args = self.serve.arguments(base + ["--host-budget-mib", "200000"])
+        argv, env = self.serve.make_plan(args)
+        self.assertEqual(env["LLAMA_KV_HOST"], "1")
+        self.assertEqual(argv[argv.index("-c") + 1], str(72 * 442368))
+        self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "2")
+        self.assertNotIn("--kv-unified", argv)
+        for extra in ([], ["--host-budget-mib", "198287"], ["--host-budget-mib", "nan"],
+                      ["--host-budget-mib", "200000", "--mtp-depth", "off"],
+                      ["--host-budget-mib", "200000", "--profile", "tensor-2"]):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(base + extra))
+
+    def test_host_capacity_launch_refuses_insufficient_available_ram(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            model.touch()
+            args = self.serve.arguments(["--model", str(model), "--server", sys.executable,
+                "--profile", "dp-4", "--kv-host", "--slots", "72", "--host-budget-mib", "200000"])
+            with mock.patch.object(self.serve.os, "execve") as execute, \
+                    mock.patch.object(self.serve, "available_memory_mib", return_value=230000):
+                with self.assertRaisesRegex(ValueError, "RAM"):
+                    self.serve.main(args)
+                execute.assert_not_called()
+
     def test_hidden_engine_settings_do_not_override_the_recipe(self):
         args = self.serve.arguments(["--model", "/models/target.gguf"])
         _, settings = self.serve.make_plan(args)
@@ -457,6 +483,41 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertTrue(set(range(256)).issubset(ids))
         self.assertTrue(set(range(154820, 154856)).issubset(ids))
         self.assertTrue(all(0 <= token <= 154855 for token in ids))
+
+
+class CapacityTest(unittest.TestCase):
+    def setUp(self):
+        from capacity import estimate
+        self.estimate = estimate
+        self.lower = [dict(device=d, used_mib=used, free_mib=97342-used)
+                      for d, used in enumerate([90510, 88876, 88876, 88876])]
+        self.upper = [dict(device=d, used_mib=used, free_mib=97342-used)
+                      for d, used in enumerate([95798, 94164, 94164, 94164])]
+
+    def test_measured_fixed_cost_and_mtp_cache_limit_every_card(self):
+        resident = self.estimate(36, self.lower, 40, self.upper)
+        self.assertEqual(resident['estimated_max']['slots'], 36)
+        host = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=200000)
+        self.assertEqual(host['estimated_max']['slots'], 72)
+        self.assertEqual(host['estimated_max']['host_kv_mib'], 198288)
+        self.assertEqual(host['cache_mib_per_slot'], 4819.5)
+        self.assertFalse(host['capacity_qualified'])
+        self.assertFalse(host['quality_qualified'])
+        limited = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=50000)
+        self.assertEqual(limited['estimated_max']['slots'], 18)
+        self.assertEqual(limited['estimated_max']['slots_per_card'], [5, 5, 4, 4])
+
+    def test_bad_calibration_cannot_produce_a_capacity_claim(self):
+        for field, value in [('peak_extra_mib', float('nan')), ('reserve_mib', float('inf')),
+                             ('max_slots', 257)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.estimate(36, self.lower, 40, self.upper, **{field: value})
+        changed = copy.deepcopy(self.upper)
+        changed[0]['free_mib'] += 1024
+        with self.assertRaises(ValueError):
+            self.estimate(36, self.lower, 40, changed)
+        with self.assertRaises(ValueError):
+            self.estimate(36, self.lower, 40, self.upper, host_kv=True)
 
 
 if __name__ == "__main__":

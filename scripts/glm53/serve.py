@@ -3,9 +3,12 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
+
+from capacity import SLOT_CELLS, MLA_LAYERS, LATENT_ROW_BYTES, MIB
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "models/templates/GLM-5.3-Flash.jinja"
@@ -32,7 +35,9 @@ def arguments(argv=None):
     parser.add_argument("--port", type=int, default=8102)
     parser.add_argument("--profile", choices=["tensor-2", "dp-4"], default="tensor-2",
                         help="Two-card tensor recipe or experimental four-card DP capacity recipe")
-    parser.add_argument("--slots", type=int, help="DP only: 1..40 private caches of 442368 cells each (default: 36)")
+    parser.add_argument("--slots", type=int, help="DP private caches of 442368 cells each: 1..40 resident, 1..256 host KV (default: 36)")
+    parser.add_argument("--kv-host", action="store_true", help="Experimental DP/MTP-2: keep latent KV in pinned RAM and stage selected rows on the GPU")
+    parser.add_argument("--host-budget-mib", type=float, help="RAM available for host KV after model, prompt-cache and system allocations")
     parser.add_argument("--mtp-depth", choices=["1", "2", "off"], default=DEFAULT_MTP_DEPTH)
     parser.add_argument("--indexer-query", choices=["q8", "f32"], default="q8", help="Q8 is lossy; compare F32 for quality-sensitive workloads")
     parser.add_argument("--prompt-step", type=int, help="Prompt tokens per step alongside generation; default: 1024 tensor, 512 DP; 0 removes the cap")
@@ -45,9 +50,17 @@ def make_plan(args):
     prompt_step = args.prompt_step if args.prompt_step is not None else (512 if dp else 1024)
     if not 1 <= args.port <= 65535 or prompt_step < 0:
         raise ValueError("port must be 1..65535 and prompt-step must be nonnegative")
-    if args.slots is not None and (not dp or not 1 <= args.slots <= 40):
-        raise ValueError("slots is supported only with --profile dp-4 and must be 1..40")
+    limit = 256 if args.kv_host else 40
+    if args.slots is not None and (not dp or not 1 <= args.slots <= limit):
+        raise ValueError(f"slots is supported only with --profile dp-4 and must be 1..{limit}")
     slots = (36 if args.slots is None else args.slots) if dp else 3
+    if args.kv_host:
+        if not dp or args.mtp_depth != "2":
+            raise ValueError("host KV requires --profile dp-4 and --mtp-depth 2")
+        if args.host_budget_mib is None or not math.isfinite(args.host_budget_mib) or args.host_budget_mib < host_kv_mib(slots):
+            raise ValueError(f"host KV needs a RAM budget of at least {host_kv_mib(slots):.0f} MiB")
+    elif args.host_budget_mib is not None:
+        raise ValueError("host-budget-mib requires --kv-host")
     if not args.host or any(char in args.host for char in "\n\r\0"):
         raise ValueError("host must be a nonempty address without control characters")
     server = args.server.expanduser().resolve()
@@ -85,7 +98,23 @@ def make_plan(args):
     }
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
+    if args.kv_host:
+        env["LLAMA_KV_HOST"] = "1"
     return argv, env
+
+
+def host_kv_mib(slots):
+    return slots * SLOT_CELLS * MLA_LAYERS * LATENT_ROW_BYTES / MIB
+
+
+def available_memory_mib():
+    available = next(int(line.split()[1]) / 1024 for line in Path('/proc/meminfo').read_text().splitlines()
+                     if line.startswith('MemAvailable:'))
+    # Vast containers may have a smaller cgroup limit than the machine's RAM.
+    limit = Path('/sys/fs/cgroup/memory.max')
+    if limit.is_file() and limit.read_text().strip() != 'max':
+        available = min(available, (int(limit.read_text()) - int(limit.with_name('memory.current').read_text())) / MIB)
+    return available
 
 
 def own_path(path):
@@ -124,6 +153,8 @@ def main(args):
             raise ValueError("missing local " + label + ": " + str(path))
     if not os.access(argv[0], os.X_OK):
         raise ValueError("server is not executable: " + argv[0])
+    if args.kv_host and available_memory_mib() < host_kv_mib(args.slots or 36) + 32768 + 8192:
+        raise ValueError("insufficient available RAM for host KV, 32 GiB prompt cache and 8 GiB system reserve")
     os.execve(argv[0], argv, execution_environment(settings))
     return 0
 
