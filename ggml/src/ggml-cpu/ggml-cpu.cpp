@@ -435,6 +435,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     for (int i = 0; i < 4; i++) {
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
+            if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) { return false; }
             auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
             return buf_extra->supports_op(dev, op);
         }
@@ -657,7 +658,12 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cpu_supports_expert_partition() { return true; }
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_supports_expert_partition") == 0) {
+        return (void *) ggml_backend_cpu_supports_expert_partition;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

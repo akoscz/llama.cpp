@@ -948,10 +948,13 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_LOG_SNR_FC2,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
-LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), arch_name(llm_arch_name(arch)), suffix(suffix) {}
+
+LLM_KV::LLM_KV(const std::string & arch_name, const char * suffix) :
+    arch(llm_arch_from_string(arch_name)), arch_name(arch_name), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    std::string name = ::format(LLM_KV_NAMES.at(kv), arch_name.c_str());
 
     if (suffix != nullptr) {
         name += ".";
@@ -996,6 +999,9 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    if (name == "glm5-next") {
+        return LLM_ARCH_GLM5NEXT;
+    }
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;

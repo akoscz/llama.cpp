@@ -495,6 +495,17 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
+    if (cparams.n_seq_devices > 1) {
+        const int64_t tokens = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t count = std::min<int64_t>(tokens, 1 + cparams.n_rs_seq);
+        for (int64_t snapshot = 0; snapshot < count; ++snapshot) {
+            ggml_tensor * window = ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, tokens - snapshot));
+            ggml_build_forward_expand(gf, build_rs_store_local(inp, conv_states_all, window, snapshot));
+        }
+        return conv_input;
+    }
+
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
@@ -582,6 +593,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
+        if (cparams.n_seq_devices > 1) {
+            ggml_build_forward_expand(gf, build_rs_store_local(inp, ssm_states_all, new_state, 0));
+            return output;
+        }
+
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
@@ -630,6 +646,16 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+    if (cparams.n_seq_devices > 1) {
+        for (int64_t snapshot = 0; snapshot < n_written; ++snapshot) {
+            ggml_tensor * states = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+                    ggml_row_size(gdn_out->type, D),
+                    ggml_row_size(gdn_out->type, attn_score_elems + snapshot*state_size_per_snap));
+            ggml_build_forward_expand(gf, build_rs_store_local(inp, ssm_states_all, states, snapshot));
+        }
+        return output;
+    }
 
     if (state_rows) {
         // rows mode: scatter the compact snapshot region [D, n_written*n_seqs]

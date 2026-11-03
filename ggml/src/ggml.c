@@ -3376,6 +3376,13 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_expert_range(struct ggml_tensor * a, int32_t first, int32_t total) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(first >= 0 && total > 0 && a->src[0]->ne[2] <= (int64_t) total - first);
+    ggml_set_op_params_i32(a, 1, first);
+    ggml_set_op_params_i32(a, 2, total);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

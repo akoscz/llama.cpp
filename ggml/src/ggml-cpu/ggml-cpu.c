@@ -1647,7 +1647,16 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t total = ggml_get_op_params_i32(dst, 2);
+                if (total > 0) {
+                    GGML_ASSERT(i02 >= 0 && i02 < total);
+                    i02 -= ggml_get_op_params_i32(dst, 1);
+                    if (i02 < 0 || i02 >= n_as) {
+                        memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                        continue;
+                    }
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 

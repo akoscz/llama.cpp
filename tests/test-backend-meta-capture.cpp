@@ -31,13 +31,17 @@ static constexpr int64_t n_ff    = 4096;
 static constexpr int64_t n_lo    = 32; // up rows and down columns on the first device
 static constexpr int     n_layer = 4;
 
-static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, void * /*userdata*/) {
+static ggml_backend_meta_split_state split_by_name(const ggml_tensor * tensor, void * userdata) {
     if (strncmp(tensor->name, "up", 2) == 0 || strncmp(tensor->name, "down", 4) == 0) {
         // up: [n_embd, n_ff], its rows; down: [n_ff, n_embd], its columns
         ggml_backend_meta_split_state split_state = {
             tensor->name[0] == 'u' ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
-        split_state.ne[0] = n_lo;
-        split_state.ne[1] = n_ff - n_lo;
+        const int n = *(const int *) userdata;
+        const int layer = atoi(strchr(tensor->name, '.') + 1);
+        const int heavy = n == 2 ? 1 : layer % n;
+        for (int rank = 0; rank < n; ++rank) {
+            split_state.ne[rank] = rank == heavy ? n_ff - (n - 1)*n_lo : n_lo;
+        }
         return split_state;
     }
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
@@ -254,21 +258,33 @@ static bool check_collective_hint_scope(const std::vector<ggml_backend_dev_t> & 
     return ok;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
+    const bool physical = argc == 3 && strcmp(argv[1], "--devices") == 0;
+    const int n_devices = logical || physical ? atoi(argv[2]) : 2;
+    if ((argc != 1 && !logical && !physical) || n_devices < 2 || n_devices > 4) {
+        fprintf(stderr, "usage: %s [--devices 2|3|4 | --logical 2|3|4]\n", argv[0]);
+        return 1;
+    }
     std::vector<ggml_backend_dev_t> gpus;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < (size_t) n_devices; i++) {
         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             gpus.push_back(ggml_backend_dev_get(i));
         }
     }
     if (gpus.empty()) {
         printf("no GPU for the meta backend, skipped\n");
-        return 0;
+        return argc == 1 ? 0 : 77;
     }
-    if (gpus.size() == 1) {
-        gpus.push_back(gpus[0]);
+    if (physical && gpus.size() < (size_t) n_devices) {
+        printf("need %d physical GPUs, found %zu, skipped\n", n_devices, gpus.size());
+        return 77;
     }
-    printf("meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
+    const size_t n_physical = gpus.size();
+    for (size_t rank = gpus.size(); rank < (size_t) n_devices; ++rank) {
+        gpus.push_back(gpus[rank % n_physical]);
+    }
+    printf("meta backend over %d ranks on %zu physical GPUs\n", n_devices, n_physical);
 
     const char * ar = getenv("GGML_CUDA_ALLREDUCE");
     if (ggml_env_switch("TEST_GLM_HC") && ggml_env_switch("GGML_CUDA_AR_HC_POST") &&
@@ -278,7 +294,7 @@ int main() {
     log_counts counts;
     ggml_log_set(log_cb, &counts);
 
-    ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), 2, split_by_name, nullptr);
+    ggml_backend_dev_t meta = ggml_backend_meta_device(gpus.data(), n_devices, split_by_name, (void *) &n_devices);
 
     std::mt19937 rng(42);
     std::vector<std::vector<float>> w_data(2*n_layer);
@@ -346,14 +362,15 @@ int main() {
     }
 
     const bool legacy      = ggml_env_switch("GGML_META_CAPTURE_LEGACY"); // as the backend reads it
-    const int  executables = legacy ? 0 : (n_graphs + 1)*2;
+    const int  executables = legacy ? 0 : (n_graphs + 1)*n_devices;
     const bool ok_captures = counts.executables == executables && counts.not_captured == 0;
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
         counts.executables, executables, counts.not_captured);
     ok = ok && ok_captures;
     if (ggml_env_switch("TEST_GLM_HC") && ggml_env_switch("GGML_CUDA_AR_HC_POST") && !legacy) {
-        printf("%s %d collective HC consumers captured\n", counts.hc_fused > 0 ? "ok" : "FAIL", counts.hc_fused);
-        ok = ok && counts.hc_fused > 0;
+        const bool ok_hc = n_devices == 2 ? counts.hc_fused > 0 : counts.hc_fused == 0;
+        printf("%s %d collective HC consumers captured\n", ok_hc ? "ok" : "FAIL", counts.hc_fused);
+        ok = ok && ok_hc;
     }
 
     if (ar != nullptr && strcmp(ar, "internal") == 0 && strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) == 0) {

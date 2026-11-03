@@ -11,8 +11,16 @@
 #include <memory>
 #include <unordered_map>
 
+// Pack streams by device while sequence s stays on device s % n_devices.
+llama_seq_id llama_seq_to_stream(llama_seq_id seq, uint32_t n_seq_max, uint32_t n_devices);
+std::vector<int64_t> llama_stream_counts(uint32_t n_seq_max, uint32_t n_devices);
+
 // keep this struct lightweight
 struct llama_ubatch {
+    // Counts follow the device-major row order, including ranks with no rows.
+    std::vector<int64_t> device_rows(uint32_t n_devices, bool outputs_only = false) const;
+    std::vector<int64_t> device_seqs(uint32_t n_devices) const;
+
     bool equal_seqs() const {
         return b_equal_seqs != 0;
     }
@@ -75,7 +83,7 @@ struct llama_ubatch {
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
-    llama_batch_allocr(uint32_t n_pos_per_embd);
+    llama_batch_allocr(uint32_t n_pos_per_embd, uint32_t n_devices = 1);
 
     // sanitize and auto-gen missing data in the input batch
     // memory is optional. if provided will be used to check for sequence continuity and to determine the positions
@@ -136,6 +144,7 @@ private:
     // TODO: this is more of a temporary solution until we have a better way to handle multiple positions per token/embd
     //       ref: https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-2983871762
     const uint32_t n_pos_per_embd;
+    const uint32_t n_devices;
 
     uint32_t n_embd;
     uint32_t n_seq_max;

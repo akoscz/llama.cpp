@@ -662,6 +662,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_META    = 32, // ...has an explicit meta backend layout
     };
 
     enum ggml_tri_type {
@@ -1456,6 +1457,10 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // as contains experts [first, first + as->ne[2]); ids remain global. Other expert lanes produce zero.
+    // Backends must advertise ggml_backend_supports_expert_partition before executing this form.
+    GGML_API void ggml_mul_mat_id_set_expert_range(struct ggml_tensor * a, int32_t first, int32_t total);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

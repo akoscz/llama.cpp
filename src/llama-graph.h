@@ -214,6 +214,9 @@ struct llm_graph_nextn {
 
     int64_t n_batch = 0;
     int64_t n_carry = 0;
+    uint32_t n_devices = 1;
+    std::vector<uint32_t> * owners = nullptr; // original batch row's owner, for both halves
+    const std::vector<float> * carry = nullptr;
 };
 
 // the store row of each ubatch row: where the target writes it, or where the head reads its hidden row
@@ -361,6 +364,7 @@ public:
     // shared across recurrent layers
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
+    std::vector<ggml_tensor *> s_write_local; // one device-local I64 index per sequence, for each snapshot
 
     const llama_memory_recurrent_context * mctx;
 
@@ -944,6 +948,17 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.n_seq_devices != other.cparams.n_seq_devices) {
+            return false;
+        }
+        if (cparams.n_seq_devices > 1) {
+            if (!ubatch.data || !other.ubatch.data ||
+                    ubatch.device_rows(cparams.n_seq_devices) != other.ubatch.device_rows(cparams.n_seq_devices) ||
+                    ubatch.device_rows(cparams.n_seq_devices, true) != other.ubatch.device_rows(cparams.n_seq_devices, true)) {
+                return false;
+            }
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -1304,6 +1319,8 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    void split_inp_rows(ggml_tensor * tensor, int axis, bool outputs_only = false) const;
+    ggml_tensor * build_output_rows(ggml_tensor * tensor, ggml_tensor * ids) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
@@ -1477,6 +1494,8 @@ struct llm_graph_context {
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
+    ggml_tensor * build_rs_store_local(llm_graph_input_rs * inp, ggml_tensor * cache,
+                                      ggml_tensor * states, uint32_t snapshot) const;
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,

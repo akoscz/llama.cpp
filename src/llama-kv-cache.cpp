@@ -166,7 +166,7 @@ llama_kv_cache::llama_kv_cache(
     if (n_stream > 1) {
         seq_to_stream.resize(n_stream, 0);
         for (uint32_t s = 0; s < n_stream; ++s) {
-            seq_to_stream[s] = s;
+            seq_to_stream[s] = llama_seq_to_stream(s, n_seq_max, model.n_seq_devices());
         }
     }
 
@@ -248,6 +248,13 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+
+        if (model.n_seq_devices() > 1) {
+            GGML_ASSERT(!unified && offload && !v_trans);
+            const auto counts = llama_stream_counts(n_seq_max, model.n_seq_devices());
+            if (k) { ggml_backend_meta_split_input(k, 2, counts.data(), counts.size()); }
+            if (v) { ggml_backend_meta_split_input(v, 2, counts.data(), counts.size()); }
+        }
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -903,7 +910,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & head  = v_heads[sinfo.strm[s]];
 
             cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+            head = it->v_heads_old[sinfo.strm[s]];
         }
     }
 
@@ -1431,6 +1438,27 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens, ui
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_devices() const {
+    return model.n_seq_devices();
+}
+
+static ggml_tensor * split_cache_view(ggml_tensor * view, const llama_kv_cache::slot_info & sinfo, uint32_t n_devices) {
+    if (n_devices == 1) { return view; }
+    const auto capacity = llama_stream_counts(view->src[0]->ne[2], n_devices);
+    std::vector<int64_t> counts(n_devices, 0), first(n_devices, 0);
+    uint32_t owner = 0;
+    int64_t offset = 0;
+    for (const auto stream : sinfo.strm) {
+        while (owner < n_devices && stream >= offset + capacity[owner]) { offset += capacity[owner++]; }
+        GGML_ASSERT(owner < n_devices);
+        if (counts[owner] == 0) { first[owner] = stream - offset; }
+        GGML_ASSERT(stream - offset == first[owner] + counts[owner]);
+        ++counts[owner];
+    }
+    ggml_backend_meta_set_stream_view(view, counts.data(), first.data(), n_devices);
+    return view;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1441,14 +1469,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const bool dp = model.n_seq_devices() > 1;
+    const uint32_t ns = dp ? sinfo.n_stream() : sinfo.s1 - sinfo.s0 + 1;
 
-    return ggml_view_4d(ctx, k,
+    return split_cache_view(ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*(dp ? 0 : sinfo.s0)), sinfo, model.n_seq_devices());
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1462,16 +1491,17 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const bool dp = model.n_seq_devices() > 1;
+    const uint32_t ns = dp ? sinfo.n_stream() : sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        return ggml_view_4d(ctx, v,
+        return split_cache_view(ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*(dp ? 0 : sinfo.s0)), sinfo, model.n_seq_devices());
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1527,7 +1557,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    return model.n_seq_devices() > 1 ? ggml_backend_meta_set_rows_local(ctx, k, k_cur, k_idxs)
+                                     : ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
@@ -1551,7 +1582,8 @@ ggml_tensor * llama_kv_cache::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur
     ggml_tensor * dst = ggml_view_2d(ctx, k2, n_embd, kv_size*n_stream,
             k2->nb[1], ggml_row_size(k2->type, i_off));
 
-    return ggml_set_rows(ctx, dst, k_cur, k_idxs);
+    return model.n_seq_devices() > 1 ? ggml_backend_meta_set_rows_local(ctx, dst, k_cur, k_idxs)
+                                     : ggml_set_rows(ctx, dst, k_cur, k_idxs);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1586,7 +1618,8 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        return model.n_seq_devices() > 1 ? ggml_backend_meta_set_rows_local(ctx, v, v_cur, v_idxs)
+                                         : ggml_set_rows(ctx, v, v_cur, v_idxs);
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
@@ -1797,6 +1830,11 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
 
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
 
+    if (model.n_seq_devices() > 1) {
+        const auto counts = ubatch.device_rows(model.n_seq_devices());
+        ggml_backend_meta_split_input(k_idxs, 0, counts.data(), counts.size());
+    }
+
     ggml_set_input(k_idxs);
 
     return k_idxs;
@@ -1814,6 +1852,12 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     }
 
     ggml_set_input(v_idxs);
+
+    if (model.n_seq_devices() > 1) {
+        GGML_ASSERT(!v_trans);
+        const auto counts = ubatch.device_rows(model.n_seq_devices());
+        ggml_backend_meta_split_input(v_idxs, 0, counts.data(), counts.size());
+    }
 
     return v_idxs;
 }
@@ -1887,7 +1931,10 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        const llama_seq_id seq = ubatch->seq_id[s*sinfo.size()][0];
+        GGML_ASSERT(int32_t(seq_to_stream[seq]) == sinfo.strm[s]);
+        const int64_t stream = model.n_seq_devices() > 1 ? seq/model.n_seq_devices() : sinfo.strm[s];
+        const int64_t offs = stream*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
@@ -1904,7 +1951,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const llama_seq_id seq = ubatch->seq_id[s*sinfo.size()][0];
+            GGML_ASSERT(int32_t(seq_to_stream[seq]) == sinfo.strm[s]);
+            const int64_t stream = model.n_seq_devices() > 1 ? seq/model.n_seq_devices() : sinfo.strm[s];
+            const int64_t offs = stream*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
@@ -2636,6 +2686,8 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         throw std::runtime_error("n_stream mismatch");
     }
 
+    if (seq_id == -1) { clear(true); }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
@@ -2877,8 +2929,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        clear(true);
-
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t  n_seq_id;
@@ -2900,6 +2950,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
+                    return false;
+                }
+                if (seq_to_stream[seq_id] != strm) {
+                    LLAMA_LOG_ERROR("%s: sequence %d belongs to a different cache stream\n", __func__, seq_id);
                     return false;
                 }
 
@@ -3198,7 +3252,7 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_stream() const {
-    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
+    return kv->get_n_devices() > 1 ? sinfos[i_cur].n_stream() : sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
 }
 
 uint32_t llama_kv_cache_context::get_strm(uint32_t s) const {

@@ -1459,7 +1459,7 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         strm_of.resize(mctx_idx->get_n_stream());
 
         for (uint32_t s = 0; s < strm_of.size(); ++s) {
-            strm_of[s] = mctx_idx->get_strm(s);
+            strm_of[s] = n_seq_devices > 1 ? ubatch->seq_id_unq[s]/n_seq_devices : mctx_idx->get_strm(s);
         }
     }
 

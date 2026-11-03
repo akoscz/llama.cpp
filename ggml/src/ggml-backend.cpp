@@ -625,6 +625,14 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if ((op->flags & GGML_TENSOR_FLAG_META) && (op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_SET_ROWS) &&
+            !ggml_backend_buft_is_meta(ggml_backend_dev_buffer_type(device))) { return false; }
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 2) > 0) {
+        const auto reg = ggml_backend_dev_backend_reg(device);
+        const auto supports = reg ? reinterpret_cast<bool (*)(void)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_supports_expert_partition")) : nullptr;
+        if (!supports || !supports()) { return false; }
+    }
     return device->iface.supports_op(device, op);
 }
 
@@ -1066,6 +1074,88 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+struct ggml_backend_input_layout {
+    int axis;
+    int64_t counts[GGML_BACKEND_META_MAX_DEVICES];
+};
+
+static bool ggml_backend_input_layout_of(const ggml_tensor * tensor, ggml_backend_input_layout & layout) {
+    if ((tensor->op == GGML_OP_NONE || tensor->op == GGML_OP_RESHAPE) && (tensor->flags & GGML_TENSOR_FLAG_META)) {
+        layout.axis = uint32_t(tensor->op_params[0]) >> 30;
+        for (size_t j = 0; j < GGML_BACKEND_META_MAX_DEVICES; ++j) {
+            layout.counts[j] = uint32_t(tensor->op_params[j]) & (j == 0 ? 0x3fffffff : UINT32_MAX);
+        }
+        return true;
+    }
+    if (tensor->op == GGML_OP_VIEW && (tensor->flags & GGML_TENSOR_FLAG_META)) {
+        layout.axis = 3;
+        for (size_t j = 0; j < GGML_BACKEND_META_MAX_DEVICES; ++j) { layout.counts[j] = uint32_t(tensor->op_params[j]) & UINT16_MAX; }
+        return true;
+    }
+    switch (tensor->op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_CONT:
+        case GGML_OP_CPY:
+        case GGML_OP_FILL:
+            break;
+        default:
+            return false;
+    }
+    const auto * source = tensor->src[0];
+    ggml_backend_input_layout input;
+    if (!source || !ggml_backend_input_layout_of(source, input)) { return false; }
+    layout = {};
+    layout.axis = std::max(1, ggml_n_dims(tensor) - 1);
+    if (tensor->op != GGML_OP_VIEW) {
+        const int64_t source_plane = ggml_nelements(source)/source->ne[input.axis];
+        const int64_t output_plane = ggml_nelements(tensor)/tensor->ne[layout.axis];
+        GGML_ASSERT(ggml_nelements(source) == ggml_nelements(tensor));
+        for (size_t j = 0; j < GGML_BACKEND_META_MAX_DEVICES; ++j) {
+            GGML_ASSERT(input.counts[j]*source_plane % output_plane == 0);
+            layout.counts[j] = input.counts[j]*source_plane/output_plane;
+        }
+        return true;
+    }
+    // Host views can select an inner chunk while retaining the stride between streams.
+    GGML_ASSERT(ggml_is_contiguous(source) && ggml_blck_size(source->type) == 1);
+    for (int d = input.axis + 1; d < GGML_MAX_DIMS; ++d) { GGML_ASSERT(source->ne[d] == 1); }
+    GGML_ASSERT(tensor->view_offs >= source->view_offs);
+    const int64_t begin = tensor->view_offs - source->view_offs;
+    const int64_t stride = tensor->nb[layout.axis];
+    ggml_tensor plane = *tensor;
+    plane.ne[layout.axis] = 1;
+    const int64_t bytes = ggml_nbytes(&plane);
+    int64_t owner_begin = 0, covered = 0;
+    for (size_t j = 0; j < GGML_BACKEND_META_MAX_DEVICES; ++j) {
+        const int64_t owner_end = owner_begin + input.counts[j]*source->nb[input.axis];
+        const int64_t first = std::max<int64_t>(0, (owner_begin - begin + stride - 1)/stride);
+        const int64_t end = owner_end < begin + bytes ? 0 : std::min<int64_t>(tensor->ne[layout.axis], (owner_end - begin - bytes)/stride + 1);
+        if (end > first) {
+            GGML_ASSERT(first == covered);
+            layout.counts[j] = end - first;
+            covered = end;
+        }
+        owner_begin = owner_end;
+    }
+    GGML_ASSERT(covered == tensor->ne[layout.axis]);
+    return true;
+}
+
+static ggml_tensor * ggml_backend_sched_dup_input(ggml_context * ctx, const ggml_tensor * src) {
+    ggml_tensor * copy = ggml_dup_tensor_layout(ctx, src);
+    ggml_backend_input_layout layout;
+    if (ggml_backend_input_layout_of(src, layout)) {
+        // Preserve ownership through host reshapes, casts and chunk views.
+        copy->flags |= GGML_TENSOR_FLAG_META;
+        for (size_t j = 0; j < GGML_BACKEND_META_MAX_DEVICES; ++j) {
+            GGML_ASSERT(layout.counts[j] < (int64_t(1) << 30));
+            copy->op_params[j] = uint32_t(layout.counts[j]) | (j == 0 ? uint32_t(layout.axis) << 30 : 0);
+        }
+    }
+    return copy;
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1395,7 +1485,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             if (c == sched->cur_copy) {
                                 tensor_copy = src; // use the original tensor as the current copy
                             } else {
-                                tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                tensor_copy = ggml_backend_sched_dup_input(sched->ctx, src);
                                 ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             }
                             ggml_set_input(tensor_copy);
@@ -1416,7 +1506,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            struct ggml_tensor * tensor_copy = ggml_backend_sched_dup_input(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);

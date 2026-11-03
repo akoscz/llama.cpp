@@ -182,6 +182,9 @@ static void common_params_fit_impl(
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_DATA) {
+        throw common_params_fit_exception("automatic fitting is not implemented for -sm dp; set -ngl all and explicit context and slot counts");
+    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();

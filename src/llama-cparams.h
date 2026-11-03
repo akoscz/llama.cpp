@@ -13,6 +13,7 @@ struct llama_cparams {
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
+    uint32_t n_seq_devices = 1; // sequences are pinned by seq_id % n_seq_devices
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_swa_mtp;       // MTP context: the attention window over a sequence's last positions (0 = the whole context)
     uint32_t n_outputs_max;   // max outputs supported by the context

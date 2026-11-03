@@ -2860,12 +2860,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor,dp}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "- dp: split sequences and experts, replicate dense weights (GLM-5.3, non-unified KV, EXPERIMENTAL)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2875,6 +2876,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "tensor") {
                 params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else if (value == "dp") {
+                params.split_mode = LLAMA_SPLIT_MODE_DATA;
             } else {
                 throw std::invalid_argument("invalid value");
             }

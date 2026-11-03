@@ -82,6 +82,8 @@ public:
     std::vector<uint32_t> rs_reach;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+    uint32_t n_devices() const { return n_seq_devices; }
+    uint32_t state_row(uint32_t cell, uint32_t snapshot, bool local = false) const;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -125,6 +127,10 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+    const uint32_t n_seq_devices;
+    llama_context * owner_context = nullptr;
+    std::vector<uint32_t> zero_cells;
+    std::vector<uint32_t> restore_cells;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -180,6 +186,8 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    uint32_t n_devices() const { return mem->n_devices(); }
+    uint32_t s_write(llama_seq_id seq, uint32_t snapshot) const;
 
 private:
     const llama_memory_status status;
