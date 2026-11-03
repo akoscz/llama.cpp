@@ -501,6 +501,7 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(host['estimated_max']['slots'], 72)
         self.assertEqual(host['estimated_max']['host_kv_mib'], 198288)
         self.assertEqual(host['cache_mib_per_slot'], 4819.5)
+        self.assertAlmostEqual(host['staging_mib_per_card'], 1321.8359375)
         self.assertFalse(host['capacity_qualified'])
         self.assertFalse(host['quality_qualified'])
         limited = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=50000)

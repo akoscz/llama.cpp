@@ -32,8 +32,9 @@ def estimate(lower_slots, lower, upper_slots, upper, *, host_kv=False, host_budg
     upper = sorted(upper, key=lambda r: r['device'])
     latent_mib = SLOT_CELLS * MLA_LAYERS * LATENT_ROW_BYTES / MIB
     cache_mib = SLOT_CELLS * MLA_LAYERS * (LATENT_ROW_BYTES + INDEXER_ROW_BYTES) / MIB
-    # Separate target and draft graph buffers; each reuses its scratch across successive attention layers.
-    staging_mib = 2 * (512 * 2080 * (LATENT_ROW_BYTES + 4)) / MIB if host_kv else 0
+    # Target and draft each keep the main graph plus up to three 32-row graph slots (llama-context.h).
+    # Every graph reuses its scratch across successive attention layers.
+    staging_mib = 2 * ((512 + 3 * 32) * 2080 * (LATENT_ROW_BYTES + 4)) / MIB if host_kv else 0
     cards = []
     for a, b in zip(lower, upper):
         total = a['used_mib'] + a['free_mib']
