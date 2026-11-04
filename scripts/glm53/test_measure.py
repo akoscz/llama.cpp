@@ -94,6 +94,17 @@ class ServingStandIn(http.server.BaseHTTPRequestHandler):
             elif case == "stream-success" and payload.get("stream"):
                 self.send(200, b'data: {"content":"visible"}\n\n')
                 return
+            elif case == "stream-bursts" and payload.get("stream"):
+                self.send_response(200)
+                self.end_headers()
+                for part in ([0], list(range(1, tokens-1)), [tokens-1]):
+                    event = dict(content="x", tokens=part, stop=False)
+                    self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.02)
+                response.update(content="", tokens=[], stop=True)
+                self.wfile.write(b"data: " + json.dumps(response).encode() + b"\n\n")
+                return
             elif case == "chunked":
                 self.send_response(200)
                 self.send_header("Transfer-Encoding", "chunked")
@@ -169,6 +180,39 @@ class ServingEvidence(unittest.TestCase):
     def capture_records(self, leg):
         records = [json.loads(path.read_text()) for path in (leg.out / "http").glob("*.json")]
         return [row for row in records if row.get("path") == "/completion"]
+
+    def test_concurrent_streams_retain_ids_timestamps_and_equal_lengths(self):
+        self.server.case = "stream-bursts"
+        leg = ServingLeg(self.args)
+        leg.out.mkdir(parents=True)
+        result = leg.decode_group(dict(category="long", prompt=list(range(512))), 128, [0, 2], 512)
+        self.assertTrue(result["common_decode"]["available"])
+        self.assertGreater(result["common_decode"]["tokens_per_second"], 0)
+        for row in result["streams"]:
+            self.assertEqual(row["token_ids"], list(range(128)))
+            self.assertEqual(row["request"]["n_predict"], 128)
+            self.assertTrue(row["request"]["return_tokens"])
+            self.assertEqual(len(row["bursts"]), 3)
+            self.assertTrue((leg.out / row["response_record"]).with_suffix(".events.jsonl").is_file())
+
+    def test_abba_runs_all_four_legs_with_shared_deadline_and_raw_streams(self):
+        from measure import run_measurements
+        self.server.case = "stream-bursts"
+        self.args.mode = "scaling"
+        self.args.sessions = [1]
+        self.args.prompt_tokens = [512]
+        self.args.tokens = 8
+        self.args.baseline_binary = self.args.binary
+        run_measurements(self.args)
+        receipt = json.loads((self.root / "results/leg/abba.json").read_text())
+        self.assertTrue(receipt["passed"])
+        self.assertEqual(receipt["completed"], ["leg-A1", "leg-B1", "leg-B2", "leg-A2"])
+        for name in receipt["completed"]:
+            folder = self.root / "results" / name
+            self.assertEqual(json.loads((folder / "run.json").read_text())["args"]["deadline"], self.args.deadline)
+            measured = json.loads((folder / "decode-512-1-0.json").read_text())
+            self.assertEqual(measured["streams"][0]["token_ids"], list(range(8)))
+            self.assertTrue(json.loads((folder / "process-exit.json").read_text())["exit"] is not None)
 
     def test_rejected_completion_keeps_its_request_and_raw_reply(self):
         for case in ("short-generation", "short-prompt", "empty", "application-error", "http-error", "bad-json", "short-body"):
@@ -335,6 +379,67 @@ class ServedContract(unittest.TestCase):
                     {"error": "request failed"}):
             with self.assertRaises(ValueError):
                 validate_response(bad, 384, 32768)
+
+
+class DecodeWindows(unittest.TestCase):
+    def test_dp_measurement_uses_shared_four_card_recipe(self):
+        args = SimpleNamespace(recipe="dp-4", profile="", ubatch=512, slots=40, context=40*442368,
+                               adaptive=0.18, binary="/bin", model="/model.gguf", port=8102, depth=2,
+                               kv_host=True, host_budget_mib=300000)
+        command = server_command(args)
+        self.assertEqual(command[command.index("-sm")+1], "dp")
+        self.assertEqual(command[command.index("-ts")+1], "1,1,1,1")
+        self.assertIn("--backend-sampling", command)
+        self.assertNotIn("--kv-unified", command)
+        args.kv_host = False
+        with self.assertRaises(ValueError):
+            server_command(args)
+        args.kv_host = True
+        args.profile = "sm120-balanced"
+        with self.assertRaises(ValueError):
+            server_command(args)
+
+    def test_common_interval_counts_tokens_in_bursts_and_excludes_prefill(self):
+        from measure import common_decode_window
+        rows = [dict(slot=0, bursts=[dict(at=1., tokens=[1, 2]), dict(at=3., tokens=[3]), dict(at=5., tokens=[4, 5])]),
+                dict(slot=1, bursts=[dict(at=2., tokens=[6]), dict(at=3., tokens=[7, 8]), dict(at=6., tokens=[9, 10])])]
+        result = common_decode_window(rows)
+        self.assertTrue(result["available"])
+        self.assertEqual((result["start"], result["end"]), (2., 5.))
+        self.assertEqual(result["tokens"], 5)
+        self.assertAlmostEqual(result["tokens_per_second"], 5/3)
+        self.assertEqual([r["tokens"] for r in result["streams"]], [3, 2])
+
+    def test_no_shared_decode_interval_is_explicit(self):
+        from measure import common_decode_window
+        rows = [dict(slot=0, bursts=[dict(at=1., tokens=[1]), dict(at=2., tokens=[2])]),
+                dict(slot=1, bursts=[dict(at=3., tokens=[1]), dict(at=4., tokens=[2])])]
+        self.assertEqual(common_decode_window(rows)["reason"], "no_common_decode_interval")
+        self.assertIsNone(common_decode_window(rows)["tokens_per_second"])
+
+    def test_stream_preserves_burst_ids_and_terminal_counters(self):
+        from measure import read_completion_stream
+        events = [dict(content="a", tokens=[7], stop=False),
+                  dict(content="", tokens=[8, 9], stop=False),
+                  dict(content="b", tokens=[10], stop=False),
+                  dict(content="", tokens=[], stop=True, timings=dict(prompt_n=512, predicted_n=4, draft_n=3, draft_n_accepted=1))]
+        clock = iter([1., 2., 3., 4.])
+        lines = [b"data: " + json.dumps(e).encode() + b"\n" for e in events]
+        result = read_completion_stream(lines, 4, 512, clock=lambda: next(clock))
+        self.assertEqual(result["token_ids"], [7, 8, 9, 10])
+        self.assertEqual([len(b["tokens"]) for b in result["bursts"]], [1, 2, 1])
+        self.assertEqual(result["response"]["content"], "ab")
+        self.assertEqual(result["response"]["timings"]["draft_n"], 3)
+        for broken in (lines[:-1], lines[:1] + lines[-1:], [b'data: {"error":"failed"}\n']):
+            with self.assertRaises(ValueError):
+                read_completion_stream(broken, 4, 512)
+
+    def test_bad_or_backwards_bursts_are_rejected(self):
+        from measure import common_decode_window
+        for bursts in ([dict(at=2., tokens=[1]), dict(at=1., tokens=[2])],
+                       [dict(at=float("nan"), tokens=[1])]):
+            with self.assertRaises(ValueError):
+                common_decode_window([dict(slot=0, bursts=bursts)])
 
 
 if __name__ == "__main__":
