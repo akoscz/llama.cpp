@@ -3032,7 +3032,7 @@ void llama_context::graph_results_reset() {
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
-static void ubatch_prepare_reserve(
+static uint32_t ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
               uint32_t                                  n_outputs,
         const std::map<llama_seq_id, llama_sampler *> & samplers,
@@ -3087,6 +3087,8 @@ static void ubatch_prepare_reserve(
             ++n_outputs_set;
         }
     }
+
+    return n_outputs_set;
 }
 
 ggml_cgraph * llama_context::graph_reserve(
@@ -3108,12 +3110,11 @@ ggml_cgraph * llama_context::graph_reserve(
     // TODO: not sure if needed, might simplify in the future by removing this
     const auto save_n_outputs = this->n_outputs;
 
-    this->n_outputs = n_outputs;
-
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd(), model.n_seq_devices());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+    // Sampler limits can leave fewer output rows than a fused-op probe requests.
+    this->n_outputs = ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     auto * res = gf_res_reserve.get();
 
