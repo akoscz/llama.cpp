@@ -2018,6 +2018,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        logits_valid = true;
     }
 
     // extract embeddings
@@ -2442,6 +2443,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                logits_valid = true;
             }
         }
 
@@ -2662,6 +2664,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    logits_valid = false;
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2868,7 +2871,7 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        if (logits.size > 0 && logits_valid) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -2916,15 +2919,15 @@ void llama_context::output_reorder() {
             assert(sampling.probs_count.size() > 0);
             assert(sampling.candidates_count.size() > 0);
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.logits_count[i0], sampling.logits_count[i1]); ++k) {
                 std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.probs_count[i0], sampling.probs_count[i1]); ++k) {
                 std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.candidates_count[i0], sampling.candidates_count[i1]); ++k) {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
 

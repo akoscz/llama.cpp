@@ -415,7 +415,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_glm_ssm_a_proj  ("blk\\.\\d*\\.ssm_(f_a|g_a|norm)\\.weight");
     static const std::regex pattern_glm_ssm_b_proj  ("blk\\.\\d*\\.ssm_(f_b|g_b)\\.weight");
     static const std::regex pattern_glm_ssm_conv    ("blk\\.\\d*\\.ssm_conv1d_[qkv]\\.weight");
+    static const std::regex pattern_glm_ssm_qkv_conv("blk\\.\\d*\\.ssm_conv1d_qkv\\.weight");
     static const std::regex pattern_glm_indexer     ("blk\\.\\d*\\.indexer.*\\.(weight|bias)");
+
+    if (is_glm5next && std::regex_match(tensor_name, pattern_glm_ssm_qkv_conv)) {
+        const auto prefix = tensor_name.substr(0, tensor_name.find('.', 4) + 1);
+        const auto * q = ud->model->get_tensor((prefix + "ssm_conv1d_q.weight").c_str());
+        GGML_ASSERT(q);
+        auto split = llama_meta_device_get_split_state(q, userdata);
+        GGML_ASSERT(split.axis == GGML_BACKEND_SPLIT_AXIS_2 && split.n_segments == 1);
+        split.axis = GGML_BACKEND_SPLIT_AXIS_1;
+        split.nr[0] *= 3;
+        return split;
+    }
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -2058,15 +2070,95 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (!ml.no_alloc) {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
+        }
+    }
+
+    struct prepared_weight {
+        ggml_tensor * dst;
+        std::vector<ggml_tensor *> src;
+        bool transpose;
+    };
+    std::vector<prepared_weight> prepared;
+    if (arch == LLM_ARCH_GLM5NEXT && !ggml_env_switch("LLAMA_GLM5NEXT_PREPACK_LEGACY")) {
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr> contexts;
+        const auto add = [&](const std::vector<ggml_tensor *> & src, bool transpose, const std::string & name) {
+            auto * first = src.front();
+            GGML_ASSERT(ggml_is_contiguous(first) && ggml_blck_size(first->type) == 1);
+            auto buft = ggml_backend_buffer_get_type(first->buffer);
+            auto & ctx = contexts[buft];
+            if (!ctx) {
+                ctx.reset(ggml_init({2*layers.size()*ggml_tensor_overhead(), nullptr, true}));
+                if (!ctx) { throw std::runtime_error("failed to allocate prepared GLM weight context"); }
+            }
+            const int64_t ne0 = transpose ? first->ne[1] : first->ne[0];
+            const int64_t ne1 = transpose ? first->ne[0] : 3*ggml_nelements(first)/first->ne[0];
+            auto * dst = ggml_new_tensor_2d(ctx.get(), first->type, ne0, ne1);
+            ggml_set_name(dst, name.c_str());
+            prepared.push_back({dst, src, transpose});
+            return dst;
+        };
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & layer = layers[il];
+            const auto prefix = "blk." + std::to_string(il) + ".";
+            if (layer.ssm_q_conv && layer.ssm_k_conv && layer.ssm_v_conv) {
+                for (auto * t : {layer.ssm_k_conv, layer.ssm_v_conv}) {
+                    GGML_ASSERT(t->type == layer.ssm_q_conv->type && ggml_are_same_shape(t, layer.ssm_q_conv));
+                }
+                layer.ssm_qkv_conv = add({layer.ssm_q_conv, layer.ssm_k_conv, layer.ssm_v_conv}, false, prefix + "ssm_conv1d_qkv.weight");
+            }
+            if (layer.indexer_comp_ape) {
+                GGML_ASSERT(layer.indexer_comp_ape->ne[2] == 1 && layer.indexer_comp_ape->ne[3] == 1);
+                layer.indexer_comp_ape_transposed = add({layer.indexer_comp_ape}, true, prefix + "indexer_compressor_ape_transposed.weight");
+            }
+        }
+        for (auto & [buft, ctx] : contexts) {
+            ggml_backend_buffer_ptr buffer(ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
+                    ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buffer) { throw std::runtime_error("failed to allocate prepared GLM weights"); }
+            if (ml.no_alloc) {
+                for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) { t->buffer = buffer.get(); }
+            }
+            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            LLAMA_LOG_INFO("%s: %12s prepared GLM weights = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
+                    (ml.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) :
+                     ggml_backend_buffer_get_size(buffer.get())) / 1024.0 / 1024.0);
+            std::vector<ggml_backend_buffer_ptr> buffers;
+            buffers.emplace_back(std::move(buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+        }
+    }
+
     if (ml.no_alloc) {
         return true;
     }
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
+    for (const auto & weight : prepared) {
+        std::vector<uint8_t> data(ggml_nbytes(weight.dst));
+        if (weight.transpose) {
+            const auto * src = weight.src.front();
+            std::vector<uint8_t> original(ggml_nbytes(src));
+            ggml_backend_tensor_get(src, original.data(), 0, original.size());
+            const size_t element = ggml_element_size(src);
+            for (int64_t y = 0; y < src->ne[1]; ++y) {
+                for (int64_t x = 0; x < src->ne[0]; ++x) {
+                    memcpy(data.data() + (x*src->ne[1] + y)*element, original.data() + (y*src->ne[0] + x)*element, element);
+                }
+            }
+        } else {
+            size_t offset = 0;
+            for (const auto * src : weight.src) {
+                GGML_ASSERT(ggml_is_contiguous(src));
+                ggml_backend_tensor_get(src, data.data() + offset, 0, ggml_nbytes(src));
+                offset += ggml_nbytes(src);
+            }
+            GGML_ASSERT(offset == data.size());
         }
+        ggml_backend_tensor_set(weight.dst, data.data(), 0, data.size());
     }
 
     if (use_mmap_buffer) {

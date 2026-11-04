@@ -513,6 +513,7 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_wkv   = nullptr;
     struct ggml_tensor * indexer_comp_wgate = nullptr;
     struct ggml_tensor * indexer_comp_ape   = nullptr;
+    struct ggml_tensor * indexer_comp_ape_transposed = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
     // cogvlm
@@ -533,6 +534,7 @@ struct llama_layer {
     struct ggml_tensor * ssm_q_conv = nullptr;
     struct ggml_tensor * ssm_k_conv = nullptr;
     struct ggml_tensor * ssm_v_conv = nullptr;
+    struct ggml_tensor * ssm_qkv_conv = nullptr;
     struct ggml_tensor * ssm_f_a    = nullptr;
     struct ggml_tensor * ssm_f_b    = nullptr;
     struct ggml_tensor * ssm_beta   = nullptr;
