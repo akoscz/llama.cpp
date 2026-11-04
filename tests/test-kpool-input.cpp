@@ -1564,6 +1564,16 @@ static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
         }, nullptr);
     auto * backend = ggml_backend_dev_init(meta, nullptr);
     const auto buft = ggml_backend_get_default_buffer_type(backend);
+    static bool (*copy_async)(ggml_backend_t, ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+    static size_t copy_calls, direct_copies;
+    copy_async = backend->iface.cpy_tensor_async;
+    const auto observe_copy = [](ggml_backend_t src_backend, ggml_backend_t dst_backend,
+            const ggml_tensor * src, ggml_tensor * dst) {
+        ++copy_calls;
+        const bool direct = copy_async(src_backend, dst_backend, src, dst);
+        direct_copies += direct;
+        return direct;
+    };
     llama_kpool_draft draft;
     std::shared_ptr<llama_kpool_backend_tensor> previous;
     for (int round = 0; round < 12; ++round) {
@@ -1586,9 +1596,14 @@ static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
         }
         ggml_backend_tensor_set(source, expected.data(), 0, ggml_nbytes(source));
         draft.advance(0);
+        copy_calls = direct_copies = 0;
+        backend->iface.cpy_tensor_async = observe_copy;
         for (size_t i = 0; i < seqs.size(); ++i) {
             draft.capture_backend(seqs[i], 100, 512, source, i, backend, slots, devices);
         }
+        backend->iface.cpy_tensor_async = copy_async;
+        CHECK(copy_calls == seqs.size(), "captured %zu rows but observed %zu backend copies", seqs.size(), copy_calls);
+        CHECK(direct_copies == copy_calls, "%zu production captures fell back to host staging", copy_calls - direct_copies);
         const auto captured = draft.backend_row(seqs.front());
         int64_t slot = seqs.front()/devices;
         for (uint32_t d = 0; d < uint32_t(seqs.front())%devices; ++d) { slot += (slots + devices - 1 - d)/devices; }

@@ -28,6 +28,7 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -179,11 +180,15 @@ struct server_rig {
 
     // the target's logits of the last batch's output rows, in batch order
     std::vector<float> logits;
+    size_t selection_reads = 0;
+    std::vector<bool> selection_seqs;
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
                ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
-               bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ) : n_max(n_max) {
+               bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ,
+               bool observe_selections = false) : n_max(n_max) {
         seqs.resize(n_seq);
+        selection_seqs.resize(n_seq);
         params.n_ctx      = 8192;
         params.cache_type_idx = type_idx;
         params.n_parallel = n_seq;
@@ -214,6 +219,22 @@ struct server_rig {
             throw std::runtime_error("failed to create the target context");
         }
         common_params params_dft = common_base_params_to_speculative(params);
+        if (observe_selections) {
+            params_dft.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+                auto & rig = *static_cast<server_rig *>(data);
+                if (!ask || t->op != GGML_OP_GET_ROWS || !rig.init) { return false; }
+                auto * draft = static_cast<llama_memory_hybrid *>(llama_get_memory(rig.init->context()))->get_mtp_index();
+                for (size_t seq = 0; seq < rig.seqs.size(); ++seq) {
+                    const auto bank = draft->backend_row(seq);
+                    if (bank && t->src[0] == bank->tensor && bank->tensor->ne[1] == (int64_t) rig.seqs.size()) {
+                        ++rig.selection_reads;
+                        rig.selection_seqs[seq] = true;
+                    }
+                }
+                return false;
+            };
+            params_dft.cb_eval_user_data = this;
+        }
         init = common_speculative_init_from_params(params_dft, model, tgt.get());
         if (!init->context()) {
             throw std::runtime_error("failed to create the MTP context");
@@ -1635,7 +1656,7 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     if (!q8_cache && (!test_sampler_reserve(split.get()) || !test_sampler_graphs(split.get()) || !test_sampler_reorder(split.get()))) { return false; }
     set_env("LLAMA_MTP_DEVICE_H", "1");
     server_rig ref(baseline.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
-    server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
+    server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache, N_SEQ, true);
     set_env("LLAMA_MTP_DEVICE_H", nullptr);
     std::mt19937 rng_ref(5), rng_dp(5);
     for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
@@ -1645,9 +1666,14 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     size_t greedy_accepted = 0;
     size_t forced_counts[N_MAX + 1] = {};
     for (int round = 0; round < 16; ++round) {
+        const bool host_selection = round >= 12;
+        set_env("LLAMA_KPOOL_SELECTION_HOST_LEGACY", host_selection ? "1" : nullptr);
+        const size_t previous_reads = dp.selection_reads;
         const std::vector<llama_seq_id> order = round % 2 ? std::vector<llama_seq_id>{1, 2, 0} : std::vector<llama_seq_id>{2, 0, 1};
         ref.draft(order);
         dp.draft(order);
+        set_env("LLAMA_KPOOL_SELECTION_HOST_LEGACY", nullptr);
+        if (host_selection && dp.selection_reads != previous_reads) { return fail("host selection control read the device bank"); }
         std::vector<llama_pos> before;
         for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
             before.push_back(ref.seqs[seq].n_past);
@@ -1697,8 +1723,12 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
         }
     }
     for (auto count : forced_counts) { if (count == 0) { return fail("DP acceptance coverage is incomplete"); } }
+    if (!dp.selection_reads || !std::all_of(dp.selection_seqs.begin(), dp.selection_seqs.end(), [](bool seen) { return seen; })) {
+        return fail("DP MTP did not read every sequence's persistent selection bank");
+    }
     printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
         devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
+    printf("DP MTP selection bank: %zu observed sequence reads; host control used none\n", dp.selection_reads);
     return q8_cache || test_graph_shapes(split.get());
 }
 
