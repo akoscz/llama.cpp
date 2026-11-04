@@ -369,3 +369,31 @@ def test_consumed_restore_does_not_inflate_future_token_evictions():
     complete(c)
     # A and B still fit beside one another, so B must not be evicted by A's already-consumed tokens.
     assert complete(b)["cache_n"] > 0
+
+
+def test_admission_eviction_preserves_recent_snapshot():
+    global server
+    server.cache_ram = 2
+    server.n_slots = 1
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompts = [
+        "alpha beta gamma delta " * 70,
+        "red green blue " * 60,
+        "north south east west " * 40,
+        "orange purple silver gold " * 50,
+        "one two three four " * 60,
+        "silver bronze copper iron " * 50,
+        "black white gray " * 40,
+    ]
+    for prompt in prompts:
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "n_predict": 1})
+        assert res.status_code == 200
+    assert "cache_evict" in log.drain(), log.path
+
+    # The previous prompt is no longer resident. It must survive bounded update() eviction in RAM.
+    res = server.make_request("POST", "/completion", data={"prompt": prompts[-2], "cache_prompt": True, "n_predict": 1})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0

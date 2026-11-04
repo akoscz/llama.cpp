@@ -1,7 +1,43 @@
 #include "server-common.h"
+#define private public
+#include "server-task.h"
+#undef private
 #include <cstdio>
 
+static bool test_update_eviction_accounting() {
+    const auto insert = [](server_prompt_cache & cache, llama_token token) {
+        server_prompt_cache_state state;
+        state.prompt.tokens.push_back(token);
+        state.data.main.assign(100, 0);
+        cache.insert_state(std::move(state));
+    };
+
+    for (const bool bytes : {true, false}) {
+        server_prompt_cache cache(0, 0);
+        cache.limit_size = bytes ? 250 : 0;
+        cache.limit_tokens = bytes ? 0 : 2;
+        insert(cache, 1);
+        insert(cache, 2);
+        insert(cache, 3);
+        const auto * protect = &cache.states.front();
+        cache.update(protect);
+        if (cache.states.size() != 2 || cache.size() != 200 || cache.n_tokens() != 2) {
+            fprintf(stderr, "FAIL: %s update eviction left %zu states, %zu bytes, %zu tokens\n",
+                bytes ? "byte" : "token", cache.states.size(), cache.size(), cache.n_tokens());
+            return false;
+        }
+        if (cache.states.front().prompt.tokens.get_tokens().front() != 1 ||
+                cache.states.back().prompt.tokens.get_tokens().front() != 3) {
+            fprintf(stderr, "FAIL: %s update eviction did not retain the protected and newest states\n", bytes ? "byte" : "token");
+            return false;
+        }
+    }
+    return true;
+}
+
 int main() {
+    if (!test_update_eviction_accounting()) { return 5; }
+
     server_slot_stats stats;
     // Nine delivered decode tokens over three verification rounds. The first
     // output belongs to prompt timing and is excluded from decode throughput.

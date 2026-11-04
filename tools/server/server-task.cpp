@@ -1962,7 +1962,7 @@ void server_prompt_cache::update(const server_prompt_cache_state * protect) {
                 continue;
             }
             SRV_WRN("cache_evict reason=byte_limit tokens=%d bytes=%zu\n", it->prompt.n_tokens(), it->size());
-            it = states.erase(it);
+            it = erase_state(it);
         }
     }
 
@@ -1977,7 +1977,7 @@ void server_prompt_cache::update(const server_prompt_cache_state * protect) {
             }
             SRV_WRN("cache_evict reason=token_limit tokens=%d bytes=%zu limit=%zu\n",
                     it->prompt.n_tokens(), it->size(), limit_tokens);
-            it = states.erase(it);
+            it = erase_state(it);
         }
     }
 
