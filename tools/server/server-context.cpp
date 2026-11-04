@@ -2579,7 +2579,7 @@ private:
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
 
-        // populate res.probs_output
+        // Streaming probabilities cover the latest token, even if UTF-8 buffering groups multiple IDs.
         if (slot.task->params.sampling.n_probs > 0) {
             res->prob_output = tkn; // copy the token probs
         }
