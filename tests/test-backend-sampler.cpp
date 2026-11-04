@@ -1790,7 +1790,7 @@ static void test_backend_cpu_mixed_batch(const test_params & params) {
 
         llama_set_sampler(test_ctx.ctx.get(), 0, sampler_chain.get());
 
-        if (!test_ctx.decode_token(3834, 0)) {
+        if (!test_ctx.decode_token(llama_vocab_bos(test_ctx.vocab), 0)) {
             GGML_ASSERT(false && "Failed to decode token");
         }
 
@@ -2697,6 +2697,62 @@ static void test_backend_verify_penalties(const test_params & params) {
     run_verify_penalties(split.get(), "-sm tensor");
 }
 
+static void test_sampling_row(const test_params & params) {
+    llama_sampler_ptr dist(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(dist.get(), llama_sampler_init_temp(0.8f));
+    llama_sampler_chain_add(dist.get(), llama_sampler_init_dist(88));
+    llama_sampler_ptr top_k(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(top_k.get(), llama_sampler_init_top_k(8));
+    std::vector<llama_sampler_seq_config> configs = {{ 0, dist.get() }, { 1, top_k.get() }};
+    test_context test_ctx(params, configs, 3, 3, 2);
+    auto * ctx = test_ctx.ctx.get();
+    const auto * vocab = test_ctx.vocab;
+    std::vector<float> previous_logits;
+
+    for (int round = 0; round < 2; ++round) {
+        llama_batch batch = llama_batch_init(6, 0, 1);
+        for (int pos = 0; pos < 2; ++pos) {
+            for (llama_seq_id seq : { 2, 0, 1 }) {
+                const llama_token token = (pos + seq + round) % 2 ? llama_vocab_bos(vocab) : llama_vocab_eos(vocab);
+                common_batch_add(batch, token, 2*round + pos, { seq }, pos == 1);
+            }
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_batch_free(batch);
+
+        for (int i = 0; i < 3; ++i) {
+            const auto row = llama_get_sampling_row_ith(ctx, 3 + i);
+            const auto reverse = llama_get_sampling_row_ith(ctx, -3 + i);
+            GGML_ASSERT(row.token == llama_get_sampled_token_ith(ctx, 3 + i));
+            GGML_ASSERT(row.sampled_logits == llama_get_sampled_logits_ith(ctx, 3 + i));
+            GGML_ASSERT(row.sampled_probs == llama_get_sampled_probs_ith(ctx, 3 + i));
+            GGML_ASSERT(row.candidates == llama_get_sampled_candidates_ith(ctx, 3 + i));
+            GGML_ASSERT(row.n_sampled_logits == llama_get_sampled_logits_count_ith(ctx, 3 + i));
+            GGML_ASSERT(row.n_sampled_probs == llama_get_sampled_probs_count_ith(ctx, 3 + i));
+            GGML_ASSERT(row.n_candidates == llama_get_sampled_candidates_count_ith(ctx, 3 + i));
+            GGML_ASSERT(row.token == reverse.token && row.logits == reverse.logits);
+            GGML_ASSERT(row.sampled_logits == reverse.sampled_logits && row.sampled_probs == reverse.sampled_probs);
+            GGML_ASSERT(row.candidates == reverse.candidates);
+
+            if (i == 0) {
+                GGML_ASSERT(row.token == LLAMA_TOKEN_NULL && !row.sampled_logits && !row.sampled_probs);
+                GGML_ASSERT(row.logits == llama_get_logits_ith(ctx, 3 + i));
+                std::vector<float> logits(row.logits, row.logits + test_ctx.n_vocab);
+                GGML_ASSERT(previous_logits.empty() || logits != previous_logits);
+                previous_logits = std::move(logits);
+            } else if (i == 1) {
+                GGML_ASSERT(row.token != LLAMA_TOKEN_NULL && row.sampled_probs);
+                llama_sampler_accept(dist.get(), row.token);
+            } else {
+                GGML_ASSERT(row.token == LLAMA_TOKEN_NULL && row.sampled_logits && !row.sampled_probs);
+                GGML_ASSERT(row.n_sampled_logits == 8);
+            }
+        }
+    }
+
+    printf("sampling row test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2704,6 +2760,7 @@ struct backend_test_case {
 };
 
 static const backend_test_case BACKEND_TESTS[] = {
+    { "sampling_row",    test_sampling_row,                    true  },
     { "greedy",          test_backend_greedy_sampling,         true  },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },

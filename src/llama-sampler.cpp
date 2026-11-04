@@ -928,10 +928,11 @@ bool llama_sampler_backend_has_inputs(const llama_sampler * sampler) {
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
-    const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
-    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    const auto row = llama_get_sampling_row_ith(ctx, idx);
+    const llama_token   sampled_token  = row.token;
+    const float *       sampled_probs  = row.sampled_probs;
+    const float *       sampled_logits = row.sampled_logits;
+    const llama_token * sampled_ids    = row.candidates;
 
     // If a backend sampler has already sampled a token, return it.
     if (sampled_token != LLAMA_TOKEN_NULL) {
@@ -959,19 +960,19 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     auto & cur = *cur_ptr;
 
     if (sampled_probs) {
-        const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+        const uint32_t sampled_probs_count = row.n_sampled_probs;
         cur.resize(sampled_probs_count);
         for (uint32_t i = 0; i < sampled_probs_count; ++i) {
             cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
         }
     } else if (sampled_logits) {
-        const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+        const uint32_t sampled_logits_count = row.n_sampled_logits;
         cur.resize(sampled_logits_count);
         for (llama_token i = 0; i < (int)sampled_logits_count; i++) {
             cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
         }
     } else {
-        const auto * logits = llama_get_logits_ith(ctx, idx);
+        const auto * logits = row.logits;
         GGML_ASSERT(logits != nullptr);
         cur.resize(n_vocab);
         for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
