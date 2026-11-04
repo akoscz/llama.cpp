@@ -572,6 +572,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `n_probs`: If greater than 0, the response also contains the probabilities of top N tokens for each generated token given the sampling settings. Note that for temperature < 0 the tokens are sampled greedily but token probabilities are still being calculated via a simple softmax of the logits without considering any other sampler settings. Default: `0`
 
+With streaming, probabilities describe only the latest token in a partial chunk. UTF-8 buffering can group several token IDs in one chunk, and an incomplete final character can leave IDs in the terminal chunk without probabilities. Do not pair streamed `tokens` and `completion_probabilities` by array index; use a non-streamed response when probabilities for every generated token are needed.
+
 `min_keep`: If greater than 0, force samplers to return N possible tokens at minimum. Default: `0`
 
 `t_max_predict_ms`: Set a time limit in milliseconds for the prediction (a.k.a. text-generation) phase. The timeout will trigger if the generation takes more than the specified time (measured since the first token was generated) and if a new-line character has already been generated. Useful for FIM applications. Default: `0`, which is disabled.

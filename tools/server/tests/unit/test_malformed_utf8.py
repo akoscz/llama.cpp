@@ -55,3 +55,29 @@ def test_malformed_utf8_output(token: int, n_predict: int, n_malformed: int, tai
             elif chunk.get("choices"):
                 text += chunk["choices"][0]["delta"].get("content") or ""
         assert text in allowed, path
+
+
+@pytest.mark.parametrize("tokens,grammar", [
+    ([LEAD, CONT, 163], 'root ::= "\u4f60"'),
+    ([LEAD, LEAD, LEAD], None),
+    ([LEAD], None),
+], ids=["complete-character", "replaced-leads", "incomplete-tail"])
+@pytest.mark.parametrize("return_tokens", [False, True])
+def test_stream_preserves_buffered_token_ids(tokens: list[int], grammar: str | None, return_tokens: bool):
+    server.start()
+    payload = {
+        "prompt": "Once upon a time", "id_slot": 0, "n_predict": len(tokens),
+        "temperature": 0, "ignore_eos": True, "logit_bias": [[token, 100] for token in set(tokens)],
+    }
+    if grammar:
+        payload["grammar"] = grammar
+    reference = server.make_request("POST", "/completion", data={**payload, "return_tokens": True})
+    assert reference.status_code == 200, reference.body
+    assert reference.body["tokens"] == tokens
+    for _ in range(2):
+        chunks = list(server.make_stream_request("POST", "/completion", data={
+            **payload, "stream": True, "return_tokens": return_tokens,
+        }))
+        assert chunks[-1]["stop"] is True
+        assert chunks[-1]["tokens_predicted"] == len(tokens)
+        assert [token for chunk in chunks for token in chunk.get("tokens", [])] == tokens
