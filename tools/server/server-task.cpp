@@ -1964,6 +1964,7 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         total_tokens -= it->prompt.n_tokens();
         prompt = std::move(it->prompt);
         states.erase(it);
+        ++revision;
     } else {
         // The slot keeps only the shared prefix; the conversation the snapshot belongs to stays recoverable.
         prompt = it->prompt.clone();

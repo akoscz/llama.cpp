@@ -392,6 +392,38 @@ def test_consumed_restore_does_not_inflate_future_token_evictions():
     assert complete(b)["cache_n"] > 0
 
 
+def test_consumed_restore_retries_idle_cache_refusal():
+    server.cache_ram = -1
+    server.n_ctx = 512
+    server.n_slots = 3
+    server.start()
+    log = LogReader(server.log_path)
+
+    def complete(tokens, slot):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": tokens, "id_slot": slot, "cache_prompt": True, "n_predict": 1,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]
+
+    # Two RAM snapshots nearly fill the 512-token budget; each fits beside the idle resident in KV.
+    complete([12] * 300, 2)
+    complete([11] * 200, 1)
+    complete([13] * 200, 0)
+    log.drain()
+    complete([14], 2)
+    refused = log.drain()
+    assert "cache_idle action=retain reason=no_space" in refused
+
+    # Restoring into empty slot 1 consumes its snapshot. Slot 0 is checked before slot 2 can change the cache.
+    restored = complete([11] * 200 + [15], 1)
+    assert restored["cache_n"] >= 199
+    retried = log.wait_for("cache_save reason=saved slot=0")
+    assert "consumed=1" in retried
+    assert "cache_save reason=saved slot=0" in retried
+    assert "cache_save reason=unchanged_refusal slot=0" not in retried
+
+
 def test_admission_eviction_preserves_recent_snapshot():
     global server
     server.cache_ram = 2
