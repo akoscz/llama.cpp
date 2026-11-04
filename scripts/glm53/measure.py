@@ -29,8 +29,15 @@ def completion_payload(prompt, tokens, slot):
                 ignore_eos=True, cache_prompt=False)
 
 def server_command(args):
+    threads = []
+    for flag in ("threads", "threads_batch"):
+        value = getattr(args, flag, None)
+        if value is not None:
+            if value < 1:
+                raise ValueError("thread counts must be positive")
+            threads += ["--" + flag.replace("_", "-"), str(value)]
     if getattr(args, "recipe", "tensor-2") == "dp-4":
-        return dp_plan(args)[0]
+        return dp_plan(args)[0] + threads
     argv = [str(Path(args.binary) / "llama-server"), "-m", str(args.model), "-ngl", "99",
             "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on", "-ctk", "q8_0",
             "-ctv", "q8_0", "-ctki", "q8_0", "-b", "4096", "-ub", str(args.ubatch),
@@ -39,7 +46,7 @@ def server_command(args):
             "--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.depth),
             "--spec-draft-mtp-vocab", str(Path(args.fixtures) / "glm-mtp-public-98304.i32"),
             "--spec-draft-mtp-adaptive", str(args.adaptive)]
-    return argv + (["--glm53-profile", args.profile] if args.profile else [])
+    return argv + (["--glm53-profile", args.profile] if args.profile else []) + threads
 
 
 def dp_plan(args):
@@ -545,6 +552,8 @@ def main():
     parser.add_argument("--sampling", choices=("served",), default="served")
     parser.add_argument("--tokens", type=int, default=384)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--threads", type=int)
+    parser.add_argument("--threads-batch", type=int)
     args = parser.parse_args()
     if args.mode == "scaling" and (args.tokens < 2 or args.repeats < 1 or
             any(s < 1 or s > args.slots for s in args.sessions) or any(t <= 128 for t in args.prompt_tokens)):
