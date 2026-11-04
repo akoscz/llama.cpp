@@ -45,7 +45,8 @@ public:
     bool active() const { return step >= 0; }
     uint64_t generation() const { return epoch; }
     void capture(llama_seq_id seq, llama_pos pos, int64_t n_kv, const std::vector<int32_t> & cells);
-    void capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv, ggml_tensor * source, int64_t row, ggml_backend_t backend = nullptr);
+    void capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv, ggml_tensor * source, int64_t row,
+            ggml_backend_t backend = nullptr, uint32_t slots = 1, uint32_t devices = 1);
     std::shared_ptr<llama_kpool_backend_tensor> backend_row(llama_seq_id seq) const;
     bool can_reuse(const llama_ubatch & ubatch, int64_t n_kv, int64_t width, uint32_t kpool) const;
     void copy(const llama_ubatch & ubatch, int32_t * dst) const;
@@ -53,9 +54,11 @@ private:
     struct row {
         llama_pos pos; int32_t step; int64_t n_kv; std::vector<int32_t> cells;
         std::shared_ptr<llama_kpool_backend_tensor> backend;
+        size_t offset = 0; // I32 elements in the bank's canonical layout
         int64_t width() const { return backend ? backend->tensor->ne[0] : (int64_t) cells.size(); }
     };
     std::map<llama_seq_id, std::shared_ptr<llama_kpool_backend_tensor>> stores;
+    std::shared_ptr<llama_kpool_backend_tensor> bank;
     int32_t step = -1;
     uint64_t epoch = 0;
     std::map<llama_seq_id, row> rows;
@@ -341,6 +344,7 @@ public:
     bool reuse_only = false;
     std::vector<std::shared_ptr<llama_kpool_backend_tensor>> draft_rows;
     std::vector<llama_seq_id> draft_seqs;
+    ggml_tensor * draft_ids = nullptr; // device-local sequence slots in the selection bank
 
     llama_kpool_draft * draft = nullptr;
     ggml_tensor * draft_top_k = nullptr; // retained selection in the current batch's sequence order

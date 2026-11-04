@@ -1564,8 +1564,13 @@ static bool test_sampler_reserve(llama_model * model) {
 
 static bool test_prepared_weights(llama_model *) {
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    for (const auto mode : {LLAMA_SPLIT_MODE_LAYER, LLAMA_SPLIT_MODE_TENSOR, LLAMA_SPLIT_MODE_DATA}) {
-        const std::vector<ggml_backend_dev_t> devices(mode == LLAMA_SPLIT_MODE_LAYER ? 1 : 4, cpu);
+    const std::pair<llama_split_mode, size_t> configs[] = {
+        {LLAMA_SPLIT_MODE_LAYER, 1}, {LLAMA_SPLIT_MODE_TENSOR, 2}, {LLAMA_SPLIT_MODE_TENSOR, 4},
+        {LLAMA_SPLIT_MODE_DATA, 2}, {LLAMA_SPLIT_MODE_DATA, 4},
+    };
+    for (const auto & config : configs) {
+        const auto mode = config.first;
+        const std::vector<ggml_backend_dev_t> devices(config.second, cpu);
         set_env("LLAMA_GLM5NEXT_PREPACK_LEGACY", "1");
         auto legacy = glm_model(1234, devices, mode);
         auto legacy_estimate = glm_model(1234, devices, mode, true);
@@ -1616,7 +1621,8 @@ static bool test_prepared_weights(llama_model *) {
                 }
             }
         }
-        printf("prepared weights mode %d: exact prefill, draft and verify parity; memory %zu bytes\n", int(mode), bytes(*prepared));
+        printf("prepared weights mode %d, %zu ranks: exact prefill, draft and verify parity; memory %zu bytes\n",
+                int(mode), devices.size(), bytes(*prepared));
     }
     return true;
 }

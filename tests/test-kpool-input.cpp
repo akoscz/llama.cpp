@@ -29,6 +29,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1554,6 +1555,98 @@ static void run_resident_patches(std::mt19937 & rng) {
     printf("resident patches: %llu writes, %llu actual callback bytes\n", (unsigned long long) calls, (unsigned long long) bytes);
 }
 
+static void run_draft_bank() {
+    constexpr uint32_t devices = 4, slots = 9;
+    std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(resident_test_backend()));
+    auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
+        [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    llama_kpool_draft draft;
+    std::shared_ptr<llama_kpool_backend_tensor> previous;
+    for (int round = 0; round < 12; ++round) {
+        const int width = round < 6 ? 8 : 12;
+        std::vector<llama_seq_id> seqs;
+        std::vector<int64_t> counts(devices, 0);
+        for (uint32_t d = 0; d < devices; ++d) {
+            if (round%2 && d == 1) { continue; }
+            for (int s = slots - 1; s >= 0; --s) {
+                if (uint32_t(s)%devices == d && (s + round)%3 != 0) { seqs.push_back(s); ++counts[d]; }
+            }
+        }
+        auto * ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * source = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, width, 1, seqs.size());
+        ggml_backend_meta_split_input(source, 2, counts.data(), counts.size());
+        auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        std::vector<int32_t> expected(width*seqs.size());
+        for (size_t i = 0; i < seqs.size(); ++i) {
+            for (int k = 0; k < width; ++k) { expected[i*width + k] = 1000*seqs[i] + 100*round + k; }
+        }
+        ggml_backend_tensor_set(source, expected.data(), 0, ggml_nbytes(source));
+        draft.advance(0);
+        for (size_t i = 0; i < seqs.size(); ++i) {
+            draft.capture_backend(seqs[i], 100, 512, source, i, backend, slots, devices);
+        }
+        const auto captured = draft.backend_row(seqs.front());
+        int64_t slot = seqs.front()/devices;
+        for (uint32_t d = 0; d < uint32_t(seqs.front())%devices; ++d) { slot += (slots + devices - 1 - d)/devices; }
+        auto * src_view = ggml_view_1d(ctx, source, width, 0);
+        auto * dst_view = ggml_view_1d(ctx, captured->tensor, width, slot*width*sizeof(int32_t));
+        CHECK(ggml_backend_view_init(src_view) == GGML_STATUS_SUCCESS, "selection source view");
+        CHECK(ggml_backend_view_init(dst_view) == GGML_STATUS_SUCCESS, "selection destination view");
+        CHECK(backend->iface.cpy_tensor_async(backend, backend, src_view, dst_view), "owner copy fell back to host staging");
+        ggml_backend_synchronize(backend);
+        CHECK(captured->buffer->iface.cpy_tensor(captured->buffer, src_view, dst_view), "synchronous owner copy fell back to host staging");
+        const uint32_t other_owner = (uint32_t(seqs.front()) + 1)%devices;
+        int64_t other_slot = 0;
+        for (uint32_t d = 0; d < other_owner; ++d) { other_slot += (slots + devices - 1 - d)/devices; }
+        auto * wrong_owner = ggml_view_1d(ctx, captured->tensor, width, other_slot*width*sizeof(int32_t));
+        CHECK(ggml_backend_view_init(wrong_owner) == GGML_STATUS_SUCCESS, "different-owner view");
+        CHECK(!backend->iface.cpy_tensor_async(backend, backend, src_view, wrong_owner), "copy accepted different ownership");
+        ggml_backend_synchronize(backend);
+        ggml_backend_buffer_free(input);
+        ggml_free(ctx);
+        auto bank = draft.backend_row(seqs.front());
+        CHECK(bank && bank->tensor->ne[1] == slots, "DP selections did not enter the bank");
+        if (!bank) { break; }
+        if (previous && previous->tensor->ne[0] == width) { CHECK(bank == previous, "unchanged selection bank was reallocated"); }
+        CHECK(ggml_backend_buffer_get_size(bank->buffer) < ggml_nbytes(bank->tensor), "selection bank is mirrored");
+        previous = bank;
+        draft.advance(1);
+        ubatch_data ud;
+        for (const auto seq : seqs) { ud.add(seq, 101); }
+        CHECK(draft.can_reuse(*ud.get(), 512, width, 4), "DP selection could not be reused");
+        std::vector<int32_t> copied(expected.size());
+        draft.copy(*ud.get(), copied.data());
+        CHECK(copied == expected, "DP selection copy used the wrong sequence row");
+        ctx = ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqs.size());
+        ggml_backend_meta_split_input(ids, 0, counts.data(), counts.size());
+        input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        std::vector<int32_t> local_ids;
+        for (const auto seq : seqs) { local_ids.push_back(seq/devices); }
+        ggml_backend_tensor_set(ids, local_ids.data(), 0, ggml_nbytes(ids));
+        auto * selected = ggml_backend_meta_get_rows_local(ctx, bank->tensor, ids);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_set_output(selected);
+        ggml_build_forward_expand(graph, selected);
+        auto * alloc = ggml_gallocr_new(buft);
+        CHECK(ggml_gallocr_alloc_graph(alloc, graph), "selection bank graph allocation");
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "selection bank graph compute");
+        ggml_backend_tensor_get(selected, copied.data(), 0, ggml_nbytes(selected));
+        CHECK(copied == expected, "DP graph read the wrong sequence selection");
+        draft.clear();
+        CHECK(!draft.can_reuse(*ud.get(), 512, width, 4), "DP selection survived memory invalidation");
+        ggml_gallocr_free(alloc);
+        ggml_backend_buffer_free(input);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    printf("draft bank: owner-local copies and graph reads, changing batches and widths\n");
+}
+
 static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices) {
     constexpr int64_t capacity = 256, r = 4, np = capacity/r + 2, nd = 2;
     auto * cpu = resident_test_backend();
@@ -1701,6 +1794,7 @@ int main() {
     run_resident_bank(rng, 41, 4);
     run_direct_indices(rng);
     run_draft_rounds(rng);
+    run_draft_bank();
 
     run_shift_regroups();
     run_compress_chunks();

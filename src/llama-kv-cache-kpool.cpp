@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -1566,22 +1567,38 @@ std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_views::resident_bank(
 }
 
 void llama_kpool_draft::capture_backend(llama_seq_id seq, llama_pos pos, int64_t n_kv,
-        ggml_tensor * source, int64_t row_index, ggml_backend_t backend) {
+        ggml_tensor * source, int64_t row_index, ggml_backend_t backend, uint32_t slots, uint32_t devices) {
     if (!active()) return;
     GGML_ASSERT(source->type == GGML_TYPE_I32 && ggml_is_contiguous(source));
-    auto & store = stores[seq];
+    const int64_t width = source->ne[0];
     const auto buft = ggml_backend_buffer_get_type(source->buffer);
-    if (!store || store->tensor->ne[0] != source->ne[0] || ggml_backend_buffer_get_type(store->buffer) != buft) {
-        store = std::make_shared<llama_kpool_backend_tensor>(buft, source->ne[0]);
+    GGML_ASSERT(devices == 1 || ggml_backend_buft_is_meta(buft));
+    auto & store = devices > 1 ? bank : stores[seq];
+    if (!store || store->tensor->ne[0] != width || ggml_backend_buffer_get_type(store->buffer) != buft) {
+        store = std::make_shared<llama_kpool_backend_tensor>(buft, width, devices > 1 ? slots : 1, devices);
     }
-    ggml_context * ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
-    auto * view = ggml_view_1d(ctx, source, source->ne[0], row_index*source->ne[0]*sizeof(int32_t));
+    ggml_context * ctx = ggml_init({2*ggml_tensor_overhead(), nullptr, true});
+    auto * destination = store->tensor;
+    size_t offset = 0;
+    if (devices > 1) {
+        GGML_ASSERT(seq >= 0 && uint32_t(seq) < slots && store->tensor->ne[1] == slots);
+        const uint32_t owner = uint32_t(seq)%devices;
+        int64_t bank_slot = seq/devices;
+        for (uint32_t d = 0; d < owner; ++d) {
+            bank_slot += (slots + devices - 1 - d)/devices;
+        }
+        offset = bank_slot*width;
+        destination = ggml_view_1d(ctx, destination, width, offset*sizeof(int32_t));
+        GGML_ASSERT(ggml_backend_view_init(destination) == GGML_STATUS_SUCCESS);
+    }
+    GGML_ASSERT(row_index >= 0 && row_index < ggml_nrows(source));
+    auto * view = ggml_view_1d(ctx, source, width, row_index*width*sizeof(int32_t));
     GGML_ASSERT(ggml_backend_view_init(view) == GGML_STATUS_SUCCESS);
     // Copy before the source graph can reset, ordered on its producing backend.
-    if (backend) ggml_backend_tensor_copy_async(backend, backend, view, store->tensor);
-    else ggml_backend_tensor_copy(view, store->tensor);
+    if (backend) ggml_backend_tensor_copy_async(backend, backend, view, destination);
+    else ggml_backend_tensor_copy(view, destination);
     ggml_free(ctx);
-    rows[seq] = {pos, step, n_kv, {}, store};
+    rows[seq] = {pos, step, n_kv, {}, store, offset};
 }
 
 std::shared_ptr<llama_kpool_backend_tensor> llama_kpool_draft::backend_row(llama_seq_id seq) const {
@@ -1611,7 +1628,7 @@ void llama_kpool_draft::copy(const llama_ubatch & ubatch, int32_t * dst) const {
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         const auto & row = rows.at(ubatch.seq_id[i][0]);
         if (row.backend) {
-            ggml_backend_tensor_get(row.backend->tensor, dst, 0, row.width()*sizeof(int32_t));
+            ggml_backend_tensor_get(row.backend->tensor, dst, row.offset*sizeof(int32_t), row.width()*sizeof(int32_t));
             dst += row.width();
         } else {
             dst = std::copy(row.cells.begin(), row.cells.end(), dst);
@@ -1626,6 +1643,11 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
 
     if (draft_top_k) {
         GGML_ASSERT(draft && draft->can_reuse(*ubatch, mctx_attn->get_n_kv(), draft_top_k->ne[0], kpool));
+        if (draft_ids) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(draft_ids->buffer));
+            auto * ids = (int32_t *) draft_ids->data;
+            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) { ids[i] = ubatch->seq_id[i][0]/n_seq_devices; }
+        }
         if (draft_rows.empty()) {
             GGML_ASSERT(ggml_backend_buffer_is_host(draft_top_k->buffer));
             draft->copy(*ubatch, (int32_t *) draft_top_k->data);

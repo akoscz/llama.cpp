@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -4690,10 +4691,11 @@ void llama_context::mtp_index_capture() {
     if (!mtp_index.tensor) return;
     auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
     if (mtp_index.generation == draft->generation()) {
-        if (mtp_index.backend && cparams.n_seq_devices == 1 && !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
+        if (mtp_index.backend && (cparams.n_seq_devices == 1 || ggml_backend_is_meta(mtp_index.backend)) &&
+                !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
             for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
                 draft->capture_backend(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv,
-                        mtp_index.tensor, i, mtp_index.backend);
+                        mtp_index.tensor, i, mtp_index.backend, cparams.n_seq_max, cparams.n_seq_devices);
             }
         } else {
             const int64_t width = mtp_index.tensor->ne[0];
