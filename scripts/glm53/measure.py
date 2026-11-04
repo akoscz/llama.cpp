@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -29,6 +30,15 @@ def completion_payload(prompt, tokens, slot):
                 ignore_eos=True, cache_prompt=False)
 
 def server_command(args):
+    threads = []
+    for flag in ("threads", "threads_batch"):
+        value = getattr(args, flag, None)
+        if value is not None:
+            if value < 1:
+                raise ValueError("thread counts must be positive")
+            threads += ["--" + flag.replace("_", "-"), str(value)]
+    if getattr(args, "recipe", "tensor-2") == "dp-4":
+        return dp_plan(args)[0] + threads
     argv = [str(Path(args.binary) / "llama-server"), "-m", str(args.model), "-ngl", "99",
             "-sm", "tensor", "-ts", "1,1", "--jinja", "-fa", "on", "-ctk", "q8_0",
             "-ctv", "q8_0", "-ctki", "q8_0", "-b", "4096", "-ub", str(args.ubatch),
@@ -37,7 +47,22 @@ def server_command(args):
             "--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.depth),
             "--spec-draft-mtp-vocab", str(Path(args.fixtures) / "glm-mtp-public-98304.i32"),
             "--spec-draft-mtp-adaptive", str(args.adaptive)]
-    return argv + (["--glm53-profile", args.profile] if args.profile else [])
+    return argv + (["--glm53-profile", args.profile] if args.profile else []) + threads
+
+
+def dp_plan(args):
+    import serve
+    if args.profile or args.ubatch != 512 or args.context != args.slots*serve.DP_SLOT_CONTEXT or args.adaptive != 0.18:
+        raise ValueError("DP measurements require the documented private-cache recipe, ubatch 512 and adaptive 0.18")
+    argv = ["--profile", "dp-4", "--model", str(args.model), "--server", str(Path(args.binary)/"llama-server"),
+            "--port", str(args.port), "--slots", str(args.slots), "--mtp-depth", str(args.depth)]
+    if getattr(args, "kv_host", False):
+        argv += ["--kv-host"]
+    if getattr(args, "host_budget_mib", None) is not None:
+        argv += ["--host-budget-mib", str(args.host_budget_mib)]
+    if getattr(args, "mmproj", None):
+        argv += ["--mmproj", str(args.mmproj)]
+    return serve.make_plan(serve.arguments(argv))
 
 def validate_response(response, tokens, prompt_tokens=None):
     response = response if isinstance(response, dict) else {}
@@ -56,8 +81,9 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
 
 
-def retained_chunks(response, saved):
+def retained_chunks(response, saved, timeout):
     while True:
+        timeout()
         try:
             raw = response.read1(65536)
         except http.client.IncompleteRead as exc:
@@ -69,25 +95,86 @@ def retained_chunks(response, saved):
             remaining = getattr(response, "length", None)
             if remaining:
                 raise http.client.IncompleteRead(b"", remaining)
+            timeout()
             return
         saved.write(raw)
         saved.flush()
+        timeout()
         yield raw
 
 
-def retain_body(response, saved):
-    return b"".join(retained_chunks(response, saved))
+def retain_body(response, saved, timeout):
+    return b"".join(retained_chunks(response, saved, timeout))
 
 
-def retained_lines(response, saved):
+def retained_lines(response, saved, timeout):
     pending = b""
-    for chunk in retained_chunks(response, saved):
+    for chunk in retained_chunks(response, saved, timeout):
         pending += chunk
         while b"\n" in pending:
             line, pending = pending.split(b"\n", 1)
             yield line + b"\n"
     if pending:
         yield pending
+
+
+def read_completion_stream(lines, tokens, prompt_tokens=None, clock=time.monotonic, on_event=None):
+    """Native /completion stream. One event may deliver several MTP/UTF-8 tokens."""
+    bursts, ids, content, final = [], [], [], None
+    for line in lines:
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if data == b"[DONE]":
+            break
+        event = json.loads(data)
+        at = clock()
+        if on_event:
+            on_event(dict(at=at, event=event))
+        if not isinstance(event, dict) or "error" in event or final is not None:
+            raise ValueError("invalid, failed or duplicate completion stream event")
+        part = event.get("tokens", [])
+        if not isinstance(part, list) or any(type(t) is not int or t < 0 for t in part):
+            raise ValueError("stream did not return valid token IDs")
+        if not isinstance(event.get("content", ""), str):
+            raise ValueError("stream did not return text")
+        if part:
+            bursts.append(dict(at=at, tokens=part))
+            ids.extend(part)
+        content.append(event.get("content", ""))
+        if event.get("stop") is True:
+            final = event
+    if final is None or len(ids) != tokens:
+        raise ValueError(f"incomplete completion stream: terminal={final is not None}, token IDs={len(ids)}, expected={tokens}")
+    response = final | dict(content="".join(content), tokens=ids)
+    validate_response(response, tokens, prompt_tokens)
+    return dict(response=response, bursts=bursts, token_ids=ids)
+
+
+def common_decode_window(rows):
+    """Delivered tokens in (latest first burst, earliest last burst]; no interpolation across bursts."""
+    unavailable = dict(available=False, tokens_per_second=None, reason="no_common_decode_interval")
+    if not rows or any(not row["bursts"] for row in rows):
+        return unavailable
+    for row in rows:
+        previous = -math.inf
+        for burst in row["bursts"]:
+            at = burst["at"]
+            if not math.isfinite(at) or at < previous or not burst["tokens"]:
+                raise ValueError("invalid stream burst timeline")
+            previous = at
+    start = max(row["bursts"][0]["at"] for row in rows)
+    end = min(row["bursts"][-1]["at"] for row in rows)
+    if end <= start:
+        return unavailable | dict(start=start, end=end)
+    streams = []
+    for row in rows:
+        count = sum(len(b["tokens"]) for b in row["bursts"] if start < b["at"] <= end)
+        streams.append(dict(slot=row["slot"], tokens=count, tokens_per_second=count/(end-start)))
+    count = sum(s["tokens"] for s in streams)
+    return dict(available=True, start=start, end=end, seconds=end-start, tokens=count,
+                tokens_per_second=count/(end-start), streams=streams,
+                boundary="start exclusive, end inclusive; client receive times; whole bursts")
 
 
 def terminate(child):
@@ -111,6 +198,11 @@ class ServingLeg:
         self.env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0,1",
                         GGML_CUDA_ALLREDUCE="internal", GGML_CUDA_GRAPH_MAX="0",
                         LD_LIBRARY_PATH=f"{args.binary}:{args.root}/cuda-runtime")
+        self.cards = 4 if getattr(args, "recipe", "tensor-2") == "dp-4" else 2
+        if self.cards == 4:
+            import serve
+            self.env = serve.execution_environment(dp_plan(args)[1], self.env)
+            self.env["LD_LIBRARY_PATH"] = f"{args.binary}:{args.root}/cuda-runtime"
         if args.mode in ("capacity", "concurrency"):
             self.env["GGML_CUDA_MMVQ_Q8_SM120_CHECK"] = "1"
         if args.mode == "diagnostic":
@@ -130,6 +222,32 @@ class ServingLeg:
             return folder / f"{self.request_number:06d}.json"
 
     @contextlib.contextmanager
+    def response_deadline(self, response):
+        stream = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        # A chunked read can keep receiving framing bytes without returning. Interrupt the socket at the deadline.
+        connection = stream.fp.raw._sock
+        expired = threading.Event()
+        def expire():
+            expired.set()
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # The response may already have closed its socket.
+        timer = threading.Timer(self.timeout(math.inf), expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+            self.timeout()
+        except Exception as exc:
+            if expired.is_set():
+                raise TimeoutError("serving deadline reached") from exc
+            raise
+        finally:
+            timer.cancel()
+            timer.join()
+
+    @contextlib.contextmanager
     def capture_response(self, path, data=None, maximum=300, record=None, context=None):
         record = record or self.response_record()
         raw = record.with_suffix(".body")
@@ -143,11 +261,11 @@ class ServingLeg:
                 response = urllib.request.urlopen(req, timeout=self.timeout(maximum))
             except urllib.error.HTTPError as exc:
                 meta["status"] = exc.code
-                with exc, raw.open("wb") as saved:
-                    retain_body(exc, saved)
+                with exc, raw.open("wb") as saved, self.response_deadline(exc):
+                    retain_body(exc, saved, lambda: self.timeout(maximum))
                 raise
             meta["status"] = response.status
-            with response, raw.open("wb") as saved:
+            with response, raw.open("wb") as saved, self.response_deadline(response):
                 yield response, saved
         except Exception as exc:
             meta["error"] = f"{type(exc).__name__}: {exc}"
@@ -163,7 +281,7 @@ class ServingLeg:
 
     def request(self, path, data=None, maximum=300, record=None, context=None):
         with self.capture_response(path, data, maximum, record, context) as (response, saved):
-            return json.loads(retain_body(response, saved))
+            return json.loads(retain_body(response, saved, lambda: self.timeout(maximum)))
 
     def complete(self, prompt, tokens=384, slot=0, prompt_tokens=None, repeat=None):
         before = time.monotonic()
@@ -181,6 +299,40 @@ class ServingLeg:
         return dict(category=prompt["category"], elapsed=elapsed,
                     prompt_sha256=hashlib.sha256(raw).hexdigest(), request=payload, response=result,
                     response_record=str(record.relative_to(self.out)))
+
+    def complete_stream(self, prompt, tokens, slot=0, prompt_tokens=None, repeat=None):
+        payload = completion_payload(prompt["prompt"], tokens, slot) | dict(stream=True, return_tokens=True)
+        record = self.response_record()
+        started = time.monotonic()
+        with self.capture_response("/completion", payload, record=record,
+                                   context=dict(category=prompt["category"], repeat=repeat, slot=slot,
+                                                expected_tokens=tokens, expected_prompt_tokens=prompt_tokens)) as (response, saved):
+            with record.with_suffix(".events.jsonl").open("w") as events:
+                def keep_event(event):
+                    events.write(json.dumps(event, allow_nan=False) + "\n")
+                    events.flush()
+                result = read_completion_stream(retained_lines(response, saved, self.timeout), tokens, prompt_tokens, on_event=keep_event)
+        raw = prompt["prompt"].encode() if isinstance(prompt["prompt"], str) else json.dumps(prompt["prompt"]).encode()
+        result.update(slot=slot, request=payload, prompt_sha256=hashlib.sha256(raw).hexdigest(),
+                      started=started, ended=time.monotonic(), response_record=str(record.relative_to(self.out)))
+        result["owner_device"] = slot % self.cards if self.cards == 4 else None
+        write_json(record.with_suffix(".stream.json"), result)
+        return result
+
+    def decode_group(self, prompt, tokens, slots, prompt_tokens=None, repeat=None):
+        slots = list(slots)
+        if not slots or len(set(slots)) != len(slots) or any(type(s) is not int or s < 0 or s >= self.args.slots for s in slots):
+            raise ValueError("decode group needs distinct configured slots")
+        barrier = threading.Barrier(len(slots))
+        def run(slot):
+            barrier.wait(timeout=self.timeout(10))
+            return self.complete_stream(prompt, tokens, slot, prompt_tokens, repeat)
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(slots)) as pool:
+            rows = list(pool.map(run, slots))
+        return dict(slots=slots, output_tokens_per_stream=tokens, streams=rows,
+                    common_decode=common_decode_window(rows), http_seconds=time.monotonic()-started,
+                    native_timings=[r["response"]["timings"] for r in rows])
 
     def long_prompt(self, prompts, count):
         prompt = next(p for p in prompts if p["category"] == "long")
@@ -220,8 +372,7 @@ class ServingLeg:
         payload = completion_payload("Explain merge sort and give several examples.", 4096, 0) | {"stream": True}
         first = None
         with self.capture_response("/completion", payload, maximum=60) as (stream, saved):
-            for line in retained_lines(stream, saved):
-                self.timeout()
+            for line in retained_lines(stream, saved, lambda: self.timeout(60)):
                 if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                     item = json.loads(line[6:])
                     if item.get("content"):
@@ -234,6 +385,15 @@ class ServingLeg:
         write_json(self.out / "cancel-followup.json", followup)
 
     def workload(self, prompts):
+        if self.args.mode == "scaling":
+            for count in self.args.prompt_tokens:
+                prompt = self.long_prompt(prompts, count)
+                for active in self.args.sessions:
+                    for repeat in range(-1, self.args.repeats):
+                        result = self.decode_group(prompt, self.args.tokens, range(active), count, repeat)
+                        result.update(prompt_tokens=count, warmup=repeat < 0, repeat=repeat)
+                        write_json(self.out / f"decode-{count}-{active}-{repeat}.json", result)
+            return
         mode = self.args.mode
         if mode == "semantics":
             self.semantics()
@@ -265,7 +425,7 @@ class ServingLeg:
         text = (self.out / "gpu.csv").read_text()
         # The monitor can be in the middle of a line when the file is read.
         lines = text[:text.rfind("\n")+1].splitlines()
-        samples = {0: [], 1: []}
+        samples = {device: [] for device in range(self.cards)}
         for row in csv.reader(lines):
             try:
                 stamp, device, memory, _power = row
@@ -296,7 +456,7 @@ class ServingLeg:
                     after = [i for i, row in enumerate(rows) if row[0] >= ended]
                     if before and after:
                         covered[device] = rows[before[-1]:after[0]+1]
-                if len(covered) == 2:
+                if len(covered) == self.cards:
                     for device, rows in covered.items():
                         if any(b[0]-a[0] > 2 for a, b in zip(rows, rows[1:])):
                             raise ValueError(f"GPU {device} memory samples have a gap over 2 seconds during the workload")
@@ -304,7 +464,7 @@ class ServingLeg:
                                 peak_mib={str(device): max(memory for _, memory in rows) for device, rows in samples.items()},
                                 sample_counts={str(device): len(rows) for device, rows in samples.items()})
             if time.monotonic() >= until:
-                raise ValueError(f"incomplete GPU memory evidence for both cards over the workload; "
+                raise ValueError(f"incomplete GPU memory evidence for all {self.cards} cards over the workload; "
                                  f"sample counts: { {device: len(rows) for device, rows in samples.items()} }")
             time.sleep(min(0.05, max(0, until-time.monotonic())))
 
@@ -373,6 +533,29 @@ class ServingLeg:
                                         exit=None if monitor is None else monitor.returncode)))
 
 
+def run_measurements(args):
+    baseline = getattr(args, "baseline_binary", None)
+    if baseline is None:
+        ServingLeg(args).run()
+        return
+    if args.mode != "scaling":
+        raise ValueError("ABBA comparisons require scaling mode")
+    folder = args.root / "results" / args.run
+    legs = [("A1", baseline), ("B1", args.binary), ("B2", args.binary), ("A2", baseline)]
+    if any((folder.parent / (args.run + "-" + name)).exists() for name, _ in legs):
+        raise ValueError("ABBA output directories must be new")
+    folder.mkdir(parents=True, exist_ok=False)
+    receipt = dict(order=[name for name, _ in legs], completed=[], deadline=args.deadline, passed=False)
+    write_json(folder / "abba.json", receipt)
+    for name, binary in legs:
+        leg = argparse.Namespace(**(vars(args) | dict(run=args.run + "-" + name, binary=binary)))
+        ServingLeg(leg).run()
+        receipt["completed"].append(leg.run)
+        write_json(folder / "abba.json", receipt)
+    receipt["passed"] = True
+    write_json(folder / "abba.json", receipt)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("root", "fixtures", "binary", "model"):
@@ -382,7 +565,14 @@ def main():
     parser.add_argument("--context", type=int, required=True)
     parser.add_argument("--ubatch", type=int, required=True)
     parser.add_argument("--deadline", type=float, required=True)
-    parser.add_argument("--mode", choices=("timing", "semantics", "capacity", "concurrency", "diagnostic"), default="timing")
+    parser.add_argument("--mode", choices=("timing", "semantics", "capacity", "concurrency", "diagnostic", "scaling"), default="timing")
+    parser.add_argument("--recipe", choices=("tensor-2", "dp-4"), default="tensor-2")
+    parser.add_argument("--baseline-binary", type=Path, help="Run scaling in baseline/candidate/candidate/baseline order")
+    parser.add_argument("--kv-host", action="store_true")
+    parser.add_argument("--host-budget-mib", type=float)
+    parser.add_argument("--mmproj", type=Path)
+    parser.add_argument("--sessions", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[512, 4096])
     parser.add_argument("--profile", default="")
     parser.add_argument("--port", type=int, default=8102)
     parser.add_argument("--slots", type=int, default=3)
@@ -391,13 +581,20 @@ def main():
     parser.add_argument("--sampling", choices=("served",), default="served")
     parser.add_argument("--tokens", type=int, default=384)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--threads", type=int)
+    parser.add_argument("--threads-batch", type=int)
     args = parser.parse_args()
+    if args.mode == "scaling" and (args.tokens < 2 or args.repeats < 1 or
+            any(s < 1 or s > args.slots for s in args.sessions) or any(t <= 128 for t in args.prompt_tokens)):
+        parser.error("scaling needs at least two output tokens, a positive repeat count, configured slots and prompts over 128 tokens")
+    if args.recipe != "dp-4" and (args.kv_host or args.host_budget_mib is not None or args.mmproj):
+        parser.error("host KV and projector measurement options require the DP recipe")
     if Path(args.run).name != args.run or args.run in (".", ".."):
         parser.error("run must be one new output directory name")
     def interrupted(signum, frame):
         raise InterruptedError(f"serving leg interrupted by signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    ServingLeg(args).run()
+    run_measurements(args)
 
 
 if __name__ == "__main__":

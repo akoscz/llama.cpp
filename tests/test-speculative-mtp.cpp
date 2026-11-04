@@ -354,7 +354,7 @@ struct acceptance {
 };
 
 static void log_errors(ggml_log_level level, const char * text, void *) {
-    if (level >= GGML_LOG_LEVEL_ERROR || getenv("LLAMA_GRAPH_RESULT_DEBUG")) fputs(text, stderr);
+    if (level >= GGML_LOG_LEVEL_ERROR || getenv("LLAMA_GRAPH_RESULT_DEBUG") || getenv("GGML_GRAPH_TRACE")) fputs(text, stderr);
 }
 
 static bool fail(const char * what) {
@@ -1327,6 +1327,92 @@ static bool test_graph_shapes(llama_model * model) {
     return true;
 }
 
+static bool test_sampler_graphs(llama_model * model) {
+    constexpr int n_seq = 4;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_sampler_ptr> samplers[2];
+    std::vector<llama_sampler_seq_config> configs[2];
+    llama_context_ptr contexts[2];
+    for (int side = 0; side < 2; ++side) {
+        for (int s = 0; s < n_seq; ++s) {
+            samplers[side].emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            auto * chain = samplers[side].back().get();
+            const llama_logit_bias bias[] = {{5, 0.3f}, {17, -INFINITY}};
+            llama_sampler_chain_add(chain, llama_sampler_init_logit_bias(n_vocab, 2, bias));
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(n_vocab, 16, 1.1f, 0.1f, 0.1f));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
+            llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(1000 + s));
+            for (llama_token t : {5, 5, 12, 17}) { llama_sampler_accept(chain, t); }
+            configs[side].push_back({s, chain});
+        }
+        auto params = llama_context_default_params();
+        params.n_ctx = 128*n_seq;
+        params.n_seq_max = n_seq;
+        params.n_batch = params.n_ubatch = 32;
+        params.n_outputs_max = 3*n_seq;
+        params.n_outputs_max_per_seq = 3;
+        params.n_threads = params.n_threads_batch = 4;
+        params.no_perf = false;
+        params.kv_unified = false;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.samplers = configs[side].data();
+        params.n_samplers = configs[side].size();
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", side == 0 ? "1" : nullptr);
+        contexts[side].reset(llama_init_from_model(model, params));
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+        if (!contexts[side]) { return fail("sampler graph context initialization failed"); }
+    }
+    // Three live shapes, changing history and random draws; then evict them with different active owners and revisit.
+    for (int round = 0; round < 15; ++round) {
+        const int width = 1 + round % 3;
+        const int seq = round >= 9 && round < 12 ? 2 : 3;
+        llama_batch batch = llama_batch_init(width, 0, 1);
+        for (int p = 0; p < width; ++p) {
+            common_batch_add(batch, (seq*7 + p + round) % n_vocab, p, {seq}, true);
+        }
+        bool ok = true;
+        for (int side = 0; side < 2; ++side) {
+            llama_memory_clear(llama_get_memory(contexts[side].get()), true);
+            const auto reused = llama_perf_context(contexts[side].get()).n_reused;
+            if (llama_decode(contexts[side].get(), batch) != 0) { ok = fail("sampler graph decode failed"); break; }
+            if (side == 1 && round >= 3 && round < 9 && llama_perf_context(contexts[side].get()).n_reused != reused + 1) {
+                ok = fail("backend sampler inputs forced a warm shape to rebuild");
+            }
+        }
+        for (int i = 0; ok && i < batch.n_tokens; ++i) {
+            const auto a = llama_get_sampled_token_ith(contexts[0].get(), i);
+            const auto b = llama_get_sampled_token_ith(contexts[1].get(), i);
+            if (a == LLAMA_TOKEN_NULL || a != b) { ok = fail("retaining sampler graphs changed a seeded token"); break; }
+            const auto row_a = llama_get_sampling_row_ith(contexts[0].get(), i);
+            const auto row_b = llama_get_sampling_row_ith(contexts[1].get(), i);
+            if (row_a.n_sampled_probs != row_b.n_sampled_probs || row_a.n_sampled_logits != row_b.n_sampled_logits ||
+                row_a.n_candidates != row_b.n_candidates ||
+                memcmp(row_a.sampled_probs, row_b.sampled_probs, row_a.n_sampled_probs*sizeof(float)) ||
+                memcmp(row_a.sampled_logits, row_b.sampled_logits, row_a.n_sampled_logits*sizeof(float)) ||
+                memcmp(row_a.candidates, row_b.candidates, row_a.n_candidates*sizeof(llama_token))) {
+                fprintf(stderr, "sampler graphs round %d row %d counts %u/%u %u/%u %u/%u\n", round, i,
+                    row_a.n_sampled_probs, row_b.n_sampled_probs, row_a.n_sampled_logits, row_b.n_sampled_logits,
+                    row_a.n_candidates, row_b.n_candidates);
+                for (uint32_t j = 0; j < std::min(row_a.n_sampled_logits, row_b.n_sampled_logits); ++j) {
+                    if (row_a.sampled_logits[j] != row_b.sampled_logits[j]) {
+                        fprintf(stderr, "logit %u: %.9g %.9g\n", j, row_a.sampled_logits[j], row_b.sampled_logits[j]); break;
+                    }
+                }
+                ok = fail("retaining sampler graphs changed probabilities, logits or candidates"); break;
+            }
+            // Partial MTP acceptance consumes only a prefix of the generated draws/history.
+            if (i % width <= round % width) {
+                for (int side = 0; side < 2; ++side) { llama_sampler_accept(samplers[side][batch.seq_id[i][0]].get(), a); }
+            }
+        }
+        llama_batch_free(batch);
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
 static bool test_sampler_reserve(llama_model * model) {
     const int n_seq = 40;
     const int width = N_MAX + 1;
@@ -1393,7 +1479,7 @@ static bool test_sampler_reserve(llama_model * model) {
 static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cache) {
     auto baseline = glm_model(1234, {devices.front()});
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
-    if (!q8_cache && !test_sampler_reserve(split.get())) { return false; }
+    if (!q8_cache && (!test_sampler_reserve(split.get()) || !test_sampler_graphs(split.get()))) { return false; }
     set_env("LLAMA_MTP_DEVICE_H", "1");
     server_rig ref(baseline.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
     server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
@@ -1495,6 +1581,7 @@ int main(int argc, char ** argv) {
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
             { "sampler-reserve", test_sampler_reserve },
+            { "sampler-graphs", test_sampler_graphs },
             { "graph-shapes", test_graph_shapes },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },

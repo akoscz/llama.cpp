@@ -33,7 +33,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <thread>
 #include <vector>
@@ -440,13 +442,211 @@ static int test_direct(const std::vector<ggml_backend_dev_t> & devices, bool req
     return ok ? 0 : 1;
 }
 
+// Persistent launch threads keep captured collectives concurrent, including when CUDA launch queues fill.
+struct benchmark_launcher {
+    std::mutex mutex;
+    std::condition_variable work, done;
+    std::vector<std::thread> threads;
+    const std::vector<ggml_backend_t> & backends;
+    ggml_backend_capture_launch_t launch;
+    std::vector<void *> execs;
+    size_t generation = 0, pending = 0;
+    int repeats = 0;
+    bool stop = false;
+
+    benchmark_launcher(const std::vector<ggml_backend_t> & backends, ggml_backend_capture_launch_t launch) :
+            backends(backends), launch(launch), execs(backends.size()) {
+        for (size_t rank = 0; rank < backends.size(); ++rank) {
+            threads.emplace_back([this, rank] {
+                size_t seen = 0;
+                std::unique_lock<std::mutex> lock(mutex);
+                for (;;) {
+                    work.wait(lock, [&] { return stop || generation != seen; });
+                    if (stop) { return; }
+                    seen = generation;
+                    lock.unlock();
+                    for (int i = 0; i < repeats; ++i) { this->launch(this->backends[rank], execs[rank]); }
+                    ggml_backend_synchronize(this->backends[rank]);
+                    lock.lock();
+                    if (--pending == 0) { done.notify_one(); }
+                }
+            });
+        }
+    }
+    void run(const std::vector<void *> & graphs, int count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        execs = graphs;
+        repeats = count;
+        pending = threads.size();
+        ++generation;
+        work.notify_all();
+        done.wait(lock, [&] { return pending == 0; });
+    }
+    ~benchmark_launcher() {
+        { std::lock_guard<std::mutex> lock(mutex); stop = true; work.notify_all(); }
+        for (auto & thread : threads) { thread.join(); }
+    }
+};
+
+// End-to-end replay batch latency includes launch/synchronization. Nsight supplies GPU-only timings separately.
+static int benchmark_collectives(const std::vector<ggml_backend_dev_t> & devices, int delay_steps) {
+    const auto reg = ggml_backend_dev_backend_reg(devices.front());
+    const auto proc = [&](const char * name) { return ggml_backend_reg_get_proc_address(reg, name); };
+    const auto init = (ggml_backend_comm_init_t) proc("ggml_backend_comm_init");
+    const auto release = (ggml_backend_comm_free_t) proc("ggml_backend_comm_free");
+    const auto sum = (ggml_backend_comm_allreduce_tensor_t) proc("ggml_backend_comm_allreduce_tensor");
+    const auto gather = (ggml_backend_comm_allgather_tensor_t) proc("ggml_backend_comm_allgather_tensor");
+    const auto begin = (ggml_backend_capture_begin_t) proc("ggml_backend_capture_begin");
+    const auto end = (ggml_backend_capture_end_t) proc("ggml_backend_capture_end");
+    const auto launch = (ggml_backend_capture_launch_t) proc("ggml_backend_capture_launch");
+    const auto free_graph = (ggml_backend_capture_free_t) proc("ggml_backend_capture_free");
+    const auto can_sum = (ggml_backend_comm_allreduce_capturable_t) proc("ggml_backend_comm_allreduce_capturable");
+    const auto can_gather = (ggml_backend_comm_allgather_capturable_t) proc("ggml_backend_comm_allgather_capturable");
+    if (!init || !release || !sum || !gather || !begin || !end || !launch || !free_graph || !can_sum || !can_gather) {
+        fprintf(stderr, "collective benchmark requires internal CUDA collectives and capture support\n");
+        return 77;
+    }
+    std::vector<ggml_backend_t> backends;
+    for (auto device : devices) {
+        backends.push_back(ggml_backend_dev_init(device, nullptr));
+        GGML_ASSERT(backends.back());
+    }
+    bool ok = true;
+    {
+        benchmark_launcher runner(backends, launch);
+        for (const char * route : {"peer_ll", "host_ll", "peer_copy", "host_copy"}) {
+            const bool peer = strncmp(route, "peer", 4) == 0;
+            const bool copy = strstr(route, "copy") != nullptr;
+            set_env("GGML_CUDA_AR_LL_MAX_BYTES", peer || copy ? "0" : "1048576");
+            set_env("GGML_CUDA_AR_P2P_MAX_BYTES", peer ? "1048576" : "0");
+            set_env("GGML_CUDA_AR_COPY_THRESHOLD", copy ? "1" : "0");
+            set_env("GGML_CUDA_AR_COPY_PEER", peer ? "1" : "0");
+            set_env("GGML_CUDA_AR_COPY_ONE_STREAM", "0");
+            for (bool bf16 : {false, true}) {
+                set_env("GGML_CUDA_AR_BF16_THRESHOLD", bf16 ? "1" : "0");
+                void * comm = init(backends.data(), backends.size());
+                GGML_ASSERT(comm);
+                const bool peer_active = last_p2p;
+                for (int rows : {1, 4, 8, 40}) {
+                    for (int operation : {0, 1, 2}) { // reset only, reduce, gather
+                        if (bf16 && operation != 1) { continue; } // gather preserves F32 bits, regardless of the sum wire
+                        const int64_t ne = int64_t(rows)*4096;
+                        std::vector<ggml_context *> contexts;
+                        std::vector<ggml_backend_buffer_t> buffers;
+                        std::vector<ggml_cgraph *> graphs;
+                        std::vector<ggml_tensor *> outputs;
+                        for (size_t rank = 0; rank < devices.size(); ++rank) {
+                            auto * ctx = ggml_init({(size_t(delay_steps) + 16)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+                            contexts.push_back(ctx);
+                            auto * graph = ggml_new_graph(ctx);
+                            auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+                            ggml_set_input(input);
+                            ggml_set_output(input); // replay always starts from the original contribution
+                            ggml_tensor * delay = nullptr;
+                            if (rank == 0 && delay_steps > 0) {
+                                delay = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 262144);
+                                ggml_set_input(delay);
+                                ggml_set_output(delay);
+                                auto * current = delay;
+                                for (int step = 0; step < delay_steps; ++step) { current = ggml_scale(ctx, current, 1.0f); }
+                                ggml_build_forward_expand(graph, current);
+                            }
+                            auto * out = ggml_scale(ctx, input, 1.0f);
+                            ggml_set_output(out);
+                            ggml_build_forward_expand(graph, out);
+                            auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backends[rank]);
+                            GGML_ASSERT(buffer);
+                            buffers.push_back(buffer);
+                            std::vector<float> values(ne, float(rank + 1));
+                            if (operation == 2) {
+                                for (int64_t i = 0; i < ne; ++i) { if (i % devices.size() != rank) { values[i] = 0; } }
+                            }
+                            ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+                            if (delay) {
+                                values.assign(262144, 1.0f);
+                                ggml_backend_tensor_set(delay, values.data(), 0, ggml_nbytes(delay));
+                            }
+                            graphs.push_back(graph);
+                            outputs.push_back(out);
+                        }
+                        const auto queue = [&] {
+                            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                                GGML_ASSERT(ggml_backend_graph_compute_async(backends[rank], graphs[rank]) == GGML_STATUS_SUCCESS);
+                            }
+                            if (operation == 1) { GGML_ASSERT(sum(comm, outputs.data())); }
+                            if (operation == 2) { GGML_ASSERT(gather(comm, outputs.data())); }
+                        };
+                        queue(); // allocate transport scratch outside capture
+                        for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                        const bool captured = operation == 0 || (operation == 1 ? can_sum(comm, outputs.data()) : can_gather(comm, outputs.data()));
+                        std::vector<void *> execs;
+                        if (captured) {
+                            for (auto backend : backends) { begin(backend); }
+                            queue();
+                            for (auto backend : backends) { execs.push_back(end(backend)); GGML_ASSERT(execs.back()); }
+                        }
+                        const auto run = [&](int count) {
+                            if (captured) {
+                                runner.run(execs, count);
+                            } else {
+                                // The copy-engine reduction synchronizes the host and cannot join a whole-evaluation capture.
+                                for (int i = 0; i < count; ++i) { queue(); }
+                                for (auto backend : backends) { ggml_backend_synchronize(backend); }
+                            }
+                        };
+                        run(8);
+                        constexpr int samples = 20, replays = 16;
+                        std::vector<double> us;
+                        for (int i = 0; i < samples; ++i) {
+                            const auto start = ggml_time_us();
+                            run(replays);
+                            us.push_back(double(ggml_time_us() - start)/replays);
+                        }
+                        std::vector<float> actual(ne);
+                        bool correct = true;
+                        for (size_t rank = 0; rank < devices.size(); ++rank) {
+                            ggml_backend_tensor_get(outputs[rank], actual.data(), 0, ggml_nbytes(outputs[rank]));
+                            for (int64_t i = 0; i < ne; ++i) {
+                                const float expected = operation == 1 ? float(devices.size()*(devices.size()+1)/2) :
+                                    operation == 2 ? float(i % devices.size() + 1) : float(rank + 1);
+                                correct = correct && actual[i] == expected;
+                            }
+                        }
+                        ok = ok && correct;
+                        const auto raw_us = us;
+                        std::sort(us.begin(), us.end());
+                        printf("{\"ranks\":%zu,\"operation\":\"%s\",\"route_requested\":\"%s\",\"peer_enabled\":%s,\"wire\":\"%s\",\"elements\":%lld,\"owner_delay_steps\":%d,\"delay_elements\":262144,\"whole_eval_capture\":%s,\"iterations_per_sample\":%d,\"samples\":%d,\"wall_us_min\":%.3f,\"wall_us_p50\":%.3f,\"wall_us_p95\":%.3f,\"correct\":%s,\"sample_wall_us\":[",
+                            devices.size(), operation == 0 ? "reset_only" : operation == 1 ? "reduce" : "gather", route,
+                            peer_active ? "true" : "false", bf16 ? "BF16" : "F32", (long long) ne, delay_steps, captured ? "true" : "false", replays, samples,
+                            us.front(), us[samples/2], us[samples*95/100], correct ? "true" : "false");
+                        for (size_t i = 0; i < raw_us.size(); ++i) { printf("%s%.3f", i ? "," : "", raw_us[i]); }
+                        printf("]}\n");
+                        fflush(stdout);
+                        for (size_t rank = 0; rank < devices.size(); ++rank) {
+                            if (captured) { free_graph(backends[rank], execs[rank]); }
+                            ggml_backend_buffer_free(buffers[rank]);
+                            ggml_free(contexts[rank]);
+                        }
+                    }
+                }
+                release(comm);
+            }
+        }
+    }
+    for (auto backend : backends) { ggml_backend_free(backend); }
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
+    const bool benchmark = (argc == 3 || argc == 5) && strcmp(argv[1], "--bench") == 0;
+    const int delay_steps = benchmark && argc == 5 && strcmp(argv[3], "--delay") == 0 ? atoi(argv[4]) : 0;
     const bool logical = argc == 3 && strcmp(argv[1], "--logical") == 0;
     const bool require_p2p = argc == 4 && strcmp(argv[3], "--require-p2p") == 0;
     const bool direct = logical || ((argc == 3 || require_p2p) && strcmp(argv[1], "--direct") == 0);
-    const int n_devices = direct ? atoi(argv[2]) : 2;
-    if ((argc != 1 && !direct) || n_devices < 2 || n_devices > 4) {
-        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4]\n", argv[0]);
+    const int n_devices = direct || benchmark ? atoi(argv[2]) : 2;
+    if ((argc != 1 && !direct && !benchmark) || n_devices < 2 || n_devices > 4 || delay_steps < 0 || delay_steps > 64 ||
+            (benchmark && argc == 5 && strcmp(argv[3], "--delay") != 0)) {
+        fprintf(stderr, "usage: %s [--direct 2|3|4 [--require-p2p] | --logical 2|3|4 | --bench 2|3|4 [--delay 0..64]]\n", argv[0]);
         return 1;
     }
     std::vector<ggml_backend_dev_t> gpus;
@@ -462,7 +662,7 @@ int main(int argc, char ** argv) {
         }
         printf("%d logical ranks on %zu physical GPUs; not a four-card qualification\n", n_devices, physical.size());
     }
-    if (direct && gpus.size() < (size_t) n_devices) {
+    if ((direct || benchmark) && gpus.size() < (size_t) n_devices) {
         printf("need %d physical GPUs for direct collectives, found %zu, skipped\n", n_devices, gpus.size());
         return 77;
     }
@@ -475,14 +675,18 @@ int main(int argc, char ** argv) {
     }
     if (strncmp(ggml_backend_dev_name(gpus[0]), "CUDA", 4) != 0) {
         printf("%s has no internal AllReduce, skipped\n", ggml_backend_dev_name(gpus[0]));
-        return direct ? 77 : 0;
+        return direct || benchmark ? 77 : 0;
     }
-    printf("meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
+    fprintf(benchmark ? stderr : stdout, "meta backend over %s and %s\n", ggml_backend_dev_name(gpus[0]), ggml_backend_dev_name(gpus[1]));
 
     ggml_log_set(log_cb, nullptr);
     set_env("GGML_CUDA_ALLREDUCE", "internal");
     set_env("GGML_CUDA_AR_COPY_THRESHOLD", nullptr);
     set_env("GGML_CUDA_AR_COPY_CHUNK_BYTES", nullptr);
+    if (benchmark) {
+        set_env("GGML_CUDA_GRAPH_MEM_STATS", "0");
+        return benchmark_collectives(gpus, delay_steps);
+    }
     if (direct) {
         return test_direct(gpus, require_p2p);
     }

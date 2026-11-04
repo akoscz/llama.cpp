@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1539,9 +1540,7 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
         }
         llama_sampler_backend_set_batch(sampler, ubatch->token ? tokens.data() : nullptr, output.data(), (int32_t) output.size());
 
-        if (sampler->iface->backend_set_input) {
-            sampler->iface->backend_set_input(sampler);
-        }
+        input_setters.at(seq_id)();
     }
 }
 
@@ -1677,7 +1676,13 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
-    if (!this->params.allow_reuse(params)) {
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    const char * reason = nullptr;
+    if (!this->params.allow_reuse(params, trace ? &reason : nullptr)) {
+        if (trace) {
+            LLAMA_LOG_INFO("graph_trace layer=llama event=reject result=%p uid=%llu reason=%s rows=%u next_rows=%u\n",
+                (void *) this, (unsigned long long) gf->uid, reason, this->params.ubatch.n_tokens, params.ubatch.n_tokens);
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1694,6 +1699,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     int input_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if (trace && !cur) {
+            LLAMA_LOG_INFO("graph_trace layer=llama event=reject result=%p uid=%llu reason=input input=%d rows=%u\n",
+                (void *) this, (unsigned long long) gf->uid, input_idx, params.ubatch.n_tokens);
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: input %d can_reuse = %d\n", __func__, input_idx, cur);
@@ -4746,7 +4755,6 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
-    res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
@@ -4756,9 +4764,9 @@ void llm_graph_context::build_sampling() const {
         }
     }
 
-    // -sm tensor: a ubatch with no output rows (the ubatches of a prompt before its last) has empty logits, and a pad of
-    // them has no split the meta backend can name. There is nothing to sample
-    if (n_rows == 0 && cparams.logits_gather) {
+    // A tensor/DP prompt ubatch with no output rows has nothing to sample or pad.
+    const bool row_local = cparams.n_seq_devices > 1;
+    if (n_rows == 0 && (cparams.logits_gather || row_local)) {
         return;
     }
 
@@ -4776,9 +4784,12 @@ void llm_graph_context::build_sampling() const {
     // for bit (ggml-backend-meta.cpp, ggml_backend_meta_is_gather), and the samplers run on them as on one device; the
     // padding keeps each row 128-byte aligned
     const int64_t n_vocab = res->t_logits->ne[0];
-    ggml_tensor * logits_t = cparams.logits_gather ?
-        ggml_pad_ext(ctx0, res->t_logits, 0, (int) (32 - n_vocab % 32), 0, 1, 0, 0, 0, 0) :
-        ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = res->t_logits;
+    if (!row_local) {
+        logits_t = cparams.logits_gather ?
+            ggml_pad_ext(ctx0, logits_t, 0, (int) (32 - n_vocab % 32), 0, 1, 0, 0, 0, 0) :
+            ggml_pad(ctx0, logits_t, 0, 1, 0, 0);
+    }
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4798,6 +4809,8 @@ void llm_graph_context::build_sampling() const {
 
         for (uint32_t i = 0; i < rows.size(); ++i) {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, n_vocab, rows[i] * logits_t->nb[1]);
+            // Copy each DP row on its owner: penalties can write it, and padding the split row axis would gather it.
+            if (row_local) { logits_seq = ggml_cont(ctx0, logits_seq); }
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
@@ -4843,6 +4856,11 @@ void llm_graph_context::build_sampling() const {
             }
         }
     }
+
+    for (const auto & [seq_id, sampler] : samplers) {
+        inp_sampling->input_setters.emplace(seq_id, llama_sampler_backend_bind_inputs(sampler));
+    }
+    res->add_input(std::move(inp_sampling));
 
     // TODO: Call backend_accept after all samplers have been applied.
     /*

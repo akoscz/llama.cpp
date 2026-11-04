@@ -2577,6 +2577,7 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    const bool                  trace_graphs  = ggml_env_switch("GGML_GRAPH_TRACE");
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2600,6 +2601,7 @@ struct ggml_backend_meta_context {
 
         struct graph {
             uint64_t            uid     = 0;     // the cgraph
+            int                 n_nodes = 0;
             int                 n_evals = 0;     // its evaluations so far
             bool                refused = false; // it cannot be captured
             std::vector<void *> execs;           // its graphs, one a device, once captured
@@ -2623,7 +2625,7 @@ struct ggml_backend_meta_context {
     }
 
     // the state of the cgraph of this uid, new if it has none
-    capture_state::graph & capture_graph(uint64_t uid) {
+    capture_state::graph & capture_graph(uint64_t uid, int n_nodes) {
         capture.t_now++;
         for (capture_state::graph & g : capture.graphs) {
             if (g.uid == uid) {
@@ -2636,12 +2638,21 @@ struct ggml_backend_meta_context {
         } else {
             capture_state::graph & lru = *std::min_element(capture.graphs.begin(), capture.graphs.end(),
                 [](const capture_state::graph & a, const capture_state::graph & b) { return a.t_used < b.t_used; });
+            if (trace_graphs) {
+                GGML_LOG_INFO("graph_trace layer=meta event=evict context=%p uid=%llu reason=lru next_uid=%llu nodes=%d executables=%zu\n",
+                    (void *) this, (unsigned long long) lru.uid, (unsigned long long) uid, lru.n_nodes, lru.execs.size());
+            }
             capture_free(lru);
             std::swap(lru, capture.graphs.back());
             capture.graphs.back() = {};
         }
         capture.graphs.back().uid    = uid;
+        capture.graphs.back().n_nodes = n_nodes;
         capture.graphs.back().t_used = capture.t_now;
+        if (trace_graphs) {
+            GGML_LOG_INFO("graph_trace layer=meta event=miss context=%p uid=%llu nodes=%d entries=%zu\n",
+                (void *) this, (unsigned long long) uid, n_nodes, capture.graphs.size());
+        }
         return capture.graphs.back();
     }
 
@@ -3019,8 +3030,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context::capture_state & cap = backend_ctx->capture;
     ggml_backend_meta_context::capture_state::graph * cg = nullptr;
     if (!capture_legacy && n_backends > 1 && cgraph->uid != 0 && cap.available()) {
-        cg = &backend_ctx->capture_graph(cgraph->uid);
+        cg = &backend_ctx->capture_graph(cgraph->uid, cgraph->n_nodes);
         if (!cg->execs.empty()) {
+            if (backend_ctx->trace_graphs) {
+                GGML_LOG_INFO("graph_trace layer=meta event=replay context=%p uid=%llu ranks=%zu nodes=%d\n",
+                    (void *) backend_ctx, (unsigned long long) cgraph->uid, n_backends, cgraph->n_nodes);
+            }
             backend_ctx->capture_launch(*cg);
             return GGML_STATUS_SUCCESS;
         }
@@ -3617,23 +3632,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // the step that cannot be captured, each device's subgraph or the all-reduce after it, or -1 for none
     auto uncapturable_step = [&]() -> int {
+        const auto refuse = [&](size_t step, int rank, const char * reason) {
+            if (backend_ctx->trace_graphs) {
+                GGML_LOG_INFO("graph_trace layer=meta event=refuse context=%p uid=%llu step=%zu rank=%d reason=%s\n",
+                    (void *) backend_ctx, (unsigned long long) cgraph->uid, step, rank, reason);
+            }
+            return (int) step;
+        };
         std::vector<ggml_tensor *> nodes(n_backends);
         for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                 if (!cap.graph_capturable(bcj.backend, cgraph_ij)) {
-                    return (int) i;
+                    return refuse(i, (int) j, "backend_subgraph");
                 }
                 nodes[j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
             }
             if (backend_ctx->gathers[i]) {
                 if (cap.allgather_capturable == nullptr || backend_ctx->comm_allgather == nullptr ||
                         !cap.allgather_capturable(backend_ctx->comm_ctx, nodes.data())) {
-                    return (int) i;
+                    return refuse(i, -1, "allgather");
                 }
             } else if (i < backend_ctx->n_subgraphs - 1 && !cap.allreduce_capturable(backend_ctx->comm_ctx, nodes.data())) {
-                return (int) i;
+                return refuse(i, -1, "allreduce");
             }
         }
         return -1;
@@ -3658,6 +3680,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (status == GGML_STATUS_SUCCESS && captured) {
                 cg->execs = std::move(execs);
+                if (backend_ctx->trace_graphs) {
+                    GGML_LOG_INFO("graph_trace layer=meta event=capture context=%p uid=%llu ranks=%zu nodes=%d subgraphs=%zu\n",
+                        (void *) backend_ctx, (unsigned long long) cgraph->uid, n_backends, cgraph->n_nodes, backend_ctx->n_subgraphs);
+                }
                 backend_ctx->capture_launch(*cg);
                 return GGML_STATUS_SUCCESS;
             }
@@ -3668,6 +3694,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             cg->refused = true;
+            if (backend_ctx->trace_graphs) {
+                GGML_LOG_INFO("graph_trace layer=meta event=refuse context=%p uid=%llu reason=capture_end status=%d\n",
+                    (void *) backend_ctx, (unsigned long long) cgraph->uid, (int) status);
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
