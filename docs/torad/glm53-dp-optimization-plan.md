@@ -132,3 +132,22 @@ Independent correctness, security, test and selection-lifetime reviews of PR 120
 The selection-bank fixture now observes the actual asynchronous copy calls made by every production capture and requires direct admission for each active row, including non-zero offsets and different owners. The end-to-end DP MTP fixture observes bank-backed graph reads before round teardown clears the rows, and runs a host-selection control that must produce no bank reads. Disabling matching owner copies or DP bank capture makes the respective test fail; restoring the optimized code makes both pass on logical CPU ranks. These checks establish path coverage, not physical CUDA stream ordering or performance.
 
 Remaining work is not described as completed: small-batch accepted hidden carry and reusable host-KV staging require explicit lifetime designs; concurrent MTP policy, larger graph retention, collective routes and L2 prefetch require current measurements. Use the short qualification to choose among those, before any 400K capacity fill.
+
+## Post-merge GPU qualification
+
+PR 120 merged as `d54ea817b`. Two bounded windows reused instance 59024660, with four 300 W RTX PRO 6000 Blackwell Max-Q cards and the same BoldingBuilds IQ3_XXS pack. Both windows collected their results and confirmed the instance stopped immediately afterward. Their combined duration was 1,253 seconds, approximately $2.24 in compute at $6.437/hour, excluding retained storage. Machine-readable results, token hashes and artifact receipts are in [the qualification record](glm53-dp-qualification-20261104.json).
+
+Four-card sampler and selection-bank checks, two/four-card DP MTP with default/Q8 caches, the two-card tensor check and both collective probes passed. All 128 collective cases reported correct results. The peer path was faster than host staging for small decode payloads. Copy-engine reduction did not support whole-evaluation capture, so its isolated latency is not a recommendation to change serving transport.
+
+The old baseline (`82ad56cb8`) completed 512-token prompts at one, two and four active sessions, then exited with signal 11 during the eight-session warmup. The cause is not established. The combined candidate was tested in a second window. Each completed cell below had one 128-token warmup and one measured 128-token reply per stream, with 40 slots configured and MTP2 enabled. Values are means of native per-stream decode rates, not aggregate HTTP throughput.
+
+| Prompt tokens | 1 session | 2 sessions | 4 sessions | 8 sessions |
+| --- | ---: | ---: | ---: | ---: |
+| 512 | 81.97 | 59.97 | 48.64 | 5.56 |
+| 4096 | 55.08 | 53.65 | 39.66 | Incomplete qualification |
+
+The eight-session 4096-token warmup generated 128 tokens but returned only 126 token IDs in its SSE stream. The strict measurement guard rejected it and stopped the run before profiling. The source buffers text until a UTF-8 character is complete, while the partial result included only the latest token ID; the final streaming result also omitted IDs held by an incomplete tail. The pending-token fix retains those IDs until a partial or terminal result sends them. Six tiny-model regressions reproduce the omission before the fix; they cover complete split characters, malformed leads, incomplete tails, both return_tokens settings and slot reuse. They pass after the fix, along with the existing malformed-text and basic completion/streaming tests (14 cases total). Text handling and the measurement guard are unchanged.
+
+The completed candidate data shows a substantial four-to-eight-session cliff. During the 512-token requests, sampled GPU utilization averaged roughly 20-27% at eight sessions, versus 84-94% at four; these coarse samples include prefill and are not a kernel attribution. The next trace must include eight sessions. Current source still has the 32,768-node default CUDA graph budget and hard-coded idle eviction; their role in this cliff has not been measured.
+
+No complete ABBA comparison or performance gain is claimed. Nsight Compute was denied GPU counter access (`ERR_NVGPUCTRPERM`); the Nsight Systems probe succeeded, but neither window reached a model trace. No 400K capacity fill ran, and forty configured slots remain distinct from forty filled sessions.

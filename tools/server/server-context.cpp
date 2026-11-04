@@ -284,6 +284,7 @@ struct server_slot {
     std::string  generated_text;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
+    llama_tokens pending_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
     std::vector<completion_token_output> generated_token_probs;
@@ -385,6 +386,7 @@ struct server_slot {
             common_speculative_end(spec, id);
         }
         generated_tokens.clear();
+        pending_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
 
@@ -1995,6 +1997,9 @@ private:
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
+        if (slot.task->params.stream) {
+            slot.pending_tokens.push_back(result.tok);
+        }
         slot.has_next_token = true;
 
         // a byte the model sampled that cannot continue the character before it, or a continuation byte with no lead,
@@ -2557,7 +2562,11 @@ private:
             res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            if (is_progress) {
+                res->tokens = {tkn.tok};
+            } else {
+                res->tokens.swap(slot.pending_tokens);
+            }
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -2596,10 +2605,10 @@ private:
             slot.debug_generated_text = slot.generated_text;
         }
 
-        // in stream mode, content and tokens are already in last partial chunk
+        // A token limit can leave IDs whose UTF-8 text is still incomplete.
         if (slot.task->params.stream) {
             res->content     = "";
-            res->tokens      = llama_tokens{};
+            res->tokens.swap(slot.pending_tokens);
         } else {
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);
