@@ -1,12 +1,12 @@
 # DP4 throughput implementation - November 4, 2026
 
-Status: all four source changes are implemented on `perf/glm53-dp-throughput`. CPU regressions and the SM120a CUDA build pass. GPU correctness, throughput gains and the transport decision remain unqualified; no speedup is claimed from source inspection. The existing `.Codex/PLAN.md` remains unchanged.
+Status: PRs [118](https://github.com/torad-labs/llama.cpp/pull/118) and [119](https://github.com/torad-labs/llama.cpp/pull/119) are merged into main (`3e15411a5`). Their local and remote branches were removed after verifying ancestry. The next source fixes are on `perf/glm53-decode-followups`, directly from main. CPU regressions and the SM120a CUDA build pass. GPU correctness, throughput gains and the transport decision remain unqualified; no speedup is claimed from source inspection.
 
 Start with owner-local sampling, then repair graph reuse where a cause is demonstrated, then optimize remaining collective latency. Keep the current BoldingBuilds IQ3_XXS pack, four-way DP with partitioned experts and replicated dense weights, private sequence caches, host latent KV, Q8 caches/state and MTP2. Preserve the two-card tensor serving path. Throughput comes before a 400K capacity run.
 
 ## Baseline and limits
 
-Runtime: `82ad56cb8b67c83c0977ae9e4d23da9b5779d469`. Evidence: [November 4 profiling](glm53-dp.md#november-4-single-session-profiling-and-scaling-controls) and [measurements](glm53-dp-profile-20261104.json). Documentation head at inspection: `301547c2039b9321d9afab4371f3bdab1285ba94`, branch `fix/dp-sampler-reserve`. [PR 118](https://github.com/torad-labs/llama.cpp/pull/118) remains an open draft; its startup fix is the tested baseline, not yet main. Keep that fix separate from subsequent optimizations. Its PR description predates the completed profiling and should be refreshed when the PR is prepared for review.
+Runtime: `82ad56cb8b67c83c0977ae9e4d23da9b5779d469`. Evidence: [November 4 profiling](glm53-dp.md#november-4-single-session-profiling-and-scaling-controls) and [measurements](glm53-dp-profile-20261104.json). Documentation head at inspection was `301547c2039b9321d9afab4371f3bdab1285ba94`. PR 118's startup fix is now on main, but the saved measurements still describe that earlier runtime. They do not measure the subsequent optimizations.
 
 One active session with 40 configured slots measured 45.3 tokens/s at 512 prompt tokens and 31.7 at 24,576. Reducing configured slots to one barely changed the short-context rate. One-slot host/GPU KV measured 36.7/36.8 at 24K with matching token IDs. These controls do not identify host KV or configured slot count as the main short-context bottleneck.
 
@@ -95,8 +95,26 @@ The collective probe prepares the fourth item; a production transport change sti
 
 ## Qualification availability, November 4 at 18:58 UTC
 
-[PR 119](https://github.com/torad-labs/llama.cpp/pull/119) holds this series, stacked on the startup fix in PR 118. The local candidate archive is SHA256 `668275c7b92e5e843559fb9b948e45cee5edbad5424b8cbd15037032d4cdfcdc`, with source head `75f8d57a2` and an independently built sampling-only library. Artifacts and the bounded controller are in `.Codex/tmp/dp-impl-20261104/`.
+At that time, PR 119 held this series, stacked on the startup fix in PR 118. That local candidate archive had SHA256 `668275c7b92e5e843559fb9b948e45cee5edbad5424b8cbd15037032d4cdfcdc`, with source head `75f8d57a2` and an independently built sampling-only library. Historical artifacts and the bounded controller are in `.Codex/tmp/dp-impl-20261104/`.
 
 No physical GPU test ran in this attempt. A direct restart of retained instance 59024660 reached SSH, but Rig's old hard-stop deadline interrupted the initial upload. The controller confirmed the box stopped after 30 seconds. A second attempt used `rig vast keep --hours 0.6666666666666666` to renew its deadline; the box did not restart within the controller's two-minute readiness budget. The start queue was cancelled and both provider states confirmed stopped. A fresh search found no four-card, >=90 GB/card, >=360 GB RAM offer at <=$8.50/hour and >=98% reliability. No new instance was created.
 
 GPU correctness, the ABBA rates and collective transport selection remain pending availability. The machine is stopped; its retained disk still incurs storage charges. The controller stops the instance immediately after necessary artifact collection and also arms an independent provider stop timer.
+
+## Follow-ups after the offline profile audit
+
+`ed45cde93` removes the hidden-row getter after terminal MTP samples while keeping the timing boundary after sampling, which already synchronizes. It also replaces the per-row sequence scan with a range-checked lookup. Sampling-output reordering now swaps only valid logits/probability/candidate prefixes; raw vocabulary rows are skipped only when no raw logits were copied for that batch. Mixed raw/backend output batches keep the raw permutation.
+
+The same commit prepares the constant KDA convolution layout and indexer APE transpose once at model load, preserving their element types. Tensor split distributes each device's Q/K/V segments; DP mirrors these dense weights. The derived allocations belong to the model, are included in memory accounting and logs, and are excluded from GGUF export. `LLAMA_GLM5NEXT_PREPACK_LEGACY=1` retains the old graph construction for qualification. The canonical weights remain allocated as well.
+
+`b46d39855` keeps DP draft selections in a persistent bank partitioned by sequence owner. Captures copy matching owner slices directly; graph reads select the local sequence slot without a host selection download or a cross-device gather. The existing round, position, pool-boundary and memory-generation checks still govern reuse. Graph inputs retain bank ownership across allocation changes. Matching Meta copies validate complete split layouts and skip empty ranks; different ownership retains the fallback. `LLAMA_KPOOL_SELECTION_HOST_LEGACY=1` remains the control.
+
+Local validation:
+
+- All 19 `test-speculative-mtp` groups pass. New coverage includes unequal sampling output lengths, raw-logit fallback, and exact legacy/prepared prefill, draft-token and verification-logit parity with one CPU device and two/four logical tensor and DP ranks.
+- Two/four logical-rank DP MTP with default and Q8 caches pass, including 48 sequence-rounds per configuration and controlled zero/one/two-token acceptance. The tiny fixture has no naturally accepted greedy drafts; controlled acceptance supplies that coverage.
+- `test-kpool-input` passes, including selection-bank width changes, reordered/shrinking batches, idle ranks, graph-storage destruction, memory invalidation and direct-copy admission/rejection. Its copy checks call the backend interface directly, so a silent host fallback cannot pass them.
+- SM120a CUDA compilation passes for the server and MTP/k-pool tests. No CUDA execution or paid machine was used for these follow-ups.
+- `test-llama-archs -a glm5next -s 1234` passes the DP KL checks and GGUF roundtrip. The full command still fails the prefill-reuse checks: the CPU compute reserve grows from 1,854,528 to 1,907,424 bytes, and logits differ at NMSE 1.70334e-12. The same failures occur with the legacy weight path; the diagnostic also expects sparse inputs where the short-context dense path has none. This is not reported as a green architecture suite.
+
+The next hardware window must qualify these changes together with PR 119 before attributing a throughput gain. Start with short prompts and equal output lengths, then stop after collection. Remaining separate work is persistent accepted hidden-state carry for small MTP batches; measured concurrent MTP policy, host-KV staging generations, collective transport and graph retention above 32 target rows. The terminal-getter change does not remove eager hidden-state downloads. No 400K capacity fill or 70-80 tokens/s result is established here.
