@@ -2076,6 +2076,19 @@ struct ggml_backend_cuda_context {
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time      = 0;
 
+    static bool graph_trace_enabled() {
+        static const bool enabled = ggml_env_switch("GGML_GRAPH_TRACE");
+        return enabled;
+    }
+
+    static bool graph_mem_stats_enabled() {
+        static const bool enabled = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_MEM_STATS");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        return enabled;
+    }
+
     ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key, int64_t time_now = ggml_time_us()) {
         // Give cached graphs 10s to be reused after an idle period, without updating each graph.
         if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
@@ -2088,6 +2101,10 @@ struct ggml_backend_cuda_context {
             next_graph_eviction_time = time_now + 5'000'000;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (!(it->first == key) && time_now - it->second->last_used_time >= 10'000'000) {
+                    if (graph_trace_enabled()) {
+                        GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=idle nodes=%zu\n",
+                            (void *) this, device, (unsigned long long) it->second->uid, it->second->num_nodes);
+                    }
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -2098,6 +2115,10 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
+            if (graph_trace_enabled()) {
+                GGML_LOG_INFO("graph_trace layer=cuda event=miss context=%p device=%d key=%p ggml_nodes=%d entries=%zu\n",
+                    (void *) this, device, key.first_node, key.n_nodes, cuda_graphs.size());
+            }
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -2141,6 +2162,9 @@ struct ggml_backend_cuda_context {
     cuda_graphs_held cuda_graph_make_room(const ggml_cuda_graph * graph) {
         const size_t max       = cuda_graphs_max();
         const size_t max_nodes = cuda_graph_nodes_max();
+        if (!max && !max_nodes && !graph_mem_stats_enabled() && !graph_trace_enabled()) {
+            return {0, 0};
+        }
         for (;;) {
             cuda_graphs_held held = { 1, graph->num_nodes };
             auto             lru  = cuda_graphs.end();
@@ -2157,6 +2181,11 @@ struct ggml_backend_cuda_context {
             const bool fits = (max == 0 || held.graphs <= max) && (max_nodes == 0 || held.nodes <= max_nodes);
             if (fits || lru == cuda_graphs.end()) {
                 return held;
+            }
+            if (graph_trace_enabled()) {
+                GGML_LOG_INFO("graph_trace layer=cuda event=evict context=%p device=%d uid=%llu reason=%s nodes=%zu held_graphs=%zu held_nodes=%zu\n",
+                    (void *) this, device, (unsigned long long) lru->second->uid,
+                    max && held.graphs > max ? "count_cap" : "node_cap", lru->second->num_nodes, held.graphs, held.nodes);
             }
             cuda_graphs.erase(lru);
         }

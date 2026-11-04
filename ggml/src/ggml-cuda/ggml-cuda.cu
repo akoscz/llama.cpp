@@ -4279,10 +4279,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 // the most one took is the most on this context so far: at INFO when that is the most memory, or the nodes held reach a
 // power of two (a -sm tensor split's context holds hundreds of small graphs), at DEBUG otherwise
 static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
-    static const bool mem_stats = [] {
-        const char * env = getenv("GGML_CUDA_GRAPH_MEM_STATS");
-        return env == nullptr || atoi(env) != 0;
-    }();
+    const bool mem_stats = cuda_ctx->graph_mem_stats_enabled();
     const ggml_backend_cuda_context::cuda_graphs_held held = cuda_ctx->cuda_graph_make_room(graph);
 
     size_t free_before = 0;
@@ -4292,6 +4289,10 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, gg
         CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
     }
     CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+    if (cuda_ctx->graph_trace_enabled()) {
+        GGML_LOG_INFO("graph_trace layer=cuda event=instantiate context=%p device=%d uid=%llu nodes=%zu held_graphs=%zu held_nodes=%zu\n",
+            (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid, graph->num_nodes, held.graphs, held.nodes);
+    }
     if (mem_stats) {
         CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
     }
@@ -4335,6 +4336,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
+        if (cuda_ctx->graph_trace_enabled()) {
+            GGML_LOG_INFO("graph_trace layer=cuda event=update_failed context=%p device=%d uid=%llu\n",
+                (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid);
+        }
         GGML_LOG_DEBUG("%s: CUDA graph update failed, re-instantiating\n", __func__);
 
         // The pre-existing graph exec cannot be updated due to violated constraints
@@ -4345,6 +4350,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         ggml_cuda_graph_instantiate(cuda_ctx, graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+        if (cuda_ctx->graph_trace_enabled()) {
+            GGML_LOG_INFO("graph_trace layer=cuda event=update context=%p device=%d uid=%llu\n",
+                (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph->uid);
+        }
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -7600,6 +7609,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_key graph_key;
 
 #ifdef USE_CUDA_GRAPH
+    const char * graph_reason = "disabled";
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     if (cuda_ctx->outer_capture) {
@@ -7615,9 +7625,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
+        graph_reason = "incompatible";
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            graph_reason = properties_changed ? "properties_changed" : "warmup";
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -7640,6 +7652,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+    if (cuda_ctx->graph_trace_enabled()) {
+        GGML_LOG_INFO("graph_trace layer=cuda event=%s context=%p device=%d uid=%llu key=%p ggml_nodes=%d reason=%s\n",
+            use_cuda_graph ? (cuda_graph_update_required ? "capture" : "replay") : "direct",
+            (void *) cuda_ctx, cuda_ctx->device, (unsigned long long) cgraph->uid, graph_key.first_node, cgraph->n_nodes,
+            use_cuda_graph ? "ready" : graph_reason);
     }
 #endif // USE_CUDA_GRAPH
 
@@ -7735,18 +7753,26 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
 
     size_t n_nodes = 0;
     CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n_nodes));
-    size_t free_before;
-    size_t free_after;
-    size_t total;
-    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    const bool mem_stats = cuda_ctx->graph_mem_stats_enabled();
+    size_t free_before = 0, free_after = 0, total = 0;
+    if (mem_stats) { CUDA_CHECK(cudaMemGetInfo(&free_before, &total)); }
     const int64_t t_start_us = ggml_time_us();
     cudaGraphExec_t exec = nullptr;
     CUDA_CHECK(cudaGraphInstantiate(&exec, graph, NULL, NULL, 0));
     const int64_t t_instantiate_us = ggml_time_us() - t_start_us;
-    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    if (mem_stats) { CUDA_CHECK(cudaMemGetInfo(&free_after, &total)); }
     CUDA_CHECK(cudaGraphDestroy(graph));
-    GGML_LOG_DEBUG("%s: %s: %zu nodes, instantiating took %.2f MiB and %.2f ms\n", __func__, cuda_ctx->name.c_str(),
-        n_nodes, (free_before > free_after ? free_before - free_after : 0) / 1024.0 / 1024.0, t_instantiate_us / 1e3);
+    if (mem_stats) {
+        GGML_LOG_DEBUG("%s: %s: %zu nodes, instantiating took %.2f MiB and %.2f ms\n", __func__, cuda_ctx->name.c_str(),
+            n_nodes, (free_before > free_after ? free_before - free_after : 0) / 1024.0 / 1024.0, t_instantiate_us / 1e3);
+    } else {
+        GGML_LOG_DEBUG("%s: %s: %zu nodes, instantiating took %.2f ms (memory measurement disabled)\n",
+            __func__, cuda_ctx->name.c_str(), n_nodes, t_instantiate_us / 1e3);
+    }
+    if (cuda_ctx->graph_trace_enabled()) {
+        GGML_LOG_INFO("graph_trace layer=cuda_outer event=instantiate context=%p device=%d exec=%p nodes=%zu host_us=%lld\n",
+            (void *) cuda_ctx, cuda_ctx->device, (void *) exec, n_nodes, (long long) t_instantiate_us);
+    }
     return exec;
 }
 

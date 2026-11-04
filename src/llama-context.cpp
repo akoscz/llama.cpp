@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1752,15 +1753,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    // a backend sampler with inputs holds those of the graph built last (build_sampling binds them), so while one is set
-    // only that graph can be reused, as with gf_res_prev alone: no slots
-    const auto sampling_has_inputs = [this]() {
-        return std::any_of(sampling.samplers.begin(), sampling.samplers.end(),
-                [](const auto & entry) { return llama_sampler_backend_has_inputs(entry.second); });
+    // Custom samplers without retained input bindings can only use the graph built last.
+    const auto sampling_can_retain = [this]() {
+        return std::all_of(sampling.samplers.begin(), sampling.samplers.end(),
+                [](const auto & entry) { return llama_sampler_backend_can_retain(entry.second); });
     };
     const bool mtp_shape = graph_slot_mtp_seq_tokens > 0 && ubatch.equal_seqs() &&
         ubatch.n_seq_tokens <= graph_slot_mtp_seq_tokens && ubatch.n_tokens <= graph_slot_max_rows;
-    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape) && !sampling_has_inputs();
+    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape) && sampling_can_retain();
 
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
@@ -1870,6 +1870,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         *t_used = graph_clock;
     }
     sched_res = sched_gf;
+
+    static const bool graph_trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    if (graph_trace) {
+        std::string owners;
+        if (cparams.n_seq_devices > 1) {
+            for (auto rows : ubatch.device_rows(cparams.n_seq_devices, true)) {
+                owners += (owners.empty() ? "" : ",") + std::to_string(rows);
+            }
+        }
+        LLAMA_LOG_INFO("graph_trace layer=llama event=%s context=%p result=%p uid=%llu phase=%s rows=%u outputs=%u owners=%s slots=%zu slots_allowed=%d nodes=%d\n",
+            reuse ? "reuse" : "build", (void *) this, (void *) res, (unsigned long long) gf->uid,
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "target", ubatch.n_tokens, gparams.n_outputs,
+            owners.empty() ? "none" : owners.c_str(), graph_slots.size(), (int) use_slots, ggml_graph_n_nodes(gf));
+    }
 
     // set the input data for the input tensors
     {

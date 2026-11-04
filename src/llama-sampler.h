@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <vector>
 
 struct llama_vocab;
@@ -36,9 +37,11 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
-// whether a backend sampler of the chain writes graph inputs (.backend_set_input, e.g. the dist sampler's uniforms): it
-// holds those of the graph it was applied to last, so no other graph with it can be computed without a rebuild
+// Whether a backend sampler of the chain writes graph inputs.
 bool llama_sampler_backend_has_inputs(const llama_sampler * sampler);
+// Built-in input setters can retain graph-specific tensor bindings while reading the live sampling state.
+bool llama_sampler_backend_can_retain(const llama_sampler * sampler);
+std::function<void()> llama_sampler_backend_bind_inputs(llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 // the context no longer runs the sampler: the chain applies every sampler on the CPU again and the dist sampler draws
 // from its own RNG outside any backend transaction (a sequence goes back to the backend with a fresh sampler)

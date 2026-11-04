@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1539,9 +1540,7 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
         }
         llama_sampler_backend_set_batch(sampler, ubatch->token ? tokens.data() : nullptr, output.data(), (int32_t) output.size());
 
-        if (sampler->iface->backend_set_input) {
-            sampler->iface->backend_set_input(sampler);
-        }
+        input_setters.at(seq_id)();
     }
 }
 
@@ -1677,7 +1676,13 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
-    if (!this->params.allow_reuse(params)) {
+    static const bool trace = ggml_env_switch("GGML_GRAPH_TRACE");
+    const char * reason = nullptr;
+    if (!this->params.allow_reuse(params, trace ? &reason : nullptr)) {
+        if (trace) {
+            LLAMA_LOG_INFO("graph_trace layer=llama event=reject result=%p uid=%llu reason=%s rows=%u next_rows=%u\n",
+                (void *) this, (unsigned long long) gf->uid, reason, this->params.ubatch.n_tokens, params.ubatch.n_tokens);
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1694,6 +1699,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     int input_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if (trace && !cur) {
+            LLAMA_LOG_INFO("graph_trace layer=llama event=reject result=%p uid=%llu reason=input input=%d rows=%u\n",
+                (void *) this, (unsigned long long) gf->uid, input_idx, params.ubatch.n_tokens);
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: input %d can_reuse = %d\n", __func__, input_idx, cur);
@@ -4746,7 +4755,6 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
-    res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
@@ -4848,6 +4856,11 @@ void llm_graph_context::build_sampling() const {
             }
         }
     }
+
+    for (const auto & [seq_id, sampler] : samplers) {
+        inp_sampling->input_setters.emplace(seq_id, llama_sampler_backend_bind_inputs(sampler));
+    }
+    res->add_input(std::move(inp_sampling));
 
     // TODO: Call backend_accept after all samplers have been applied.
     /*

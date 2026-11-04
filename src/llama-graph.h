@@ -848,6 +848,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::function<void()>> input_setters;
 };
 
 //
@@ -912,7 +913,8 @@ struct llm_graph_params {
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
-    bool allow_reuse(const llm_graph_params & other) const {
+    bool allow_reuse(const llm_graph_params & other, const char ** reason = nullptr) const {
+        const auto reject = [reason](const char * why) { if (reason) { *reason = why; } return false; };
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -941,52 +943,52 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
-            return false;
+            return reject("ubatch_shape_or_sequences");
         }
 
         if (n_outputs != other.n_outputs) {
-            return false;
+            return reject("output_count");
         }
 
         if (cparams.n_seq_devices != other.cparams.n_seq_devices) {
-            return false;
+            return reject("device_count");
         }
         if (cparams.n_seq_devices > 1) {
             if (!ubatch.data || !other.ubatch.data ||
                     ubatch.device_rows(cparams.n_seq_devices) != other.ubatch.device_rows(cparams.n_seq_devices) ||
                     ubatch.device_rows(cparams.n_seq_devices, true) != other.ubatch.device_rows(cparams.n_seq_devices, true)) {
-                return false;
+                return reject("device_row_ownership");
             }
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
-            return false;
+            return reject("sampler_identity");
         }
 
         if (samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
-                return false;
+                return reject("sampler_batch_lifetime");
             }
 
             // check that the outputs are the same for all samplers
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (ubatch.output[i]    != other.ubatch.output[i] ||
                     ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
-                    return false;
+                    return reject("sampler_output_ownership");
                 }
             }
         }
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
-            return false;
+            return reject("nextn_layer");
         }
 
         if (nextn.mode != other.nextn.mode || nextn.store != other.nextn.store) {
-            return false;
+            return reject("nextn_store");
         }
 
-        return
+        const bool compatible =
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -996,6 +998,7 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
+        return compatible || reject("model_or_context_parameters");
     }
 };
 
