@@ -1,6 +1,6 @@
-# DP4 throughput implementation proposal - November 4, 2026
+# DP4 throughput implementation - November 4, 2026
 
-Status: research and source inspection complete; the changes below are proposed, not implemented. No machine was started for this work. The existing `.Codex/PLAN.md` remains unchanged.
+Status: all four source changes are implemented on `perf/glm53-dp-throughput`. CPU regressions and the SM120a CUDA build pass. GPU correctness, throughput gains and the transport decision remain unqualified; no speedup is claimed from source inspection. The existing `.Codex/PLAN.md` remains unchanged.
 
 Start with owner-local sampling, then repair graph reuse where a cause is demonstrated, then optimize remaining collective latency. Keep the current BoldingBuilds IQ3_XXS pack, four-way DP with partitioned experts and replicated dense weights, private sequence caches, host latent KV, Q8 caches/state and MTP2. Preserve the two-card tensor serving path. Throughput comes before a 400K capacity run.
 
@@ -78,3 +78,17 @@ Finish source changes, focused CPU regressions, CUDA compilation, review and pac
 First qualify CUDA correctness, then warmed unprofiled 512/4K requests at 1/2/4/8 active sessions with 40 slots configured. Compare baseline and individual candidate changes as well as the combined candidate. Check that the sampling gather is absent and repeated graph instantiations fall for shapes already warmed. Extend the existing 24K control only after short-context throughput and scaling improve. Stop the machine as soon as collection finishes; analysis and documentation are local.
 
 Do not launch a 400K/full-capacity fill while the short concurrent workload remains unusable. The eventual requirement is useful per-stream throughput at the accepted active-session count, followed by gradual 400K capacity qualification, tool-cache continuity and numerical checks. Forty allocated slots are not proof that forty filled sessions perform acceptably. The user's 70-80 tokens/s team target remains a target, not a predicted result from these fixes.
+
+## Implementation and local validation
+
+- `87c9ce015`: DP sampling copies each vocabulary row into an aligned owner-local allocation. Tensor-split padding/gather remains. Four logical CPU ranks pass uneven/empty ownership layouts and three sampling chains, including the 154,880-token vocabulary, probabilities, candidates, seeded draws and unchanged source logits.
+- `230ace57b`: graph reuse exposed an allocator lifetime defect. A temporary becoming an output could keep its old overlapping allocation. Allocation plans now include input/output lifetime flags. The regression fails without the check and passes with it.
+- `8fb096af9`: retained graphs snapshot built-in sampler tensor bindings while sharing live RNG and penalty history. Unknown custom input callbacks retain the current-graph-only behavior. Three repeated shapes reuse without rebuilding, preserve seeded tokens and sampled outputs through partial acceptance, and survive eviction/owner changes. CPU DP/MTP cases pass on two and four logical ranks with default and Q8 caches. This does not imply arbitrary concurrent shapes fit the bounded cache.
+- `9ed90db1b`: `measure.py --mode scaling` records native timings, raw SSE, each burst's token IDs and receive time, and the common decode interval. `--baseline-binary DIR` runs A1/B1/B2/A2 with one shared deadline. Seventeen harness tests pass, including HTTP streaming and all four ABBA legs.
+- `b998962b1`: the existing collective test adds `--bench 4 [--delay 0..64]`, with 1/4/8/40-row payloads, F32/BF16 reduction, bitwise gather, peer/host paths and raw latency samples. Whole-evaluation capture is used where supported. Copy-engine reduction synchronizes the host and cannot join that capture; its result explicitly reports `whole_eval_capture=false`. The replay-only control and wall latency include launch/synchronization overhead; they are not GPU kernel latency.
+
+`GGML_GRAPH_TRACE=1` reports llama graph UID/phase/ownership, reuse rejection, Meta capture/LRU decisions and CUDA instantiate/update/replay/eviction. It is disabled for throughput measurements. No cache limits were raised. Whole-evaluation capture now also honors `GGML_CUDA_GRAPH_MEM_STATS=0`, avoiding two accounting-only memory queries that the earlier change missed.
+
+Focused local checks: `test-alloc`; `test-backend-meta-sampler --cpu`; `test-speculative-mtp --test sampler-graphs`; `test-speculative-mtp --dp-device CPU`; tensor CPU split cases `(0,1)`, `(0,3)`, `(1,8)`; and `python3 -m unittest discover -s scripts/glm53 -p test_measure.py`. CUDA compilation covered the server, sampler/MTP tests, collective probe and split tests. Raw local logs are under `.Codex/tmp/dp-impl-20261104/`.
+
+The collective probe prepares the fourth item; a production transport change still requires measured evidence. The next bounded rental must establish physical CUDA correctness before the full-model ABBA matrix. Keep the startup-fix baseline (`82ad56cb8`), a sampling-only library from `87c9ce015`, and the combined candidate separately identified by artifact hashes.
