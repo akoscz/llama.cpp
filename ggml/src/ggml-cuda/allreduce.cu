@@ -417,9 +417,9 @@ static __device__ __forceinline__ ggml_cuda_ar_accumulator<T_wire> ggml_cuda_ar_
 }
 
 // Every receiver adds the original shares in increasing rank order, rounding only at the wire and destination.
-template <typename T_dst, typename T_wire>
+template <typename T_dst, typename T_wire, bool peer_push = false>
 static __global__ void ggml_cuda_ar_kernel_n(
-        T_dst * data, ggml_cuda_ar_rank_ptrs<T_wire> staging, size_t slot_elems, int count,
+        T_dst * data, ggml_cuda_ar_rank_ptrs<T_wire> staging, ggml_cuda_ar_rank_ptrs<T_wire> receives, size_t slot_elems, int count,
         int * arrival, int rank, int n_ranks, int * counter) {
     constexpr int V = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
     constexpr int A = GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int);
@@ -434,14 +434,28 @@ static __global__ void ggml_cuda_ar_kernel_n(
     __syncthreads();
     const int token = token_shared;
     const size_t offset = (size_t) (token & 1) * slot_elems;
-    T_wire * mine = staging.ptr[rank] + offset;
     for (int i = gtid; i < nv; i += gnt) {
         T_wire wire[V];
 #pragma unroll
         for (int k = 0; k < V; ++k) { wire[k] = ggml_cuda_cast<T_wire>(data[i*V + k]); }
-        ggml_cuda_memcpy_1<sizeof(wire)>(mine + i*V, wire);
+        if constexpr (peer_push) {
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer != rank) { ggml_cuda_memcpy_1<sizeof(wire)>(staging.ptr[peer] + offset + i*V, wire); }
+            }
+        } else {
+            ggml_cuda_memcpy_1<sizeof(wire)>(staging.ptr[rank] + offset + i*V, wire);
+        }
     }
-    if (bid == 0 && tid < count - tail) { mine[tail + tid] = ggml_cuda_cast<T_wire>(data[tail + tid]); }
+    if (bid == 0 && tid < count - tail) {
+        const T_wire wire = ggml_cuda_cast<T_wire>(data[tail + tid]);
+        if constexpr (peer_push) {
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer != rank) { staging.ptr[peer][offset + tail + tid] = wire; }
+            }
+        } else {
+            staging.ptr[rank][offset + tail + tid] = wire;
+        }
+    }
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
@@ -469,7 +483,7 @@ static __global__ void ggml_cuda_ar_kernel_n(
 #pragma unroll
                 for (int k = 0; k < V; ++k) { wire[k] = ggml_cuda_cast<T_wire>(data[i*V + k]); }
             } else {
-                ggml_cuda_memcpy_1<sizeof(wire)>(wire, staging.ptr[peer] + offset + i*V);
+                ggml_cuda_memcpy_1<sizeof(wire)>(wire, receives.ptr[peer] + offset + i*V);
             }
 #pragma unroll
             for (int k = 0; k < V; ++k) { sum[k] = ggml_cuda_ar_accumulate<T_wire>(sum[k], wire[k], peer); }
@@ -480,7 +494,7 @@ static __global__ void ggml_cuda_ar_kernel_n(
     if (bid == 0 && tid < count - tail) {
         ggml_cuda_ar_accumulator<T_wire> sum = {};
         for (int peer = 0; peer < n_ranks; ++peer) {
-            const T_wire v = peer == rank ? ggml_cuda_cast<T_wire>(data[tail + tid]) : staging.ptr[peer][offset + tail + tid];
+            const T_wire v = peer == rank ? ggml_cuda_cast<T_wire>(data[tail + tid]) : receives.ptr[peer][offset + tail + tid];
             sum = ggml_cuda_ar_accumulate<T_wire>(sum, v, peer);
         }
         data[tail + tid] = ggml_cuda_cast<T_dst>(sum);
@@ -684,12 +698,14 @@ struct ggml_cuda_ar_pipeline {
     size_t   ll_max_bytes;   // wire bytes up to which the host LL path reduces; 0 disables this path
     size_t   p2p_max_bytes;  // wire bytes up to which the LL kernel reduces card to card; 0 when off or unavailable
     bool     copy_peer;      // copy-engine shares go card to card, into the peer's dev_tmp (ggml_cuda_ar_allreduce_copy_peer)
+    bool     gather_peer;    // large captured gathers push into a separate parity ring on each peer
     uint64_t call_count;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping ll_buf[GGML_CUDA_MAX_DEVICES];     // pinned packets (LL kernel), 2 slots
     ggml_cuda_ar_peer_mem     p2p[GGML_CUDA_MAX_DEVICES];        // device packets (LL kernel card to card), 2 slots
+    ggml_cuda_ar_peer_mem     gather_buf[GGML_CUDA_MAX_DEVICES]; // one parity ring per sender, local reads after peer writes
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine), none under copy_peer
     // Device scratch for the copy-engine path: the peer's share, which the add_kernel adds. Under copy_peer the peer
     // copies it in, so it is mapped for both cards.
@@ -1197,12 +1213,23 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->dev_tmp[i].size = receive_bytes;
     }
 
+    const size_t gather_bytes = GGML_CUDA_AR_POOL_SIZE * p->buf_bytes * (n_devices - 1);
+    p->gather_peer = p->copy_peer;
+    for (size_t i = 0; p->gather_peer && i < n_devices; ++i) {
+        if (!ggml_cuda_ar_peer_alloc(p, (int) i, gather_bytes, p->gather_buf[i])) {
+            for (size_t k = 0; k < n_devices; ++k) { ggml_cuda_ar_peer_free(p, (int) k, p->gather_buf[k]); }
+            p->gather_peer = false;
+            GGML_LOG_WARN("%s: gather inbox allocation failed; large gathers stage through host memory\n", __func__);
+        }
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu KB LL staging (up to %zu KB on the wire) + %zu MB copy-engine %s per GPU, "
-                  "LL card to card up to %zu bytes on the wire, copy-engine receives %s, %zu MB receive scratch per GPU\n",
+                  "LL card to card up to %zu bytes on the wire, copy-engine receives %s, %zu MB receive scratch per GPU, large gather %s\n",
                   __func__, n_devices, p->buf_bytes >> 10, ll_total >> 10, p->ll_max_bytes >> 10, p->copy_bytes >> 20,
                   p->copy_peer ? "receive buffer" : "staging", p->p2p_max_bytes,
-                  p->copy_peer ? "card to card" : one_stream ? "after the sends" : "beside the sends", receive_bytes >> 20);
+                  p->copy_peer ? "card to card" : one_stream ? "after the sends" : "beside the sends", receive_bytes >> 20,
+                  p->gather_peer ? "card to card" : "through host memory");
 
     return p;
 }
@@ -1228,6 +1255,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         p->host_buf[i].free();
         p->ll_buf[i].free();
         ggml_cuda_ar_p2p_free(p, i);
+        ggml_cuda_ar_peer_free(p, i, p->gather_buf[i]);
         p->host_large[i].free();
         ggml_cuda_ar_peer_free(p, i, p->dev_tmp[i]);
         if (p->counter[i]) {
@@ -1607,6 +1635,7 @@ static void ggml_cuda_ar_launch_kernels(
     const size_t wire_bytes      = (size_t) ne * sizeof(T_wire);
     const bool   use_p2p         = wire_bytes <= p->p2p_max_bytes;
     const bool   use_ll          = use_p2p || wire_bytes <= p->ll_max_bytes;
+    const bool   gather_peer     = std::is_same_v<T_dst, uint32_t> && p->gather_peer && !use_ll;
 
     for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
         const size_t remaining_elems = (size_t) (ne - chunk_start);
@@ -1623,6 +1652,21 @@ static void ggml_cuda_ar_launch_kernels(
                 CUDA_CHECK(cudaMemsetAsync(chunk, 0, chunk_elems * sizeof(T_dst), stream));
             }
 
+            if (gather_peer) {
+                ggml_cuda_ar_rank_ptrs<T_wire> sends, receives;
+                for (int peer = 0; peer < p->n_devices; ++peer) {
+                    if (peer == i) { continue; }
+                    const int send_index = i < peer ? i : i - 1;
+                    const int recv_index = peer < i ? peer : peer - 1;
+                    sends.ptr[peer] = p->gather_buf[peer].as<T_wire>() + send_index*GGML_CUDA_AR_POOL_SIZE*max_chunk_elems;
+                    receives.ptr[peer] = p->gather_buf[i].as<T_wire>() + recv_index*GGML_CUDA_AR_POOL_SIZE*max_chunk_elems;
+                }
+                ggml_cuda_ar_kernel_n<T_dst, T_wire, true><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
+                    chunk, sends, receives, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
+                    i, p->n_devices, p->counter[i]);
+                CUDA_CHECK(cudaGetLastError());
+                continue;
+            }
             if (p->n_devices != 2) {
                 if (use_ll) {
                     ggml_cuda_ar_rank_ptrs<uint2> sends;
@@ -1648,7 +1692,7 @@ static void ggml_cuda_ar_launch_kernels(
                         staging.ptr[rank] = reinterpret_cast<T_wire *>(p->host_buf[rank].dev);
                     }
                     ggml_cuda_ar_kernel_n<T_dst, T_wire><<<GGML_CUDA_AR_KERNEL_BLOCKS, 256, 0, stream>>>(
-                        chunk, staging, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
+                        chunk, staging, staging, max_chunk_elems, (int) chunk_elems, reinterpret_cast<int *>(p->arrival.dev),
                         i, p->n_devices, p->counter[i]);
                 }
                 CUDA_CHECK(cudaGetLastError());
@@ -1945,7 +1989,7 @@ bool ggml_cuda_ar_allgather(
         data[i]       = tensors[i]->data;
         zero_first[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0; // a device with no part brings none
     }
-    // never the copy engines: the words go through the kernels whatever their size, so a capture holds the gather
+    // Device counters and peer inboxes keep large gathers capturable; unsupported peers retain host staging.
     ggml_cuda_ar_launch_kernels<uint32_t, uint32_t>(p, backends, data, zero_first, (int64_t) (nbytes / sizeof(uint32_t)));
     return true;
 }

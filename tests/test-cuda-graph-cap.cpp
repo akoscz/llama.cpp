@@ -26,6 +26,10 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#ifdef GGML_USE_CUDA
+#include "../ggml/src/ggml-cuda/common.cuh"
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +46,7 @@ struct graph_log {
     int    captured  = 0;
     size_t held_max  = 0; // "N CUDA graphs held at most", the most the backend reported
     size_t nodes_max = 0; // "..., K nodes"
+    size_t held_lines = 0;
 };
 
 static void log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -50,6 +55,7 @@ static void log_callback(ggml_log_level level, const char * text, void * user_da
         log->captured++;
     }
     if (const char * held = strstr(text, "CUDA graphs held at most")) {
+        log->held_lines++;
         // the count is the number right before it: "...: CUDA0 (context 0x...): 4 CUDA graphs held at most, 12 nodes ..."
         const char * p = held;
         while (p > text && p[-1] == ' ') {
@@ -240,6 +246,35 @@ static std::vector<int> compute_rounds(ggml_backend_dev_t dev, graph_log & log, 
     return captured;
 }
 
+static bool test_graph_lifetime() {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context ctx(0);
+    ggml_cuda_graph_key a, b;
+    a.first_node = reinterpret_cast<const void *>(0x1);
+    b.first_node = reinterpret_cast<const void *>(0x2);
+
+    auto * graph_a = ctx.cuda_graph(a, 1'000'000);
+    auto * graph_b = ctx.cuda_graph(b, 2'000'000);
+    ctx.cuda_graph(a, 3'000'000);
+    ctx.cuda_graph(b, 14'000'000);
+
+    // A has been idle for 11 s, but traffic on B means the cache is still active. A must survive to be replayed.
+    const bool active_kept = ctx.cuda_graphs.count(a) && ctx.cuda_graphs.count(b) &&
+        ctx.cuda_graph(a, 16'000'000) == graph_a && ctx.cuda_graph(b, 17'000'000) == graph_b;
+    printf("  active traffic keeps reusable graphs: %s\n", active_kept ? "ok" : "FAILED");
+
+    // After a genuinely idle period, an old graph other than the requested one is evicted.
+    ctx.cuda_graph(a, 28'000'000);
+    ctx.cuda_graph(a, 29'000'000);
+    const bool idle_evicted = ctx.cuda_graph(a, 38'000'000) == graph_a && !ctx.cuda_graphs.count(b);
+    printf("  true idle period evicts stale graphs: %s\n", idle_evicted ? "ok" : "FAILED");
+    return active_kept && idle_evicted;
+#else
+    puts("CUDA graph lifetime test skipped: CUDA graphs are not built");
+    return true;
+#endif
+}
+
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
     _putenv_s(name, value != nullptr ? value : "");
@@ -262,12 +297,19 @@ static std::string join(const std::vector<int> & v) {
 
 int main(int argc, char ** argv) {
     const bool nodes = argc > 1 && strcmp(argv[1], "nodes") == 0;
+    const bool idle  = argc > 1 && strcmp(argv[1], "idle") == 0;
+    const bool no_mem_stats = argc > 1 && strcmp(argv[1], "no-mem-stats") == 0;
+
+    if (idle) {
+        return test_graph_lifetime() ? 0 : 1;
+    }
 
     // the caps are read once, when the first CUDA backend is made
     const std::string cap_env       = std::to_string(cap);
     const std::string cap_nodes_env = std::to_string(cap_nodes);
     set_env("GGML_CUDA_GRAPH_MAX", nodes ? nullptr : cap_env.c_str());
     set_env("GGML_CUDA_GRAPH_NODES", nodes ? cap_nodes_env.c_str() : nullptr);
+    set_env("GGML_CUDA_GRAPH_MEM_STATS", no_mem_stats ? "0" : nullptr);
 
     ggml_backend_load_all();
 
@@ -294,6 +336,17 @@ int main(int argc, char ** argv) {
         }
         if (log.captured == 0) {
             printf("  no graph was captured: this device does not use CUDA graphs, skipped\n");
+            continue;
+        }
+
+        if (no_mem_stats) {
+            ok &= compute_shapes(dev, cpu, log, { 1, 2, 3 }, 3, supported);
+            const bool quiet = log.held_lines == 0;
+            const bool captured = log.captured == 3;
+            ok &= quiet && captured;
+            printf("  memory stats disabled: log lines %zu (0 expected), captures %d (3 expected): %s\n",
+                log.held_lines, log.captured, quiet && captured ? "ok" : "FAILED");
+            n_tested++;
             continue;
         }
 

@@ -1,4 +1,15 @@
-# Reproducing GLM-5.3 Flash serving on two SM120 cards
+# GLM-5.3 Flash serving recipes
+
+Select the GPU layout explicitly with `scripts/glm53/serve.py --profile`:
+
+| Launcher profile | Server layout | Engine flags and visible devices |
+|---|---|---|
+| `tensor-2` (default) | One server spans two cards with tensor parallelism | `-sm tensor -ts 1,1`, `CUDA_VISIBLE_DEVICES=0,1` |
+| `dp-4` | One server spans all four cards; sequences have individual owners, dense weights are replicated, and routed experts are partitioned across all four | `-sm dp -ts 1,1,1,1`, `CUDA_VISIBLE_DEVICES=0,1,2,3` |
+
+`dp-4` is the Python launcher's profile name, selected with `--profile dp-4`. It creates one four-card group, not two independent two-card servers or a 2x2 tensor/data split. The four-card launcher, host-KV option, measurements and current throughput blocker are documented in the [four-card DP recipe](../torad/glm53-dp.md#candidate-serving-command). That candidate keeps MTP enabled; the historical MTP-off comparison below is specific to `tensor-2`.
+
+The remaining commands and measurements on this page describe `tensor-2`. Omitting `--profile` selects that two-card default.
 
 This recipe reproduces the retained 524,288-token serving configuration for
 GLM-5.3-Flash-Uncensored IQ3_XXS on two 96 GB RTX PRO 6000 Blackwell cards. It
@@ -50,7 +61,7 @@ draft shortlist and pinned template hashes.
 First print the exact argument vector and environment without loading a model:
 
 ```sh
-python3 scripts/glm53/serve.py \
+python3 scripts/glm53/serve.py --profile tensor-2 \
   --server ./build/bin/llama-server \
   --model /models/GLM-5.3/IQ3_XXS/GLM-5.3-Flash-Uncensored-IQ3_XXS-00001-of-00003.gguf \
   --mmproj /models/GLM-5.3/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
@@ -93,7 +104,7 @@ overrides, then installs the displayed settings. This prevents a forgotten
 profile or diagnostic switch from changing the recipe. The server's own access
 controls stay: `LLAMA_API_KEY`, `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SSL_KEY_FILE`
 and `LLAMA_ARG_SSL_CERT_FILE` reach the server, and the dry run lists the keys it
-removes under `removed`. It fixes device
+removes under `removed`. The `tensor-2` profile fixes device
 visibility to cards 0 and 1; container device mapping must make the intended
 cards available. `LD_LIBRARY_PATH` is set to the selected server's directory,
 so place its matching shared libraries there. Run the displayed command

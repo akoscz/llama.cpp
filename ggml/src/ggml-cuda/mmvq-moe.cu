@@ -341,8 +341,8 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
                 break;
             }
         }
-        const unsigned heads0 = __ballot_sync(0xFFFFFFFF, lane < npairs && first0 == lane);
-        const unsigned heads1 = __ballot_sync(0xFFFFFFFF, p1   < npairs && first1 == p1);
+        const unsigned heads0 = __ballot_sync(0xFFFFFFFF, lane < npairs && e0 >= 0 && first0 == lane);
+        const unsigned heads1 = __ballot_sync(0xFFFFFFFF, p1   < npairs && e1 >= 0 && first1 == p1);
         const unsigned below  = (1u << lane) - 1;
         if (heads0 & (1u << lane)) {
             expert[__popc(heads0 & below)] = e0;
@@ -353,10 +353,10 @@ static __global__ void mmvq_moe(const mmvq_moe_dev_args a) {
             pair_u[p1] = __popc(heads0) + __popc(heads1 & below);
         }
         __syncwarp();
-        if (lane < npairs) {
+        if (lane < npairs && e0 >= 0) {
             atomicOr(&pairs_of[pair_u[first0]], 1ull << lane);
         }
-        if (p1 < npairs) {
+        if (p1 < npairs && e1 >= 0) {
             atomicOr(&pairs_of[pair_u[first1]], 1ull << p1);
         }
         __syncwarp();

@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <optional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -604,8 +605,12 @@ struct server_prompt_cache_state {
     server_prompt_data data;
     // The beginning of the restorable memory, including recurrent/SWA state.
     llama_pos pos_min = 0;
+    size_t cached_size = 0;
 
     size_t size() const {
+        if (cached_size != 0) {
+            return cached_size;
+        }
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
@@ -613,6 +618,10 @@ struct server_prompt_cache_state {
         }
 
         return res;
+    }
+
+    void freeze_size() {
+        cached_size = size();
     }
 };
 
@@ -627,14 +636,25 @@ enum class server_prompt_cache_result {
 
 const char * server_prompt_cache_result_name(server_prompt_cache_result result);
 
+struct server_prompt_cache_test_access;
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
 
-    std::list<server_prompt_cache_state> states;
+private:
+    friend struct server_prompt_cache_test_access;
 
+    std::list<server_prompt_cache_state> states;
+    size_t total_bytes = 0;
+    size_t total_tokens = 0;
+
+    void insert_state(server_prompt_cache_state && state);
+    std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
+
+public:
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
@@ -650,10 +670,10 @@ struct server_prompt_cache {
             bool allow_evict = true);
 
     static size_t reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
-            llama_pos pos_min, int32_t n_swa);
+            llama_pos pos_min, int32_t n_swa, std::optional<size_t> lcp = std::nullopt);
 
     server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new,
-            llama_pos pos_min, int32_t n_swa);
+            llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse = std::nullopt);
 
     // consume: the slot takes the whole snapshot, so the RAM copy goes; otherwise the slot will cut it to the shared
     // prefix and the copy stays recoverable for the conversation it belongs to

@@ -344,3 +344,56 @@ def test_unlimited_byte_budget_refuses_a_save_that_cannot_fit_before_evicting():
     res = server.make_request("POST", "/completion", data={"prompt": y, "cache_prompt": True})
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] >= ny - 2, res.body["timings"]
+
+
+def test_consumed_restore_does_not_inflate_future_token_evictions():
+    global server
+    server.cache_ram = -1
+    server.n_ctx = 512
+    server.n_slots = 2
+    server.start()
+
+    a = " ".join(["alpha beta gamma delta"] * 12)
+    b = " ".join(["red green blue"] * 15)
+    c = " ".join(["north south east west"] * 10)
+
+    def complete(prompt):
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "n_predict": 1})
+        assert res.status_code == 200
+        return res.body["timings"]
+
+    cold_a = complete(a)
+    complete(b)
+    # A consumes its RAM snapshot on return. Its tokens must leave the cache-wide total before the prompt moves out.
+    assert complete(a)["cache_n"] >= cold_a["prompt_n"] - 2
+    complete(c)
+    # A and B still fit beside one another, so B must not be evicted by A's already-consumed tokens.
+    assert complete(b)["cache_n"] > 0
+
+
+def test_admission_eviction_preserves_recent_snapshot():
+    global server
+    server.cache_ram = 2
+    server.n_slots = 1
+    server.n_ctx = 2048
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompts = [
+        "alpha beta gamma delta " * 70,
+        "red green blue " * 60,
+        "north south east west " * 40,
+        "orange purple silver gold " * 50,
+        "one two three four " * 60,
+        "silver bronze copper iron " * 50,
+        "black white gray " * 40,
+    ]
+    for prompt in prompts:
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "n_predict": 1})
+        assert res.status_code == 200
+    assert "cache_evict" in log.drain(), log.path
+
+    # The previous prompt is no longer resident. It must survive bounded update() eviction in RAM.
+    res = server.make_request("POST", "/completion", data={"prompt": prompts[-2], "cache_prompt": True, "n_predict": 1})
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0

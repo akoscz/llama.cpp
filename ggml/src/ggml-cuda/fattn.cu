@@ -1093,7 +1093,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+static size_t ggml_cuda_flash_attn_ext_device_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE);
 
     const ggml_tensor * K = dst->src[1];
@@ -1130,7 +1130,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_device(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
@@ -1145,6 +1145,80 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+}
+
+struct ggml_cuda_fattn_host_stage {
+    ggml_tensor k, v, ids, node;
+    size_t rows, selected, kv_offset, ids_offset, bytes;
+
+    ggml_cuda_fattn_host_stage(int device, const ggml_tensor * dst) : k(*dst->src[1]), v(*dst->src[2]), ids{}, node(*dst) {
+        GGML_ASSERT(k.type == GGML_TYPE_Q8_0 && k.ne[0] == 512 && v.ne[0] == 512 && k.ne[2] == 1);
+        GGML_ASSERT(ggml_cuda_fattn_V_same_as_K(dst) && k.ne[3] == dst->src[0]->ne[3]);
+        selected = dst->op == GGML_OP_FLASH_ATTN_EXT_SPARSE ? dst->src[5]->ne[0]*dst->src[0]->ne[1] : 0;
+        rows = selected ? GGML_PAD(selected, FATTN_KQ_STRIDE) : k.ne[1];
+        GGML_ASSERT(rows <= INT32_MAX);
+        k.ne[1] = rows;
+        k.nb[1] = ggml_row_size(k.type, k.ne[0]);
+        k.nb[2] = k.nb[3] = k.nb[1]*rows;
+        k.view_src = nullptr;
+        k.view_offs = 0;
+        k.buffer = dst->buffer;
+        v = k;
+        v.view_src = &k;
+        node.src[1] = &k;
+        node.src[2] = &v;
+        if (selected) {
+            ids = *dst->src[5];
+            GGML_ASSERT(ids.type == GGML_TYPE_I32 && ggml_is_contiguous(&ids) && ids.ne[2] == 1 && ids.ne[3] == k.ne[3]);
+            ids.view_src = nullptr;
+            ids.view_offs = 0;
+            ids.buffer = dst->buffer;
+            node.src[5] = &ids;
+        }
+        kv_offset = GGML_PAD(ggml_cuda_flash_attn_ext_device_alloc_size(device, &node), 128);
+        ids_offset = GGML_PAD(kv_offset + ggml_nbytes(&k), 128);
+        bytes = ids_offset + (selected ? ggml_nbytes(&ids) : 0);
+        k.data = v.data = (void *) ((uintptr_t) dst->data + kv_offset);
+        ids.data = (void *) ((uintptr_t) dst->data + ids_offset);
+    }
+};
+
+// Copy selected canonical Q8 rows once; attention reads GPU memory and keeps the original selection order.
+static __global__ void fattn_stage_host_rows(const char * src, char * dst, const int32_t * indices, int32_t * remapped,
+        int64_t src_rows, int64_t rows, int64_t selected, size_t row_bytes, size_t src_nb1, size_t src_nb3, size_t dst_nb3) {
+    const int64_t row = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
+    const int64_t seq = blockIdx.y;
+    if (row >= rows) { return; }
+    const int64_t cell = selected ? (row < selected ? indices[seq*selected + row] : -1) : row;
+    const bool valid = cell >= 0 && cell < src_rows;
+    if (selected && row < selected && threadIdx.x == 0) { remapped[seq*selected + row] = valid ? int32_t(row) : -1; }
+    for (size_t i = threadIdx.x; i < row_bytes/sizeof(uint32_t); i += blockDim.x) {
+        ((uint32_t *) (dst + seq*dst_nb3 + row*row_bytes))[i] = valid ?
+            ((const uint32_t *) (src + seq*src_nb3 + cell*src_nb1))[i] : 0;
+    }
+}
+
+size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_buffer_is_host_mapped(dst->src[1])) {
+        return ggml_cuda_fattn_host_stage(device, dst).bytes;
+    }
+    return ggml_cuda_flash_attn_ext_device_alloc_size(device, dst);
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_buffer_is_host_mapped(dst->src[1])) {
+        ggml_cuda_flash_attn_ext_device(ctx, dst);
+        return;
+    }
+    ggml_cuda_set_device(ctx.device);
+    ggml_cuda_fattn_host_stage stage(ctx.device, dst);
+    const ggml_tensor * src = dst->src[1];
+    const dim3 threads(32, 4);
+    const dim3 blocks((stage.rows + threads.y - 1)/threads.y, src->ne[3]);
+    fattn_stage_host_rows<<<blocks, threads, 0, ctx.stream()>>>((const char *) src->data, (char *) stage.k.data,
+        stage.selected ? (const int32_t *) dst->src[5]->data : nullptr, (int32_t *) stage.ids.data,
+        src->ne[1], stage.rows, stage.selected, stage.k.nb[1], src->nb[1], src->nb[3], stage.k.nb[3]);
+    ggml_cuda_flash_attn_ext_device(ctx, &stage.node);
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

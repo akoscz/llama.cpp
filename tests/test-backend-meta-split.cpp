@@ -14,18 +14,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <vector>
 
 static constexpr int64_t n_cols = 64;
 static constexpr int64_t n_rows = 8;
 
-static int captured = 0;
+static std::atomic<int> captured {0};
 static unsigned long long expert_hits = 0;
 static ggml_backend_dev_t peer = nullptr;
+static std::array<ggml_backend_dev_t, 4> host_devices = {};
 
 static ggml_backend_dev_t second_device(ggml_backend_dev_t first) { return peer ? peer : first; }
 
@@ -175,8 +178,9 @@ static bool test_scatter_views(ggml_backend_dev_t device) {
     return ok;
 }
 
-static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type) {
+static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type, bool mapped = false) {
     ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
+    if (host_devices[0]) { std::copy(host_devices.begin(), host_devices.end(), devices); }
     ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     ggml_context * weights = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -184,7 +188,8 @@ static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type) {
     const int64_t capacity[] = {2, 4, 3, 7};
     const int64_t active[] = {1, 0, 2, 1};
     ggml_backend_meta_split_input(cache, 1, capacity, 4);
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(weights, backend);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, mapped ?
+        ggml_backend_dev_mapped_buffer_type(ggml_backend_get_device(backend)) : ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(buffer);
     std::vector<float> original(64*16), updates(64*4);
     for (size_t i = 0; i < original.size(); ++i) { original[i] = 127.0f*(1 + i/32); }
@@ -235,7 +240,7 @@ static bool test_owned_cache_rows(ggml_backend_dev_t device, ggml_type type) {
         std::copy(updates.begin() + row*64, updates.begin() + (row + 1)*64, original.begin() + global_rows[row]*64);
     }
     ok = ok && result == updates && result_full == original;
-    printf("%s owned %s cache reads/writes with unequal capacity and active rows\n", ok ? "ok  " : "FAIL", ggml_type_name(type));
+    printf("%s owned %s cache reads/writes%s with unequal capacity and active rows\n", ok ? "ok  " : "FAIL", ggml_type_name(type), mapped ? " (mapped host cache)" : "");
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
     ggml_backend_buffer_free(buffer);
@@ -293,17 +298,28 @@ static bool test_host_layout(ggml_backend_dev_t device) {
     return ok;
 }
 
-static bool test_stream_view(ggml_backend_dev_t device, ggml_type type) {
+static bool test_stream_view(ggml_backend_dev_t device, ggml_type type, bool single = false, bool mapped = false) {
     ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
+    if (host_devices[0]) { std::copy(host_devices.begin(), host_devices.end(), devices); }
     auto backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
     auto ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
-    auto cache = ggml_new_tensor_3d(ctx, type, 64, 64, 16);
-    const int64_t capacity[] = {4, 4, 4, 4}, active[] = {1, 0, 2, 1}, first[] = {2, 0, 1, 3};
+    auto cache_ctx = mapped ? ggml_init({ggml_tensor_overhead(), nullptr, true}) : nullptr;
+    auto cache = ggml_new_tensor_3d(mapped ? cache_ctx : ctx, type, 64, 64, 16);
+    const int64_t capacity[] = {4, 4, 4, 4}, first[] = {2, 0, 1, 3};
+    const int64_t active[] = {single ? 0 : 1, 0, single ? 1 : 2, single ? 0 : 1};
+    const int64_t n_streams = single ? 1 : 4;
     ggml_backend_meta_split_input(cache, 2, capacity, 4);
     ggml_set_input(cache);
-    auto view = ggml_view_4d(ctx, cache, 32, 2, 32, 4, ggml_row_size(type, 32), cache->nb[1], cache->nb[2], 0);
+    ggml_backend_buffer_t cache_buffer = nullptr;
+    if (mapped) {
+        auto buft = ggml_backend_dev_mapped_buffer_type(ggml_backend_get_device(backend));
+        GGML_ASSERT(buft && ggml_backend_dev_supports_buft(ggml_backend_get_device(backend), buft));
+        cache_buffer = ggml_backend_alloc_ctx_tensors_from_buft(cache_ctx, buft);
+        GGML_ASSERT(cache_buffer);
+    }
+    auto view = ggml_view_4d(ctx, cache, 32, 2, 32, n_streams, ggml_row_size(type, 32), cache->nb[1], cache->nb[2], 0);
     ggml_backend_meta_set_stream_view(view, active, first, 4);
-    auto nested = ggml_view_3d(ctx, view, 32, 32, 4, view->nb[2], view->nb[3], view->nb[1]);
+    auto nested = ggml_view_3d(ctx, view, 32, 32, n_streams, view->nb[2], view->nb[3], view->nb[1]);
     auto out = ggml_cont(ctx, ggml_cast(ctx, nested, GGML_TYPE_F32));
     ggml_set_output(out);
     auto graph = ggml_new_graph(ctx);
@@ -315,22 +331,151 @@ static bool test_stream_view(ggml_backend_dev_t device, ggml_type type) {
     std::vector<uint8_t> bytes(ggml_nbytes(cache));
     ggml_quantize_chunk(type, data.data(), bytes.data(), 0, 64*16, 64, nullptr);
     ggml_backend_tensor_set(cache, bytes.data(), 0, bytes.size());
+    bool ok = true;
+    if (single) {
+        GGML_ASSERT(ggml_is_contiguous(view) && view->nb[3] > ggml_nbytes(view));
+        std::vector<uint8_t> transferred(ggml_nbytes(view)), unchanged(bytes.size());
+        const auto expected = bytes.data() + 9*cache->nb[2];
+        ggml_backend_tensor_set_async(backend, view, expected, 0, transferred.size());
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(view, transferred.data(), 0, transferred.size());
+        ok = std::equal(transferred.begin(), transferred.end(), expected);
+        ggml_backend_tensor_memset(view, 0, 3, transferred.size() - 7);
+        ggml_backend_tensor_set_async(backend, view, expected + 3, 3, transferred.size() - 7);
+        ggml_backend_tensor_get_async(backend, view, transferred.data(), 0, transferred.size());
+        ggml_backend_synchronize(backend);
+        ok = ok && std::equal(transferred.begin(), transferred.end(), expected);
+        ggml_backend_tensor_get(cache, unchanged.data(), 0, unchanged.size());
+        ok = ok && unchanged == bytes;
+    }
     GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
     std::vector<float> result(ggml_nelements(out));
     ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
     const size_t streams[] = {2, 9, 10, 15};
-    bool ok = true;
-    for (size_t s = 0; s < 4; ++s) {
+    for (size_t s = 0; s < (size_t) n_streams; ++s) {
         for (size_t row = 0; row < 32; ++row) {
             for (size_t col = 0; col < 32; ++col) {
-                ok = ok && result[s*32*32 + row*32 + col] == data[streams[s]*64*64 + row*64 + 32 + col];
+                ok = ok && result[s*32*32 + row*32 + col] == data[(single ? 9 : streams[s])*64*64 + row*64 + 32 + col];
             }
         }
     }
-    printf("%s %s active stream views with empty owner, unequal starts and nested channel slice\n", ok ? "ok  " : "FAIL", ggml_type_name(type));
+    printf("%s %s %s stream views%s with empty owner, unequal starts and nested channel slice\n", ok ? "ok  " : "FAIL", ggml_type_name(type), single ? "single" : "active", mapped ? " (mapped host cache)" : "");
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
+    if (cache_buffer) { ggml_backend_buffer_free(cache_buffer); ggml_free(cache_ctx); }
     ggml_backend_free(backend);
+    return ok;
+}
+
+static bool test_host_attention(ggml_backend_dev_t device, int64_t queries, bool sparse, bool long_context = false, bool masked_sparse = false) {
+    ggml_backend_dev_t devices[] = {device, second_device(device), device, second_device(device)};
+    if (host_devices[0]) { std::copy(host_devices.begin(), host_devices.end(), devices); }
+    auto backend = ggml_backend_dev_init(ggml_backend_meta_device(devices, 4, split_rows, nullptr), nullptr);
+    auto cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    const int64_t cells = long_context ? 409600 : masked_sparse ? 8192 : 256;
+    const int64_t selected = long_context ? 2080 : 32;
+    const int64_t owners[] = {1, 0, 2, 1};
+    std::vector<float> result[2];
+    int captures[2] = {};
+    for (int mapped = 0; mapped < 2; ++mapped) {
+        const int captured_before = captured;
+        auto weights = ggml_init({ggml_tensor_overhead(), nullptr, true});
+        auto cache = ggml_new_tensor_3d(weights, GGML_TYPE_Q8_0, 512, cells, 4);
+        ggml_backend_meta_split_input(cache, 2, owners, 4);
+        auto buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights, mapped ?
+            ggml_backend_dev_mapped_buffer_type(ggml_backend_get_device(backend)) : ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(buffer);
+        auto ctx = ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto k = ggml_reshape_4d(ctx, cache, 512, cells, 1, 4);
+        auto v = ggml_view_4d(ctx, k, 512, cells, 1, 4, k->nb[1], k->nb[2], k->nb[3], 0);
+        auto q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, queries, 8, 4);
+        auto selection = sparse ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, selected, queries, 1, 4) :
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cells, (queries + 31)/32*32, 1, 4);
+        for (auto input : {q, selection}) { ggml_set_input(input); ggml_backend_meta_split_input(input, 3, owners, 4); }
+        auto out = sparse ? ggml_flash_attn_ext_sparse(ctx, q, k, v, selection, 1.0f/sqrtf(512.0f)) :
+            ggml_flash_attn_ext(ctx, q, k, v, selection, 1.0f/sqrtf(512.0f), 0.0f, 0.0f);
+        if (masked_sparse) { ggml_flash_attn_ext_set_n_kv_max(out, 2080); }
+        ggml_set_output(out);
+        auto graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_t backends[] = {backend, cpu};
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        for (auto input : {q, selection}) { ggml_backend_sched_set_tensor_backend(sched, input, backend); }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+        std::vector<float> cache_data(512*256), query_data(ggml_nelements(q));
+        std::vector<uint8_t> cache_bytes(ggml_row_size(GGML_TYPE_Q8_0, 512)*cells);
+        const size_t chunk_bytes = ggml_row_size(GGML_TYPE_Q8_0, 512)*256;
+        for (size_t i = 0; i < query_data.size(); ++i) { query_data[i] = float(int(i % 31) - 15)/32; }
+        ggml_backend_tensor_set(q, query_data.data(), 0, ggml_nbytes(q));
+        result[mapped].resize(6*ggml_nelements(out));
+        for (int iteration = 0; iteration < 6; ++iteration) {
+            for (int seq = 0; seq < 4; ++seq) {
+                for (size_t i = 0; i < cache_data.size(); ++i) { cache_data[i] = float(int((i*13 + seq*7 + iteration*11) % 127) - 63)/64; }
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, cache_data.data(), cache_bytes.data(), 0, 256, 512, nullptr);
+                if (iteration == 0) {
+                    for (size_t offset = chunk_bytes; offset < cache_bytes.size(); offset += chunk_bytes) {
+                        std::copy_n(cache_bytes.data(), chunk_bytes, cache_bytes.data() + offset);
+                    }
+                }
+                ggml_backend_tensor_set(cache, cache_bytes.data(), seq*cache_bytes.size(), iteration == 0 ? cache_bytes.size() : chunk_bytes);
+            }
+            if (sparse) {
+                std::vector<int32_t> ids(ggml_nelements(selection), -1);
+                for (int64_t row = 0; row < queries*4; ++row) {
+                    for (int64_t i = 0; i < selected - 3 - iteration; ++i) {
+                        ids[row*selected + i] = int32_t(i*(cells/selected) + (row + iteration) % (cells/selected));
+                    }
+                }
+                if (long_context) {
+                    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, 512);
+                    std::vector<float> sentinel(512);
+                    std::vector<uint8_t> quantized(row_bytes);
+                    for (int seq = 0; seq < 4; ++seq) {
+                        for (int64_t query = 0; query < queries; ++query) {
+                            for (int64_t i = 0; i < selected - 3 - iteration; i += 64) {
+                                const int32_t cell = ids[(seq*queries + query)*selected + i];
+                                std::seed_seq seed {seq, cell, iteration};
+                                std::mt19937 rng(seed);
+                                std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+                                for (auto & value : sentinel) { value = distribution(rng); }
+                                ggml_quantize_chunk(GGML_TYPE_Q8_0, sentinel.data(), quantized.data(), 0, 1, 512, nullptr);
+                                ggml_backend_tensor_set(cache, quantized.data(), seq*cache_bytes.size() + cell*row_bytes, row_bytes);
+                            }
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(selection, ids.data(), 0, ggml_nbytes(selection));
+            } else {
+                std::vector<ggml_fp16_t> mask(ggml_nelements(selection));
+                for (size_t i = 0; i < mask.size(); ++i) {
+                    const bool selected_cell = i % cells < size_t(cells - 7 - iteration) && (!masked_sparse || i % 4 == 0);
+                    mask[i] = ggml_fp32_to_fp16(selected_cell ? 0.0f : -INFINITY);
+                }
+                ggml_backend_tensor_set(selection, mask.data(), 0, ggml_nbytes(selection));
+            }
+            GGML_ASSERT(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, result[mapped].data() + iteration*ggml_nelements(out), 0, ggml_nbytes(out));
+        }
+        captures[mapped] = captured - captured_before;
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(weights);
+    }
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < result[0].size(); ++i) {
+        const double delta = result[0][i] - result[1][i];
+        error += delta*delta;
+        norm += double(result[0][i])*result[0][i];
+    }
+    bool ok = std::isfinite(error) && error <= 1e-9*norm;
+    if (ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_capture_end")) {
+        ok = ok && captures[0] == 4 && captures[1] == 4;
+    }
+    printf("%s mapped Q8 attention q=%lld cells=%lld sparse=%d, changed cache/selection over six evaluations, NMSE %.9g, resident/mapped captures %d/%d\n",
+        ok ? "ok  " : "FAIL", (long long) queries, (long long) cells, sparse, error/norm, captures[0], captures[1]);
+    ggml_backend_free(backend);
+    ggml_backend_free(cpu);
     return ok;
 }
 
@@ -748,7 +893,8 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--stream-view-cpu") == 0) {
         gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        return test_stream_view(gpu, GGML_TYPE_F32) && test_stream_view(gpu, GGML_TYPE_Q8_0) ? 0 : 1;
+        return test_stream_view(gpu, GGML_TYPE_F32) && test_stream_view(gpu, GGML_TYPE_Q8_0) &&
+               test_stream_view(gpu, GGML_TYPE_F32, true) && test_stream_view(gpu, GGML_TYPE_Q8_0, true) ? 0 : 1;
     }
     if (argc == 3 && strcmp(argv[1], "--owned-op-cpu") == 0) {
         return test_owned_ops(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), atoi(argv[2])) ? 0 : 1;
@@ -768,7 +914,11 @@ int main(int argc, char ** argv) {
         ok = test_tensor_mode(gpu, 1, 8) && ok;
         ok = test_scatter_views(gpu) && ok;
         ok = test_host_layout(gpu) && ok;
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
+        }
+        for (int64_t q : {1, 3}) { ok = test_host_attention(gpu, q, false) && test_host_attention(gpu, q, true) && ok; }
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && test_stream_view(gpu, type, true) && ok; }
         return ok ? 0 : 1;
     }
     for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
@@ -778,7 +928,28 @@ int main(int argc, char ** argv) {
     }
     if (gpu == nullptr) {
         printf("no GPU for the meta backend, skipped\n");
-        return 0;
+        return argc > 1 && strncmp(argv[1], "--host-kv", 9) == 0 ? 77 : 0;
+    }
+    if (argc > 1 && (strcmp(argv[1], "--host-kv") == 0 || strcmp(argv[1], "--host-kv-four") == 0)) {
+        if (strcmp(argv[1], "--host-kv-four") == 0) {
+            size_t count = 0;
+            for (size_t i = 0; i < ggml_backend_dev_count() && count < 4; ++i) {
+                auto dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { host_devices[count++] = dev; }
+            }
+            if (count != 4) { printf("need four GPUs for mapped host KV qualification\n"); return 77; }
+            for (auto dev : host_devices) { printf("host KV device: %s\n", ggml_backend_dev_name(dev)); }
+        } else {
+            printf("host KV: four logical ranks on one GPU; not four-card qualification\n");
+        }
+        if (!ggml_backend_dev_mapped_buffer_type(gpu)) { printf("mapped host KV unsupported on this backend\n"); return 77; }
+        bool ok = true;
+        for (int64_t q : {1, 3, 16}) { ok = test_host_attention(gpu, q, false) && test_host_attention(gpu, q, true, true) && ok; }
+        for (int64_t q : {3, 512}) { ok = test_host_attention(gpu, q, false, false, true) && ok; }
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
+        }
+        return ok ? 0 : 1;
     }
     if (argc == 4 && strcmp(argv[1], "--tensor") == 0) {
         return test_tensor_mode(gpu, atoi(argv[2]), atoll(argv[3])) ? 0 : 1;
@@ -837,7 +1008,13 @@ int main(int argc, char ** argv) {
     ok = test_sequence_axis(gpu) && ok;
     ok = test_scatter_views(gpu) && ok;
     ok = test_host_layout(gpu) && ok;
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && ok; }
+    if (ggml_backend_dev_mapped_buffer_type(gpu)) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            ok = test_owned_cache_rows(gpu, type, true) && test_stream_view(gpu, type, false, true) && test_stream_view(gpu, type, true, true) && ok;
+        }
+        for (int64_t q : {1, 3}) { ok = test_host_attention(gpu, q, false) && test_host_attention(gpu, q, true) && ok; }
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) { ok = test_owned_cache_rows(gpu, type) && test_stream_view(gpu, type) && test_stream_view(gpu, type, true) && ok; }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_XXS}) { ok = test_experts(gpu, type) && ok; }
     for (int variant = 0; variant < 12; ++variant) {
         ok = test_owned_ops(gpu, variant) && ok;

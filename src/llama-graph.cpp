@@ -788,10 +788,18 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
         }
     }
     if (resident_table) {
-        if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return false;
+        if (resident_seqs.empty()) {
+            if (params.ubatch.n_seqs_unq != 1 || params.ubatch.seq_id_unq[0] != resident_seq) return false;
+        } else if (params.ubatch.n_seqs_unq != resident_seqs.size() ||
+                !std::equal(resident_seqs.begin(), resident_seqs.end(), params.ubatch.seq_id_unq)) {
+            return false;
+        }
         auto & views = mctx_attn->get_kv()->get_kpool_views();
         views.begin();
-        if (!views.serve(mctx_attn->get_kv()->get_cells(resident_seq), resident_seq, kpool, dims.n_kv, dims.n_pools)) return false;
+        for (uint32_t s = 0; s < params.ubatch.n_seqs_unq; ++s) {
+            const auto seq = params.ubatch.seq_id_unq[s];
+            if (!views.serve(mctx_attn->get_kv()->get_cells(seq), seq, kpool, dims.n_kv, dims.n_pools)) return false;
+        }
     }
     sched = params.sched;
 
@@ -4222,11 +4230,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
-        // A single sequence's canonical tables live with the cache, shared by every
-        // graph slot. Different layer devices or unsupported layouts keep the full
-        // input/reference path.
+        // Canonical tables live with the cache, shared by graph slots. DP stores each sequence's table on its owner.
         const llama_kpool_views::view * resident_view = nullptr;
-        if (!mctx_attn->is_full() && n_stream == 1 && n_ps == 1 && cparams.n_seq_devices == 1 &&
+        if (!mctx_attn->is_full() && n_ps == 1 && (n_stream == 1 || cparams.n_seq_devices > 1) &&
                 !ggml_env_switch("LLAMA_KPOOL_RESIDENT_LEGACY") &&
                 !ggml_env_switch("LLAMA_KPOOL_INPUT_LEGACY") && !ggml_env_switch("LLAMA_KPOOL_INPUT_CHECK") &&
                 !ggml_env_switch("LLAMA_KPOOL_MASK_HOST_LEGACY")) {
@@ -4237,20 +4243,37 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             for (auto layer : layers) {
                 if (ggml_backend_buffer_get_type(kv->get_k_storage(layer)->buffer) != buft) buft = nullptr;
             }
+            if (buft && ggml_env_switch("LLAMA_KV_HOST")) {
+                // Keep hot selection metadata on the owning GPU when latent history lives in RAM.
+                buft = ggml_backend_dev_buffer_type(ggml_backend_buft_get_device(buft));
+            }
             if (buft) {
                 auto & views = kv->get_kpool_views();
+                if (cparams.n_seq_devices > 1) { views.reserve_views(cparams.n_seq_max); }
                 views.begin();
-                resident_view = views.serve(kv->get_cells(ubatch.seq_id_unq[0]), ubatch.seq_id_unq[0], kpool, n_kv, n_pools);
+                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                    resident_view = views.serve(kv->get_cells(ubatch.seq_id_unq[s]), ubatch.seq_id_unq[s], kpool, n_kv, n_pools);
+                    if (!resident_view) { break; }
+                }
                 if (resident_view) {
-                    inp->resident_seq = ubatch.seq_id_unq[0];
-                    inp->resident_table = resident_view->resident(buft);
-                    inp->resident_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 6, n_tps);
+                    if (cparams.n_seq_devices > 1) {
+                        inp->resident_seqs.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
+                        inp->resident_table = views.resident_bank(buft, resident_view->resident_size(), cparams.n_seq_max, cparams.n_seq_devices);
+                        inp->resident_rows = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 7, n_tps, n_stream);
+                        const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+                        ggml_backend_meta_split_input(inp->resident_rows, 2, counts.data(), counts.size());
+                    } else {
+                        inp->resident_seq = ubatch.seq_id_unq[0];
+                        inp->resident_table = resident_view->resident(buft);
+                        inp->resident_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 6, n_tps);
+                    }
                     auto * probe = ggml_kpool_materialize(ctx0, inp->resident_table->tensor, inp->resident_rows,
                             kv->get_size(), kpool, n_kv, n_pools, n_dump, GGML_KPOOL_MATERIALIZE_FACTS);
                     auto * device = ggml_backend_buft_get_device(buft);
                     if (!device && ggml_backend_buft_is_host(buft)) device = ggml_backend_get_device(backend_cpu);
                     if (!device || !ggml_backend_dev_supports_op(device, probe)) {
                         inp->resident_table.reset();
+                        inp->resident_seqs.clear();
                         inp->resident_rows = nullptr;
                         resident_view = nullptr;
                     } else {
@@ -4278,6 +4301,10 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_name(inp->pool_bias, "kpool_pool_bias");
 
         inp->pool_dump = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_dump, n_tps, n_stream);
+        if (resident_view && cparams.n_seq_devices > 1) {
+            const auto counts = ubatch.device_seqs(cparams.n_seq_devices);
+            ggml_backend_meta_split_input(inp->pool_dump, 2, counts.data(), counts.size());
+        }
         if (resident_view) inp->pool_dump = ggml_fill(ctx0, inp->pool_dump, -FLT_MAX);
         else ggml_set_input(inp->pool_dump);
         ggml_set_name(inp->pool_dump, "kpool_pool_dump");
@@ -4409,7 +4436,12 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 {inp->new_pool_cells, 1}, {inp->mask_cells, 3}, {inp->mask_rows, 2},
                 {inp->tail_cells, 2}, {inp->draft_top_k, 2},
                 {inp->mask_cells ? nullptr : inp->sel_mask, 3}, {inp->mask_cells ? nullptr : inp->cand_mask, 3}}) {
-            if (item.first) { ggml_backend_meta_split_input(item.first, item.second, counts.data(), counts.size()); }
+            if (item.first && item.first->op == GGML_OP_NONE) {
+                ggml_backend_meta_split_input(item.first, item.second, counts.data(), counts.size());
+            }
+        }
+        if (inp->draft_top_k && inp->draft_top_k->op != GGML_OP_NONE) {
+            inp->draft_top_k = ggml_backend_meta_scatter(ctx0, inp->draft_top_k, 2, counts.data(), counts.size());
         }
         auto writes = counts;
         for (auto & count : writes) { count *= inp->n_new_max; }
@@ -4467,6 +4499,12 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     const bool direct = tail_cells && cparams.flash_attn && !kq_b && !kq_add && !hparams.use_alibi &&
         hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.n_pos_per_embd() == 1 && !hparams.attn_soft_cap &&
         sel_mask->op == GGML_OP_KPOOL_MASK;
+    // Keep the resident kernel for short contexts; full-row staging stays below the direct-index cutoff.
+    const int64_t direct_bound = llama_kpool_n_kv_max(top_k->ne[0], std::max<int64_t>(1, n_tail));
+    if (ggml_env_switch("LLAMA_KV_HOST") && !direct &&
+            (!cparams.flash_attn || kq_b || n_kv >= std::max<int64_t>(4096, std::min<int64_t>(cand_mask->ne[1], 8)*direct_bound))) {
+        throw std::runtime_error("host KV requires flash attention and direct sparse indices above the staging cutoff");
+    }
     ggml_tensor * sparse_indices = nullptr;
     ggml_tensor * mask_top_k = nullptr;
     if (direct) {

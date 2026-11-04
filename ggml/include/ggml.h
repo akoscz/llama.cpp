@@ -2801,6 +2801,8 @@ extern "C" {
     // One sequence's resident I32 table: pos[kv_size], absolute pool[kv_size], slot[cap*kpool], fill[cap], reps[cap].
     // cap = kv_size/kpool + 2. rows: I32 [6,Q], containing q, base, tail, visible pools, table base, run length.
     // All rows share base, table base and run length. Outputs have the ordinary k-pool input layouts.
+    // A bank has [table_size, slots] and rows [7,Q,streams]; the seventh value selects a device-local slot.
+    // Rows within one stream share that slot, base, table base and run length.
     GGML_API struct ggml_tensor * ggml_kpool_materialize(
             struct ggml_context * ctx,
             struct ggml_tensor  * table,

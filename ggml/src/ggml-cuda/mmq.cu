@@ -302,6 +302,7 @@ void ggml_cuda_mul_mat_q(
         ne12};
 
     args.q8_layout = ggml_cuda_q8_layout_of(src0);
+    args.n_experts_total = ggml_get_op_params_i32(dst, 2);
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 

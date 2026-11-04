@@ -1554,10 +1554,151 @@ static void run_resident_patches(std::mt19937 & rng) {
     printf("resident patches: %llu writes, %llu actual callback bytes\n", (unsigned long long) calls, (unsigned long long) bytes);
 }
 
+static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devices) {
+    constexpr int64_t capacity = 256, r = 4, np = capacity/r + 2, nd = 2;
+    auto * cpu = resident_test_backend();
+    std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(cpu));
+    auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
+        [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }, nullptr);
+    auto * backend = ggml_backend_dev_init(meta, nullptr);
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    pool w(capacity, slots, false, rng);
+    llama_kpool_views views;
+    views.reserve_views(slots);
+    const auto bank = views.resident_bank(buft, 2*capacity + np*(r + 2), slots, devices);
+    for (uint32_t s = 0; s < slots; ++s) { w.append(s, 16 + s%17); }
+    for (int step = 0; step < 12; ++step) {
+        const llama_seq_id changed = step%slots;
+        const auto saved = w.cells_of(changed);
+        const auto before = w.p_next(changed);
+        w.append(changed, 1 + step%3);
+        if (step%4 == 1) { w.rollback(changed, before); }
+        if (step%4 == 2) { w.cells_of(changed) = saved; }
+        views.begin();
+        bank->begin_upload(backend);
+        std::vector<const llama_kpool_views::view *> current(slots);
+        for (uint32_t s = 0; s < slots; ++s) {
+            const auto * v = views.serve(w.cells_of(s), s, r, capacity, np);
+            CHECK(v, "resident bank cannot serve slot %u/%u", s, slots);
+            if (!v) { continue; }
+            current[s] = v;
+            int64_t slot = s/devices;
+            for (uint32_t d = 0; d < s%devices; ++d) { slot += (slots + devices - 1 - d)/devices; }
+            v->emit_patches([&](size_t off, const int32_t * data, size_t count) {
+                bank->upload(slot*bank->tensor->ne[0] + off, data, count);
+            });
+        }
+        bank->end_upload();
+        // Reverse the sequence order within each device; leave one device idle on alternating rounds.
+        std::vector<llama_seq_id> seqs;
+        std::vector<int64_t> counts(devices, 0);
+        for (uint32_t d = 0; d < devices; ++d) {
+            if (step%2 && d == devices - 1) { continue; }
+            for (int64_t s = slots - 1; s >= 0; --s) {
+                if (s%devices == d && current[s] && (s + step)%3 == 0) { seqs.push_back(s); ++counts[d]; }
+            }
+        }
+        const int64_t nr = 1 + step%3, ns = seqs.size();
+        ubatch_data ud;
+        for (const auto seq : seqs) {
+            for (int64_t row = 0; row < nr; ++row) { ud.add(seq, w.p_next(seq) - nr + row); }
+        }
+        const auto * ub = ud.get();
+        maps ref(capacity, ns, nr, 1, r, true, false, false, nd, 0xa5, np, true);
+        std::vector<uint32_t> streams(ns, 0);
+        llama_kpool_set_input([&](llama_seq_id s) -> const llama_kv_cells & { return w.cells_of(s); }, nullptr,
+                nullptr, ref.pool_cells, nullptr, ref.pool_bias, nullptr, nullptr, ref.pool_reps,
+                ref.new_pool_cells, ref.new_pool_reps, streams.data(), capacity, false, ub, r,
+                ref.mask_cells, ref.mask_rows, ref.tail_cells);
+        auto * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 7, nr, ns);
+        auto * visibility = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, nr, ns);
+        auto * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 16, nr, ns);
+        auto * tail = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 3, nr, ns);
+        for (auto * t : {rows, visibility, selected, tail}) {
+            ggml_backend_meta_split_input(t, 2, counts.data(), counts.size());
+        }
+        auto * input = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        std::vector<int32_t> params(7*nr*ns);
+        for (int64_t s = 0; s < ns; ++s) {
+            const auto seq = seqs[s];
+            const auto * v = current[seq];
+            const int32_t base = w.cells_of(seq).seq_pos_min(seq)/r;
+            const int32_t run = w.cells_of(seq).seq_pos_max(seq)/r - base + 1;
+            for (int64_t row = 0; row < nr; ++row) {
+                const int32_t q = ub->pos[s*nr + row], tail = (q + 1)/r*r;
+                const int32_t values[] = {q, base, tail, int32_t(tail/r - base), int32_t(v->b_lo), run, int32_t(seq/devices)};
+                std::copy_n(values, 7, params.data() + 7*(s*nr + row));
+            }
+        }
+        ggml_backend_tensor_set(rows, params.data(), 0, ggml_nbytes(rows));
+        std::vector<int32_t> picks(16*nr*ns), tails(3*nr*ns), expected(32*nr*ns, -1);
+        auto * visible = (int32_t *) ref.mask_rows->data;
+        for (int64_t i = 0; i < nr*ns; ++i) {
+            if ((i + step)%5 == 0) visible[4*i + 1] = -1;
+            if ((i + step)%7 == 0) visible[4*i] = 0;
+            for (int j = 0; j < 16; ++j) picks[16*i+j] = j < 2 ? 0 : (i*13+j*17)%(capacity+nd*r);
+            std::copy_n((int32_t *) ref.tail_cells->data + i*capacity, 3, tails.data() + 3*i);
+            std::vector<int32_t> ids;
+            const auto * facts = (int32_t *) ref.mask_cells->data + (i/nr)*2*capacity;
+            const auto * f = visible + 4*i;
+            if (f[1] == 0) {
+                for (int j = 0; j < 19; ++j) {
+                    const int32_t cell = j < 16 ? picks[16*i+j] : tails[3*i+j-16];
+                    if (cell >= 0 && cell < capacity && uint32_t(facts[cell]) <= uint32_t(f[0]) &&
+                            (facts[cell] >= f[2] || (j < 16 && uint32_t(facts[capacity+cell]) < uint32_t(f[3])))) {
+                        ids.push_back(cell);
+                    }
+                }
+            }
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            std::copy(ids.begin(), ids.end(), expected.data() + 32*i);
+        }
+        ggml_backend_tensor_set(visibility, visible, 0, ggml_nbytes(visibility));
+        ggml_backend_tensor_set(selected, picks.data(), 0, ggml_nbytes(selected));
+        ggml_backend_tensor_set(tail, tails.data(), 0, ggml_nbytes(tail));
+        auto * graph = ggml_new_graph(ctx);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> outputs;
+        for (const auto & pair : {std::make_pair(GGML_KPOOL_MATERIALIZE_FACTS, ref.mask_cells),
+                std::make_pair(GGML_KPOOL_MATERIALIZE_CELLS, ref.pool_cells),
+                std::make_pair(GGML_KPOOL_MATERIALIZE_REPS, ref.pool_reps),
+                std::make_pair(GGML_KPOOL_MATERIALIZE_BIAS, ref.pool_bias)}) {
+            auto * out = ggml_kpool_materialize(ctx, bank->tensor, rows, capacity, r, capacity, np, nd, pair.first);
+            ggml_set_output(out);
+            ggml_build_forward_expand(graph, out);
+            outputs.emplace_back(out, pair.second);
+        }
+        auto * indices = ggml_kpool_indices(ctx, outputs.front().first, visibility, selected, tail, nd*r, 32);
+        ggml_set_output(indices);
+        ggml_build_forward_expand(graph, indices);
+        auto * alloc = ggml_gallocr_new(buft);
+        CHECK(ggml_gallocr_alloc_graph(alloc, graph), "bank graph allocation");
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "bank graph compute");
+        for (const auto & pair : outputs) {
+            std::vector<uint8_t> got(ggml_nbytes(pair.first));
+            ggml_backend_tensor_get(pair.first, got.data(), 0, got.size());
+            CHECK(got.size() == ggml_nbytes(pair.second) && memcmp(got.data(), pair.second->data, got.size()) == 0,
+                    "bank/reference mismatch: step=%d slots=%u devices=%u mode=%d", step, slots, devices, pair.first->op_params[0]);
+        }
+        std::vector<int32_t> actual(expected.size());
+        ggml_backend_tensor_get(indices, actual.data(), 0, ggml_nbytes(indices));
+        CHECK(actual == expected, "bank direct indices mismatch: step=%d slots=%u", step, slots);
+        ggml_gallocr_free(alloc);
+        ggml_backend_buffer_free(input);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+}
+
 int main() {
     std::mt19937 rng(20260930);
 
     run_resident_patches(rng);
+    run_resident_bank(rng, 40, 4);
+    run_resident_bank(rng, 41, 4);
     run_direct_indices(rng);
     run_draft_rounds(rng);
 

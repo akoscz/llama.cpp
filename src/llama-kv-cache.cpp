@@ -83,12 +83,18 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                     bool   host_mapped) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    if (host_mapped && (!offload || unified || v_trans || !hparams.is_mla() ||
+                       hparams.indexer_kpool == 0 || hparams.n_lora_kv != 512 || type_k != GGML_TYPE_Q8_0)) {
+        throw std::runtime_error("host KV requires non-unified GLM pooled MLA with GPU attention and Q8_0 latent caches");
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -231,9 +237,10 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            buft = host_mapped ? ggml_backend_dev_mapped_buffer_type(dev) : ggml_backend_dev_buffer_type(dev);
+            if (!buft) { throw std::runtime_error("backend does not support mapped host KV storage"); }
 
-            dev_name = ggml_backend_dev_name(dev);
+            dev_name = host_mapped ? ggml_backend_buft_name(buft) : ggml_backend_dev_name(dev);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

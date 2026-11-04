@@ -287,7 +287,7 @@ class ServingRecipeTest(unittest.TestCase):
         import serve
         self.serve = serve
 
-    def test_retained_recipe_has_no_experimental_profile(self):
+    def test_default_retains_the_two_card_tensor_recipe(self):
         args = self.serve.arguments(["--model", "/models/first shard.gguf", "--mmproj", "/models/projector.gguf"])
         argv, env = self.serve.make_plan(args)
         self.assertEqual(argv, [str(self.serve.ROOT / "build/bin/llama-server"),
@@ -310,6 +310,47 @@ class ServingRecipeTest(unittest.TestCase):
             "LD_LIBRARY_PATH": str(self.serve.ROOT / "build/bin")})
         self.assertNotIn("--glm53-profile", argv)
 
+    def test_dp_capacity_recipe_keeps_each_slots_cache_on_one_owner(self):
+        for slots in (1, 4, 36, 40):
+            for depth in ("2", "off"):
+                with self.subTest(slots=slots, depth=depth):
+                    args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4",
+                                                 "--slots", str(slots), "--mtp-depth", depth])
+                    argv, env = self.serve.make_plan(args)
+                    expected = {"-sm": "dp", "-ts": "1,1,1,1", "-fit": "off", "-np": str(slots),
+                                "-c": str(slots * 442368), "-b": "2048", "-ub": "512", "--prompt-step": "512",
+                                "--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "-ctki": "q8_0", "-cts": "q8_0"}
+                    for flag, value in expected.items():
+                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                    self.assertNotIn("--kv-unified", argv)
+                    self.assertNotIn("--no-cache-idle-slots", argv)
+                    self.assertIn("--backend-sampling", argv)
+                    self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
+                    self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_MEM_STATS"], "0")
+                    self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
+                    for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
+                        if depth == "off":
+                            self.assertNotIn(flag, argv)
+                        else:
+                            self.assertEqual(argv[argv.index(flag) + 1], value)
+                    if depth == "off":
+                        self.assertFalse(any(arg.startswith("--spec-") for arg in argv))
+                    else:
+                        self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
+
+    def test_dp_slot_defaults_and_bounds_do_not_change_tensor_capacity(self):
+        args = self.serve.arguments(["--model", "/models/target.gguf", "--profile", "dp-4"])
+        argv, _ = self.serve.make_plan(args)
+        self.assertEqual(argv[argv.index("-np") + 1], "36")
+        for options in (["--slots", "4"], ["--profile", "dp-4", "--slots", "0"],
+                        ["--profile", "dp-4", "--slots", "41"]):
+            with self.subTest(options=options):
+                args = self.serve.arguments(["--model", "/models/target.gguf", *options])
+                with self.assertRaisesRegex(ValueError, "slots"):
+                    self.serve.make_plan(args)
+
     def test_depth_and_responsiveness_options_are_independent(self):
         for depth, query in itertools.product(["1", "2", "off"], ["q8", "f32"]):
             args = self.serve.arguments(["--model", "/models/target.gguf", "--mtp-depth", depth,
@@ -325,6 +366,56 @@ class ServingRecipeTest(unittest.TestCase):
                 self.assertFalse(any(arg.startswith("--spec-") for arg in argv))
             else:
                 self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], depth)
+
+    def test_host_capacity_requires_mtp_and_a_sufficient_ram_budget(self):
+        base = ["--model", "/model.gguf", "--profile", "dp-4", "--kv-host", "--slots", "72"]
+        args = self.serve.arguments(base + ["--host-budget-mib", "200000"])
+        argv, env = self.serve.make_plan(args)
+        self.assertEqual(env["LLAMA_KV_HOST"], "1")
+        self.assertEqual(argv[argv.index("-c") + 1], str(72 * 442368))
+        self.assertEqual(argv[argv.index("--spec-draft-n-max") + 1], "2")
+        self.assertNotIn("--kv-unified", argv)
+        for extra in ([], ["--host-budget-mib", "198287"], ["--host-budget-mib", "nan"],
+                      ["--host-budget-mib", "200000", "--mtp-depth", "off"],
+                      ["--host-budget-mib", "200000", "--profile", "tensor-2"]):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.serve.make_plan(self.serve.arguments(base + extra))
+
+    def test_cgroup_v1_memory_budget_is_honored(self):
+        files = {
+            "/proc/meminfo": "MemAvailable: 104857600 kB\n",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(50 * 1024**3),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes": str(10 * 1024**3),
+        }
+
+        class FakePath:
+            def __init__(self, path):
+                self.path = path
+
+            def is_file(self):
+                return self.path in files
+
+            def read_text(self):
+                return files[self.path]
+
+            def with_name(self, name):
+                from pathlib import PurePosixPath
+                return FakePath(str(PurePosixPath(self.path).with_name(name)))
+
+        with mock.patch.object(self.serve, "Path", side_effect=FakePath):
+            self.assertEqual(self.serve.available_memory_mib(), 40960)
+
+    def test_host_capacity_launch_refuses_insufficient_available_ram(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            model.touch()
+            args = self.serve.arguments(["--model", str(model), "--server", sys.executable,
+                "--profile", "dp-4", "--kv-host", "--slots", "72", "--host-budget-mib", "200000"])
+            with mock.patch.object(self.serve.os, "execve") as execute, \
+                    mock.patch.object(self.serve, "available_memory_mib", return_value=230000):
+                with self.assertRaisesRegex(ValueError, "RAM"):
+                    self.serve.main(args)
+                execute.assert_not_called()
 
     def test_hidden_engine_settings_do_not_override_the_recipe(self):
         args = self.serve.arguments(["--model", "/models/target.gguf"])
@@ -418,6 +509,42 @@ class ServingRecipeTest(unittest.TestCase):
         self.assertTrue(set(range(256)).issubset(ids))
         self.assertTrue(set(range(154820, 154856)).issubset(ids))
         self.assertTrue(all(0 <= token <= 154855 for token in ids))
+
+
+class CapacityTest(unittest.TestCase):
+    def setUp(self):
+        from capacity import estimate
+        self.estimate = estimate
+        self.lower = [dict(device=d, used_mib=used, free_mib=97342-used)
+                      for d, used in enumerate([90510, 88876, 88876, 88876])]
+        self.upper = [dict(device=d, used_mib=used, free_mib=97342-used)
+                      for d, used in enumerate([95798, 94164, 94164, 94164])]
+
+    def test_measured_fixed_cost_and_mtp_cache_limit_every_card(self):
+        resident = self.estimate(36, self.lower, 40, self.upper)
+        self.assertEqual(resident['estimated_max']['slots'], 36)
+        host = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=200000)
+        self.assertEqual(host['estimated_max']['slots'], 72)
+        self.assertEqual(host['estimated_max']['host_kv_mib'], 198288)
+        self.assertEqual(host['cache_mib_per_slot'], 4819.5)
+        self.assertAlmostEqual(host['staging_mib_per_card'], 1321.8359375)
+        self.assertFalse(host['capacity_qualified'])
+        self.assertFalse(host['quality_qualified'])
+        limited = self.estimate(36, self.lower, 40, self.upper, host_kv=True, host_budget_mib=50000)
+        self.assertEqual(limited['estimated_max']['slots'], 18)
+        self.assertEqual(limited['estimated_max']['slots_per_card'], [5, 5, 4, 4])
+
+    def test_bad_calibration_cannot_produce_a_capacity_claim(self):
+        for field, value in [('peak_extra_mib', float('nan')), ('reserve_mib', float('inf')),
+                             ('max_slots', 257)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.estimate(36, self.lower, 40, self.upper, **{field: value})
+        changed = copy.deepcopy(self.upper)
+        changed[0]['free_mib'] += 1024
+        with self.assertRaises(ValueError):
+            self.estimate(36, self.lower, 40, changed)
+        with self.assertRaises(ValueError):
+            self.estimate(36, self.lower, 40, self.upper, host_kv=True)
 
 
 if __name__ == "__main__":

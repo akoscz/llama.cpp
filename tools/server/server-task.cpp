@@ -1688,24 +1688,27 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+void server_prompt_cache::insert_state(server_prompt_cache_state && state) {
+    state.freeze_size();
+    total_bytes += state.cached_size;
+    total_tokens += state.prompt.n_tokens();
+    states.push_back(std::move(state));
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_state(
+        std::list<server_prompt_cache_state>::iterator it) {
+    GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
+    total_bytes -= it->cached_size;
+    total_tokens -= it->prompt.n_tokens();
+    return states.erase(it);
+}
+
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
-
-    for (const auto & state : states) {
-        res += state.size();
-    }
-
-    return res;
+    return total_bytes;
 }
 
 size_t server_prompt_cache::n_tokens() const {
-    size_t res = 0;
-
-    for (const auto & state : states) {
-        res += state.prompt.n_tokens();
-    }
-
-    return res;
+    return total_tokens;
 }
 
 const char * server_prompt_cache_result_name(server_prompt_cache_result result) {
@@ -1750,6 +1753,18 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
     }
 
     try {
+        // Token-only rejection does not need either model's serialized state size.
+        if (!allow_evict && limit_size == 0 && limit_tokens > 0 &&
+                ((size_t) prompt.n_tokens() > limit_tokens || n_tokens() > limit_tokens - prompt.n_tokens())) {
+            return server_prompt_cache_result::no_space;
+        }
+        if (protect && limit_size == 0 && limit_tokens > 0 &&
+                (size_t) protect->prompt.n_tokens() + (size_t) prompt.n_tokens() > limit_tokens) {
+            SRV_TRC("cache_save reason=no_space slot=%d tokens=%d protected=%d limit=%zu\n",
+                    id_slot, prompt.n_tokens(), protect->prompt.n_tokens(), limit_tokens);
+            return server_prompt_cache_result::no_space;
+        }
+
         server_prompt_cache_state pending;
         pending.pos_min = pos_min;
         const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1778,20 +1793,6 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
             SRV_WRN("cache_save reason=invalid_state slot=%d\n", id_slot);
             return server_prompt_cache_result::failed;
         }
-        // With no byte limit, the token budget is the only eviction bound.
-        // Idle/pressure saves must not displace another conversation through it.
-        if (!allow_evict && limit_size == 0 && limit_tokens > 0 &&
-                ((size_t) prompt.n_tokens() > limit_tokens || n_tokens() > limit_tokens - prompt.n_tokens())) {
-            return server_prompt_cache_result::no_space;
-        }
-        // Nor may an evicting save clear every other conversation and then find no room beside the protected
-        // snapshot: with no byte limit, the pair must fit the token cap before anyone is evicted for it.
-        if (protect && limit_size == 0 && limit_tokens > 0 &&
-                (size_t) protect->prompt.n_tokens() + (size_t) prompt.n_tokens() > limit_tokens) {
-            SRV_TRC("cache_save reason=no_space slot=%d tokens=%d protected=%d limit=%zu\n",
-                    id_slot, prompt.n_tokens(), protect->prompt.n_tokens(), limit_tokens);
-            return server_prompt_cache_result::no_space;
-        }
 
         if (limit_size > 0) {
             const size_t retained = protect ? protect->size() : 0;
@@ -1809,7 +1810,7 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
                     continue;
                 }
                 SRV_WRN("cache_evict reason=admission tokens=%d bytes=%zu\n", it->prompt.n_tokens(), it->size());
-                it = states.erase(it);
+                it = erase_state(it);
             }
         }
 
@@ -1825,12 +1826,12 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
         }
 
         // Publish only after both model states and the drafter state are complete.
-        states.push_back(std::move(pending));
+        insert_state(std::move(pending));
         const auto * saved = &states.back();
         for (auto it = states.begin(); &*it != saved;) {
             if (&*it != protect && it->prompt.tokens.size() == prompt.tokens.size() &&
                     it->prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) {
-                it = states.erase(it);
+                it = erase_state(it);
             } else {
                 ++it;
             }
@@ -1849,8 +1850,8 @@ server_prompt_cache_result server_prompt_cache::save(const server_prompt & promp
 }
 
 size_t server_prompt_cache::reusable_prefix(const server_prompt & prompt, const server_tokens & tokens_new,
-        llama_pos pos_min, int32_t n_swa) {
-    size_t reused = prompt.tokens.get_common_prefix(tokens_new);
+        llama_pos pos_min, int32_t n_swa, std::optional<size_t> lcp) {
+    size_t reused = lcp.value_or(prompt.tokens.get_common_prefix(tokens_new));
     if (reused == 0 || pos_min < 0) {
         return 0;
     }
@@ -1873,16 +1874,17 @@ size_t server_prompt_cache::reusable_prefix(const server_prompt & prompt, const 
 }
 
 server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt & prompt,
-        const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa) {
-    size_t best_reuse = reusable_prefix(prompt, tokens_new, pos_min, n_swa);
+        const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa, std::optional<size_t> resident_reuse) {
+    size_t best_reuse = resident_reuse ? *resident_reuse : reusable_prefix(prompt, tokens_new, pos_min, n_swa);
     server_prompt_cache_state * best = nullptr;
     for (auto & state : states) {
         if (state.data.main.empty()) {
             continue;
         }
-        const size_t reused = reusable_prefix(state.prompt, tokens_new, state.pos_min, n_swa);
+        const size_t lcp = state.prompt.tokens.get_common_prefix(tokens_new);
+        const size_t reused = reusable_prefix(state.prompt, tokens_new, state.pos_min, n_swa, lcp);
         SRV_TRC("cache_candidate tokens=%d lcp=%zu reusable=%zu bytes=%zu\n", state.prompt.n_tokens(),
-                state.prompt.tokens.get_common_prefix(tokens_new), reused, state.size());
+                lcp, reused, state.size());
         // Restoring a snapshot to keep under a quarter of it costs a transfer for little saved computation, and the
         // slot then cuts the rest: such a candidate is passed over (main's "don't trash large prompts").
         if (4 * reused < (size_t) state.prompt.n_tokens()) {
@@ -1940,6 +1942,9 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
     SRV_TRC("cache_restore reason=restored slot=%d tokens=%d bytes=%zu consumed=%d\n", id_slot, it->prompt.n_tokens(),
             it->size(), consume);
     if (consume) {
+        GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
+        total_bytes -= it->cached_size;
+        total_tokens -= it->prompt.n_tokens();
         prompt = std::move(it->prompt);
         states.erase(it);
     } else {
@@ -1957,7 +1962,7 @@ void server_prompt_cache::update(const server_prompt_cache_state * protect) {
                 continue;
             }
             SRV_WRN("cache_evict reason=byte_limit tokens=%d bytes=%zu\n", it->prompt.n_tokens(), it->size());
-            it = states.erase(it);
+            it = erase_state(it);
         }
     }
 
@@ -1972,7 +1977,7 @@ void server_prompt_cache::update(const server_prompt_cache_state * protect) {
             }
             SRV_WRN("cache_evict reason=token_limit tokens=%d bytes=%zu limit=%zu\n",
                     it->prompt.n_tokens(), it->size(), limit_tokens);
-            it = states.erase(it);
+            it = erase_state(it);
         }
     }
 
