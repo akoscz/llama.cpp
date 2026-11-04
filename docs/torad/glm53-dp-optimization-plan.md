@@ -92,3 +92,11 @@ Do not launch a 400K/full-capacity fill while the short concurrent workload rema
 Focused local checks: `test-alloc`; `test-backend-meta-sampler --cpu`; `test-speculative-mtp --test sampler-graphs`; `test-speculative-mtp --dp-device CPU`; tensor CPU split cases `(0,1)`, `(0,3)`, `(1,8)`; and `python3 -m unittest discover -s scripts/glm53 -p test_measure.py`. CUDA compilation covered the server, sampler/MTP tests, collective probe and split tests. Raw local logs are under `.Codex/tmp/dp-impl-20261104/`.
 
 The collective probe prepares the fourth item; a production transport change still requires measured evidence. The next bounded rental must establish physical CUDA correctness before the full-model ABBA matrix. Keep the startup-fix baseline (`82ad56cb8`), a sampling-only library from `87c9ce015`, and the combined candidate separately identified by artifact hashes.
+
+## Qualification availability, November 4 at 18:58 UTC
+
+[PR 119](https://github.com/torad-labs/llama.cpp/pull/119) holds this series, stacked on the startup fix in PR 118. The local candidate archive is SHA256 `668275c7b92e5e843559fb9b948e45cee5edbad5424b8cbd15037032d4cdfcdc`, with source head `75f8d57a2` and an independently built sampling-only library. Artifacts and the bounded controller are in `.Codex/tmp/dp-impl-20261104/`.
+
+No physical GPU test ran in this attempt. A direct restart of retained instance 59024660 reached SSH, but Rig's old hard-stop deadline interrupted the initial upload. The controller confirmed the box stopped after 30 seconds. A second attempt used `rig vast keep --hours 0.6666666666666666` to renew its deadline; the box did not restart within the controller's two-minute readiness budget. The start queue was cancelled and both provider states confirmed stopped. A fresh search found no four-card, >=90 GB/card, >=360 GB RAM offer at <=$8.50/hour and >=98% reliability. No new instance was created.
+
+GPU correctness, the ABBA rates and collective transport selection remain pending availability. The machine is stopped; its retained disk still incurs storage charges. The controller stops the instance immediately after necessary artifact collection and also arms an independent provider stop timer.
