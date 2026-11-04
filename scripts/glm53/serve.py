@@ -114,8 +114,14 @@ def available_memory_mib():
                      if line.startswith('MemAvailable:'))
     # Vast containers may have a smaller cgroup limit than the machine's RAM.
     limit = Path('/sys/fs/cgroup/memory.max')
-    if limit.is_file() and limit.read_text().strip() != 'max':
-        available = min(available, (int(limit.read_text()) - int(limit.with_name('memory.current').read_text())) / MIB)
+    if limit.is_file():
+        if limit.read_text().strip() != 'max':
+            available = min(available, (int(limit.read_text()) - int(limit.with_name('memory.current').read_text())) / MIB)
+    else:
+        limit_v1 = Path('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+        if limit_v1.is_file():
+            available = min(available, (int(limit_v1.read_text()) -
+                                       int(limit_v1.with_name('memory.usage_in_bytes').read_text())) / MIB)
     return available
 
 

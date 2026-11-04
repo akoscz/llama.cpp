@@ -381,6 +381,30 @@ class ServingRecipeTest(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.serve.make_plan(self.serve.arguments(base + extra))
 
+    def test_cgroup_v1_memory_budget_is_honored(self):
+        files = {
+            "/proc/meminfo": "MemAvailable: 104857600 kB\n",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(50 * 1024**3),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes": str(10 * 1024**3),
+        }
+
+        class FakePath:
+            def __init__(self, path):
+                self.path = path
+
+            def is_file(self):
+                return self.path in files
+
+            def read_text(self):
+                return files[self.path]
+
+            def with_name(self, name):
+                from pathlib import PurePosixPath
+                return FakePath(str(PurePosixPath(self.path).with_name(name)))
+
+        with mock.patch.object(self.serve, "Path", side_effect=FakePath):
+            self.assertEqual(self.serve.available_memory_mib(), 40960)
+
     def test_host_capacity_launch_refuses_insufficient_available_ram(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / "model.gguf"
