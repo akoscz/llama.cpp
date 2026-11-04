@@ -2404,18 +2404,26 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     }
 }
 
-static bool ggml_backend_meta_mirrored_copy(const ggml_tensor * src, const ggml_tensor * dst) {
+static bool ggml_backend_meta_matching_copy(const ggml_tensor * src, const ggml_tensor * dst) {
     if (!ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer) ||
             ggml_backend_buffer_get_type(src->buffer) != ggml_backend_buffer_get_type(dst->buffer) ||
             !ggml_are_same_layout(src, dst) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
-    if (ggml_backend_meta_get_split_state(src, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
-            ggml_backend_meta_get_split_state(dst, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-        return false;
-    }
     const size_t count = ggml_backend_meta_buffer_n_bufs(dst->buffer);
     if (ggml_backend_meta_buffer_n_bufs(src->buffer) != count) { return false; }
+    const auto a = ggml_backend_meta_get_split_state(src, false);
+    const auto b = ggml_backend_meta_get_split_state(dst, false);
+    if (a.axis != b.axis) { return false; }
+    if (a.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        if (a.axis < 0 || a.axis >= GGML_MAX_DIMS || a.n_segments != b.n_segments) { return false; }
+        for (size_t s = 0; s < a.n_segments; ++s) {
+            if (a.nr[s] != b.nr[s]) { return false; }
+            for (size_t i = 0; i < count; ++i) {
+                if (a.ne[s*count + i] != b.ne[s*count + i]) { return false; }
+            }
+        }
+    }
     for (size_t i = 0; i < count; ++i) {
         if (!ggml_are_same_layout(ggml_backend_meta_buffer_simple_tensor(src, i),
                                  ggml_backend_meta_buffer_simple_tensor(dst, i))) {
@@ -2426,8 +2434,9 @@ static bool ggml_backend_meta_mirrored_copy(const ggml_tensor * src, const ggml_
 }
 
 static bool ggml_backend_meta_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    if (buffer != dst->buffer || !ggml_backend_meta_mirrored_copy(src, dst)) { return false; }
+    if (buffer != dst->buffer || !ggml_backend_meta_matching_copy(src, dst)) { return false; }
     for (size_t i = 0; i < ggml_backend_meta_buffer_n_bufs(buffer); ++i) {
+        if (ggml_is_empty(ggml_backend_meta_buffer_simple_tensor(src, i))) { continue; }
         ggml_backend_tensor_copy(ggml_backend_meta_buffer_simple_tensor(src, i), ggml_backend_meta_buffer_simple_tensor(dst, i));
     }
     return true;
@@ -2926,7 +2935,7 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const ggml_tensor * src, ggml_tensor * dst) {
     if (!backend_src || !backend_dst || !ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst) ||
-            !ggml_backend_meta_mirrored_copy(src, dst) ||
+            !ggml_backend_meta_matching_copy(src, dst) ||
             ggml_backend_get_device(backend_src) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) ||
             ggml_backend_get_device(backend_dst) != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer))) {
         return false;
@@ -2934,6 +2943,7 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     const size_t count = ggml_backend_meta_buffer_n_bufs(dst->buffer);
     if (ggml_backend_meta_n_backends(backend_src) != count || ggml_backend_meta_n_backends(backend_dst) != count) { return false; }
     for (size_t i = 0; i < count; ++i) {
+        if (ggml_is_empty(ggml_backend_meta_buffer_simple_tensor(src, i))) { continue; }
         ggml_backend_tensor_copy_async(ggml_backend_meta_simple_backend(backend_src, i), ggml_backend_meta_simple_backend(backend_dst, i),
                 ggml_backend_meta_buffer_simple_tensor(src, i), ggml_backend_meta_buffer_simple_tensor(dst, i));
     }

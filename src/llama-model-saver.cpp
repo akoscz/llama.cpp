@@ -449,7 +449,11 @@ void llama_model_saver::add_tensors_from_model() {
 
     for (const struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
-            add_tensor(reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i]);
+            const auto * tensor = reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i];
+            // These layouts are derived at load time and are not GGUF weights.
+            if (tensor != layer.ssm_qkv_conv && tensor != layer.indexer_comp_ape_transposed) {
+                add_tensor(tensor);
+            }
         }
     }
 }

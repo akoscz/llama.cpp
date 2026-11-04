@@ -286,7 +286,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * conv_in = build_conv_state(inp_rs, conv_states_all, qkv, d_conv, 3*d_inner, il);
 
-    ggml_tensor * conv_w = ggml_concat(ctx0,
+    ggml_tensor * conv_w = layer.ssm_qkv_conv ? layer.ssm_qkv_conv : ggml_concat(ctx0,
             ggml_concat(ctx0,
                 ggml_reshape_2d(ctx0, layer.ssm_q_conv, d_conv, d_inner),
                 ggml_reshape_2d(ctx0, layer.ssm_k_conv, d_conv, d_inner), 1),
@@ -429,7 +429,8 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
             kbuf->nb[2], kbuf->nb[3], 0);
 
-    ggml_tensor * ape = ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
+    ggml_tensor * ape = layer.indexer_comp_ape_transposed ? layer.indexer_comp_ape_transposed :
+            ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
 
     // the write is by GLOBAL row while pool_reps is stream-local, so the read must not chain
     // off the write tensor; every chunk's write is expanded first and build order sequences them

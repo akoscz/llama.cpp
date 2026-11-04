@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -2018,6 +2019,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(logits.data != nullptr);
 
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        logits_valid = true;
     }
 
     // extract embeddings
@@ -2442,6 +2444,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                logits_valid = true;
             }
         }
 
@@ -2662,6 +2665,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    logits_valid = false;
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2868,7 +2872,7 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        if (logits.size > 0 && logits_valid) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -2916,15 +2920,15 @@ void llama_context::output_reorder() {
             assert(sampling.probs_count.size() > 0);
             assert(sampling.candidates_count.size() > 0);
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.logits_count[i0], sampling.logits_count[i1]); ++k) {
                 std::swap(sampling.logits.data[i0*n_vocab + k], sampling.logits.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.probs_count[i0], sampling.probs_count[i1]); ++k) {
                 std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
             }
 
-            for (uint64_t k = 0; k < n_vocab; ++k) {
+            for (uint64_t k = 0; k < std::max(sampling.candidates_count[i0], sampling.candidates_count[i1]); ++k) {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
 
@@ -4687,10 +4691,11 @@ void llama_context::mtp_index_capture() {
     if (!mtp_index.tensor) return;
     auto * draft = static_cast<llama_memory_hybrid *>(memory.get())->get_mtp_index();
     if (mtp_index.generation == draft->generation()) {
-        if (mtp_index.backend && cparams.n_seq_devices == 1 && !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
+        if (mtp_index.backend && (cparams.n_seq_devices == 1 || ggml_backend_is_meta(mtp_index.backend)) &&
+                !ggml_env_switch("LLAMA_KPOOL_SELECTION_HOST_LEGACY")) {
             for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
                 draft->capture_backend(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv,
-                        mtp_index.tensor, i, mtp_index.backend);
+                        mtp_index.tensor, i, mtp_index.backend, cparams.n_seq_max, cparams.n_seq_devices);
             }
         } else {
             const int64_t width = mtp_index.tensor->ne[0];

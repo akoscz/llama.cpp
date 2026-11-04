@@ -26,7 +26,9 @@
 
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -136,7 +138,7 @@ static gguf_context_ptr glm_gguf() {
 }
 
 static llama_model_ptr glm_model(size_t seed, std::vector<ggml_backend_dev_t> devices = {},
-        llama_split_mode split = LLAMA_SPLIT_MODE_LAYER) {
+        llama_split_mode split = LLAMA_SPLIT_MODE_LAYER, bool no_alloc = false) {
     auto gguf = glm_gguf();
     if (!devices.empty()) {
         llama_model_saver ms(LLM_ARCH_GLM5NEXT, gguf.get());
@@ -148,6 +150,7 @@ static llama_model_ptr glm_model(size_t seed, std::vector<ggml_backend_dev_t> de
     llama_model_params mparams = llama_model_default_params();
     mparams.progress_callback = [](float, void *) { return true; };
     mparams.load_mtp = true;
+    mparams.no_alloc = no_alloc;
     devices.push_back(nullptr);
     mparams.devices = devices.data();
     mparams.split_mode = split;
@@ -177,11 +180,15 @@ struct server_rig {
 
     // the target's logits of the last batch's output rows, in batch order
     std::vector<float> logits;
+    size_t selection_reads = 0;
+    std::vector<bool> selection_seqs;
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
                ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
-               bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ) : n_max(n_max) {
+               bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ,
+               bool observe_selections = false) : n_max(n_max) {
         seqs.resize(n_seq);
+        selection_seqs.resize(n_seq);
         params.n_ctx      = 8192;
         params.cache_type_idx = type_idx;
         params.n_parallel = n_seq;
@@ -212,6 +219,22 @@ struct server_rig {
             throw std::runtime_error("failed to create the target context");
         }
         common_params params_dft = common_base_params_to_speculative(params);
+        if (observe_selections) {
+            params_dft.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+                auto & rig = *static_cast<server_rig *>(data);
+                if (!ask || t->op != GGML_OP_GET_ROWS || !rig.init) { return false; }
+                auto * draft = static_cast<llama_memory_hybrid *>(llama_get_memory(rig.init->context()))->get_mtp_index();
+                for (size_t seq = 0; seq < rig.seqs.size(); ++seq) {
+                    const auto bank = draft->backend_row(seq);
+                    if (bank && t->src[0] == bank->tensor && bank->tensor->ne[1] == (int64_t) rig.seqs.size()) {
+                        ++rig.selection_reads;
+                        rig.selection_seqs[seq] = true;
+                    }
+                }
+                return false;
+            };
+            params_dft.cb_eval_user_data = this;
+        }
         init = common_speculative_init_from_params(params_dft, model, tgt.get());
         if (!init->context()) {
             throw std::runtime_error("failed to create the MTP context");
@@ -1413,6 +1436,90 @@ static bool test_sampler_graphs(llama_model * model) {
     return true;
 }
 
+static bool test_sampler_reorder(llama_model * model) {
+    constexpr int n_seq = 8;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    for (int n_sampled : {n_seq, n_seq - 1}) {
+        std::vector<llama_sampler_ptr> samplers[2];
+        std::vector<llama_sampler_seq_config> configs[2];
+        llama_context_ptr contexts[2];
+        for (int side = 0; side < 2; ++side) {
+            for (int s = 0; s < n_sampled; ++s) {
+                samplers[side].emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                auto * chain = samplers[side].back().get();
+                if (s % 3 == 2) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+                } else {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(s % 3 == 0 ? 10 : 40));
+                    if (s % 3 == 1) {
+                        llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
+                        llama_sampler_chain_add(chain, llama_sampler_init_dist(1000 + s));
+                    }
+                }
+                configs[side].push_back({s, chain});
+            }
+            auto params = llama_context_default_params();
+            params.n_ctx = 128*n_seq;
+            params.n_seq_max = n_seq;
+            params.n_batch = params.n_ubatch = 32;
+            params.n_outputs_max = 3*n_seq;
+            params.n_outputs_max_per_seq = 3;
+            params.n_threads = params.n_threads_batch = 4;
+            params.kv_unified = false;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            params.samplers = configs[side].data();
+            params.n_samplers = configs[side].size();
+            contexts[side].reset(llama_init_from_model(model, params));
+            if (!contexts[side]) { return fail("sampler reorder context initialization failed"); }
+        }
+        for (int round = 0; round < 6; ++round) {
+            const int width = 1 + round % 3;
+            llama_batch batches[2] = {llama_batch_init(n_seq*width, 0, 1), llama_batch_init(n_seq*width, 0, 1)};
+            int row_of[2][n_seq];
+            bool ok = true;
+            for (int side = 0; side < 2; ++side) {
+                for (int i = 0; i < n_seq; ++i) {
+                    const int s = side == 0 ? (i % 2)*4 + i/2 : (i + round) % n_seq;
+                    row_of[side][s] = batches[side].n_tokens;
+                    for (int p = 0; p < width; ++p) {
+                        common_batch_add(batches[side], (s*7 + p + round) % n_vocab, p, {s}, true);
+                    }
+                }
+                llama_memory_clear(llama_get_memory(contexts[side].get()), true);
+                if (llama_decode(contexts[side].get(), batches[side]) != 0) { ok = fail("sampler reorder decode failed"); break; }
+            }
+            for (int s = 0; ok && s < n_seq; ++s) {
+                for (int p = 0; ok && p < width; ++p) {
+                    const int ia = row_of[0][s] + p, ib = row_of[1][s] + p;
+                    if (s >= n_sampled) {
+                        if (memcmp(llama_get_logits_ith(contexts[0].get(), ia), llama_get_logits_ith(contexts[1].get(), ib), n_vocab*sizeof(float))) {
+                            ok = fail("output reorder changed raw fallback logits");
+                        }
+                        continue;
+                    }
+                    const auto a = llama_get_sampling_row_ith(contexts[0].get(), ia);
+                    const auto b = llama_get_sampling_row_ith(contexts[1].get(), ib);
+                    if (a.n_sampled_logits != b.n_sampled_logits || a.n_sampled_probs != b.n_sampled_probs || a.n_candidates != b.n_candidates ||
+                            memcmp(a.sampled_logits, b.sampled_logits, a.n_sampled_logits*sizeof(float)) ||
+                            memcmp(a.sampled_probs, b.sampled_probs, a.n_sampled_probs*sizeof(float)) ||
+                            memcmp(a.candidates, b.candidates, a.n_candidates*sizeof(llama_token)) ||
+                            llama_get_sampled_token_ith(contexts[0].get(), ia) != llama_get_sampled_token_ith(contexts[1].get(), ib)) {
+                        ok = fail("output reorder changed sampling values or counts");
+                    }
+                    const uint32_t expected = s % 3 == 2 ? 0 : (s % 3 == 0 ? 10 : 40);
+                    if (a.n_sampled_logits != (s % 3 == 2 ? (uint32_t) n_vocab : expected) || a.n_candidates != expected || a.n_sampled_probs != (s % 3 == 1 ? expected : 0)) {
+                        fprintf(stderr, "reorder seq %d: logits=%u probs=%u candidates=%u expected=%u\n", s, a.n_sampled_logits, a.n_sampled_probs, a.n_candidates, expected);
+                        ok = fail("sampler reorder did not exercise mixed output lengths");
+                    }
+                }
+            }
+            for (auto & batch : batches) { llama_batch_free(batch); }
+            if (!ok) { return false; }
+        }
+    }
+    return true;
+}
+
 static bool test_sampler_reserve(llama_model * model) {
     const int n_seq = 40;
     const int width = N_MAX + 1;
@@ -1476,13 +1583,80 @@ static bool test_sampler_reserve(llama_model * model) {
     return finish(true);
 }
 
+static bool test_prepared_weights(llama_model *) {
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    const std::pair<llama_split_mode, size_t> configs[] = {
+        {LLAMA_SPLIT_MODE_LAYER, 1}, {LLAMA_SPLIT_MODE_TENSOR, 2}, {LLAMA_SPLIT_MODE_TENSOR, 4},
+        {LLAMA_SPLIT_MODE_DATA, 2}, {LLAMA_SPLIT_MODE_DATA, 4},
+    };
+    for (const auto & config : configs) {
+        const auto mode = config.first;
+        const std::vector<ggml_backend_dev_t> devices(config.second, cpu);
+        set_env("LLAMA_GLM5NEXT_PREPACK_LEGACY", "1");
+        auto legacy = glm_model(1234, devices, mode);
+        auto legacy_estimate = glm_model(1234, devices, mode, true);
+        set_env("LLAMA_GLM5NEXT_PREPACK_LEGACY", nullptr);
+        auto prepared = glm_model(1234, devices, mode);
+        auto estimate = glm_model(1234, devices, mode, true);
+        const auto bytes = [](const llama_model & model) {
+            size_t result = 0;
+            for (const auto & entry : model.memory_breakdown()) { result += entry.second; }
+            return result;
+        };
+        if (bytes(*prepared) <= bytes(*legacy) || bytes(*estimate) <= bytes(*legacy_estimate) ||
+                bytes(*estimate) - bytes(*legacy_estimate) < bytes(*prepared) - bytes(*legacy)) {
+            fprintf(stderr, "prepared weights mode %d: legacy %zu/%zu, prepared %zu/%zu bytes (allocated/estimated)\n",
+                    int(mode), bytes(*legacy), bytes(*legacy_estimate), bytes(*prepared), bytes(*estimate));
+            return fail("prepared weights are missing from model memory accounting");
+        }
+        if (prepared->n_tensors() != legacy->n_tensors()) { return fail("prepared weights changed the GGUF tensor count"); }
+        for (const auto & layer : prepared->layers) {
+            if (layer.ssm_q_conv && !layer.ssm_qkv_conv) { return fail("KDA convolution weights were not prepared"); }
+            if (layer.indexer_comp_ape && !layer.indexer_comp_ape_transposed) { return fail("indexer APE was not prepared"); }
+        }
+        server_rig ref(legacy.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, mode == LLAMA_SPLIT_MODE_DATA);
+        server_rig packed(prepared.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, mode == LLAMA_SPLIT_MODE_DATA);
+        std::mt19937 rng_ref(5), rng_packed(5);
+        for (llama_seq_id s = 0; s < N_SEQ; ++s) {
+            ref.request(s, rng_ref, 150 + 17*s);
+            packed.request(s, rng_packed, 150 + 17*s);
+            if (ref.logits != packed.logits) { return fail("prepared weights changed prefill logits"); }
+        }
+        for (int round = 0; round < 6; ++round) {
+            const std::vector<llama_seq_id> order = round % 2 ? std::vector<llama_seq_id>{1, 2, 0} : std::vector<llama_seq_id>{2, 0, 1};
+            ref.draft(order);
+            packed.draft(order);
+            for (llama_seq_id s : order) {
+                if (ref.seqs[s].draft != packed.seqs[s].draft) { return fail("prepared weights changed draft tokens"); }
+            }
+            ref.verify(order);
+            packed.verify(order);
+            if (ref.logits != packed.logits) { return fail("prepared weights changed verification logits"); }
+            for (llama_seq_id s : order) {
+                const int accepted = (round + s) % (N_MAX + 1);
+                for (auto * rig : {&ref, &packed}) {
+                    common_speculative_accept(rig->spec.get(), s, accepted);
+                    rig->seqs[s].n_past -= N_MAX - accepted;
+                    llama_memory_seq_rm(llama_get_memory(rig->tgt.get()), s, rig->seqs[s].n_past, -1);
+                    llama_memory_seq_rm(llama_get_memory(rig->init->context()), s, rig->seqs[s].n_past, -1);
+                }
+            }
+        }
+        printf("prepared weights mode %d, %zu ranks: exact prefill, draft and verify parity; memory %zu bytes\n",
+                int(mode), devices.size(), bytes(*prepared));
+    }
+    return true;
+}
+
 static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cache) {
+    set_env("LLAMA_GLM5NEXT_PREPACK_LEGACY", "1");
     auto baseline = glm_model(1234, {devices.front()});
+    set_env("LLAMA_GLM5NEXT_PREPACK_LEGACY", nullptr);
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
-    if (!q8_cache && (!test_sampler_reserve(split.get()) || !test_sampler_graphs(split.get()))) { return false; }
+    if (!q8_cache && (!test_sampler_reserve(split.get()) || !test_sampler_graphs(split.get()) || !test_sampler_reorder(split.get()))) { return false; }
     set_env("LLAMA_MTP_DEVICE_H", "1");
     server_rig ref(baseline.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
-    server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
+    server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache, N_SEQ, true);
     set_env("LLAMA_MTP_DEVICE_H", nullptr);
     std::mt19937 rng_ref(5), rng_dp(5);
     for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
@@ -1492,9 +1666,14 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     size_t greedy_accepted = 0;
     size_t forced_counts[N_MAX + 1] = {};
     for (int round = 0; round < 16; ++round) {
+        const bool host_selection = round >= 12;
+        set_env("LLAMA_KPOOL_SELECTION_HOST_LEGACY", host_selection ? "1" : nullptr);
+        const size_t previous_reads = dp.selection_reads;
         const std::vector<llama_seq_id> order = round % 2 ? std::vector<llama_seq_id>{1, 2, 0} : std::vector<llama_seq_id>{2, 0, 1};
         ref.draft(order);
         dp.draft(order);
+        set_env("LLAMA_KPOOL_SELECTION_HOST_LEGACY", nullptr);
+        if (host_selection && dp.selection_reads != previous_reads) { return fail("host selection control read the device bank"); }
         std::vector<llama_pos> before;
         for (llama_seq_id seq = 0; seq < N_SEQ; ++seq) {
             before.push_back(ref.seqs[seq].n_past);
@@ -1544,8 +1723,12 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
         }
     }
     for (auto count : forced_counts) { if (count == 0) { return fail("DP acceptance coverage is incomplete"); } }
+    if (!dp.selection_reads || !std::all_of(dp.selection_seqs.begin(), dp.selection_seqs.end(), [](bool seen) { return seen; })) {
+        return fail("DP MTP did not read every sequence's persistent selection bank");
+    }
     printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
         devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
+    printf("DP MTP selection bank: %zu observed sequence reads; host control used none\n", dp.selection_reads);
     return q8_cache || test_graph_shapes(split.get());
 }
 
@@ -1582,6 +1765,8 @@ int main(int argc, char ** argv) {
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
             { "sampler-reserve", test_sampler_reserve },
             { "sampler-graphs", test_sampler_graphs },
+            { "sampler-reorder", test_sampler_reorder },
+            { "prepared-weights", test_prepared_weights },
             { "graph-shapes", test_graph_shapes },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },

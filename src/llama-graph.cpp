@@ -4417,9 +4417,19 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             }
             if (!inp->draft_rows.empty()) {
                 ggml_tensor * joined = nullptr;
-                for (const auto & row : inp->draft_rows) {
-                    auto * t = ggml_reshape_2d(ctx0, row->tensor, kpool*n_dump, 1);
-                    joined = joined ? ggml_concat(ctx0, joined, t, 1) : t;
+                if (cparams.n_seq_devices > 1) {
+                    const auto & bank = inp->draft_rows.front();
+                    for (const auto & row : inp->draft_rows) { GGML_ASSERT(row == bank); }
+                    inp->draft_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+                    const auto counts = ubatch.device_rows(cparams.n_seq_devices);
+                    ggml_backend_meta_split_input(inp->draft_ids, 0, counts.data(), counts.size());
+                    ggml_set_input(inp->draft_ids);
+                    joined = ggml_backend_meta_get_rows_local(ctx0, bank->tensor, inp->draft_ids);
+                } else {
+                    for (const auto & row : inp->draft_rows) {
+                        auto * t = ggml_reshape_2d(ctx0, row->tensor, kpool*n_dump, 1);
+                        joined = joined ? ggml_concat(ctx0, joined, t, 1) : t;
+                    }
                 }
                 inp->draft_top_k = ggml_reshape_3d(ctx0, joined, kpool*n_dump, n_tps, n_stream);
             } else {
@@ -4449,7 +4459,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 ggml_backend_meta_split_input(item.first, item.second, counts.data(), counts.size());
             }
         }
-        if (inp->draft_top_k && inp->draft_top_k->op != GGML_OP_NONE) {
+        if (inp->draft_top_k && !inp->draft_ids && inp->draft_top_k->op != GGML_OP_NONE) {
             inp->draft_top_k = ggml_backend_meta_scatter(ctx0, inp->draft_top_k, 2, counts.data(), counts.size());
         }
         auto writes = counts;
