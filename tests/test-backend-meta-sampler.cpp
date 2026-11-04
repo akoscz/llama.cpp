@@ -167,7 +167,8 @@ struct sampling_graph {
     ggml_tensor  * gathered = nullptr;
     std::vector<llama_sampler_data> out;
 
-    sampling_graph(const head_weights * w, int64_t n_vocab, int64_t n_rows, const std::vector<llama_sampler *> & chains) {
+    sampling_graph(const head_weights * w, int64_t n_vocab, int64_t n_rows, const std::vector<llama_sampler *> & chains,
+            bool dp = false) {
         const size_t max_nodes = 8192;
         const ggml_init_params params = {
             /*.mem_size   =*/ max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false),
@@ -191,9 +192,11 @@ struct sampling_graph {
             ggml_build_forward_expand(gf, gathered);
         } else {
             logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_rows);
+            ggml_set_name(logits, "logits");
             ggml_set_input(logits);
             // as llama builds it on one device: the chains read rows padded out of the logits, never the input itself
-            rows = ggml_pad_ext(ctx, logits, 0, (int) n_pad_of(n_vocab), 0, 0, 0, 0, 0, 0);
+            rows = dp ? ggml_pad(ctx, logits, 0, 1, 0, 0) :
+                ggml_pad_ext(ctx, logits, 0, (int) n_pad_of(n_vocab), 0, 0, 0, 0, 0, 0);
         }
 
         for (int64_t r = 0; r < n_rows; r++) {
@@ -264,9 +267,20 @@ static bool same_output(const char * name, const ggml_tensor * m, const ggml_ten
     return false;
 }
 
+static ggml_backend_meta_split_state split_dp_by_name(const ggml_tensor * tensor, void * userdata) {
+    if (strcmp(tensor->name, "logits") == 0) {
+        const auto * counts = (const std::vector<int64_t> *) userdata;
+        ggml_backend_meta_split_state state = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        state.ne[0] = (*counts)[0];
+        state.ne[1] = (*counts)[1];
+        return state;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
 // one shape and one chain kind; returns whether every evaluation matched
 static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, ggml_backend_t cpu, ggml_backend_dev_t meta,
-        ggml_backend_dev_t gpu, chain_kind kind, int64_t n_vocab, int64_t n_rows, std::mt19937 & rng) {
+        ggml_backend_dev_t gpu, chain_kind kind, int64_t n_vocab, int64_t n_rows, std::mt19937 & rng, bool dp = false) {
     head_weights w(ggml_backend_dev_buffer_type(meta), n_vocab, rng);
 
     std::vector<llama_sampler *> chains_meta;
@@ -282,7 +296,7 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
         }
     }
 
-    sampling_graph g_meta(&w,      n_vocab, n_rows, chains_meta);
+    sampling_graph g_meta(dp ? nullptr : &w, n_vocab, n_rows, chains_meta, dp);
     sampling_graph g_ref (nullptr, n_vocab, n_rows, chains_ref);
 
     ggml_backend_t backends_meta[2] = {meta_backend, cpu};
@@ -302,12 +316,22 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
 
     bool ok = true;
     for (int e = 0; e < n_eval; e++) {
-        std::vector<float> x(n_embd*n_rows);
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (float & v : x) {
-            v = dist(rng);
+        if (dp) {
+            std::vector<float> logits(n_vocab*n_rows);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & v : logits) { v = dist(rng); }
+            for (int64_t r = 0; r < n_rows; r++) {
+                logits[r*n_vocab + (r*37 + e*53) % n_vocab] += 10.0f;
+            }
+            ggml_backend_tensor_set(g_meta.logits, logits.data(), 0, ggml_nbytes(g_meta.logits));
+        } else {
+            std::vector<float> x(n_embd*n_rows);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & v : x) {
+                v = dist(rng);
+            }
+            ggml_backend_tensor_set(g_meta.x, x.data(), 0, ggml_nbytes(g_meta.x));
         }
-        ggml_backend_tensor_set(g_meta.x, x.data(), 0, ggml_nbytes(g_meta.x));
         for (llama_sampler * c : chains_meta) {
             c->iface->backend_set_input(c);
         }
@@ -316,24 +340,26 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
         std::vector<float> logits(n_vocab*n_rows);
         ggml_backend_tensor_get(g_meta.logits, logits.data(), 0, ggml_nbytes(g_meta.logits));
         const int64_t n_pad = n_pad_of(n_vocab);
-        std::vector<float> gathered((n_vocab + n_pad)*n_rows);
-        ggml_backend_tensor_get(g_meta.gathered, gathered.data(), 0, ggml_nbytes(g_meta.gathered));
-
         int64_t n_neg_zero = 0;
         int64_t n_pos_zero = 0;
         bool ok_gather = true;
-        for (int64_t r = 0; r < n_rows; r++) {
-            const float * a = logits.data()   + r*n_vocab;
-            const float * b = gathered.data() + r*(n_vocab + n_pad);
-            const std::vector<float> pad(n_pad, 0.0f);
-            ok_gather = ok_gather && memcmp(a, b, n_vocab*sizeof(float)) == 0;
-            ok_gather = ok_gather && memcmp(&b[n_vocab], pad.data(), n_pad*sizeof(float)) == 0;
-            for (int64_t i = 0; i < n_vocab; i++) {
-                n_neg_zero += a[i] == 0.0f &&  std::signbit(a[i]);
-                n_pos_zero += a[i] == 0.0f && !std::signbit(a[i]);
+        if (!dp) {
+            std::vector<float> gathered((n_vocab + n_pad)*n_rows);
+            ggml_backend_tensor_get(g_meta.gathered, gathered.data(), 0, ggml_nbytes(g_meta.gathered));
+
+            for (int64_t r = 0; r < n_rows; r++) {
+                const float * a = logits.data()   + r*n_vocab;
+                const float * b = gathered.data() + r*(n_vocab + n_pad);
+                const std::vector<float> pad(n_pad, 0.0f);
+                ok_gather = ok_gather && memcmp(a, b, n_vocab*sizeof(float)) == 0;
+                ok_gather = ok_gather && memcmp(&b[n_vocab], pad.data(), n_pad*sizeof(float)) == 0;
+                for (int64_t i = 0; i < n_vocab; i++) {
+                    n_neg_zero += a[i] == 0.0f &&  std::signbit(a[i]);
+                    n_pos_zero += a[i] == 0.0f && !std::signbit(a[i]);
+                }
             }
+            GGML_ASSERT(n_neg_zero > 0 && n_pos_zero > 0);
         }
-        GGML_ASSERT(n_neg_zero > 0 && n_pos_zero > 0);
 
         ggml_backend_tensor_set(g_ref.logits, logits.data(), 0, ggml_nbytes(g_ref.logits));
         for (llama_sampler * c : chains_ref) {
@@ -362,8 +388,9 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
         }
 
         const bool ok_eval = ok_gather && ok_chain;
-        printf("%s %-34s vocab %6lld rows %lld eval %d: gather %s, chain outputs %s, tokens%s\n", ok_eval ? "ok  " : "FAIL",
-            chain_name(kind), (long long) n_vocab, (long long) n_rows, e, ok_gather ? "exact" : "DIFFER",
+        printf("%s %-34s vocab %6lld rows %lld eval %d: %s, chain outputs %s, tokens%s\n", ok_eval ? "ok  " : "FAIL",
+            dp ? "dp greedy" : chain_name(kind), (long long) n_vocab, (long long) n_rows, e,
+            dp ? "row-local" : ok_gather ? "exact" : "DIFFER",
             ok_chain ? "equal" : "DIFFER", tokens.c_str());
         ok = ok && ok_eval;
     }
@@ -463,6 +490,13 @@ int main() {
             n_cases++;
         }
     }
+
+    std::vector<int64_t> dp_rows = {1, 1};
+    ggml_backend_dev_t dp_meta = ggml_backend_meta_device(gpus.data(), 2, split_dp_by_name, &dp_rows);
+    ggml_backend_t dp_backend = ggml_backend_dev_init(dp_meta, nullptr);
+    ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], CHAIN_GREEDY, 154880, 2, rng, true) && ok;
+    n_cases++;
+    ggml_backend_free(dp_backend);
 
     // as in test-backend-meta-capture: one executable a device for each meta graph, none under GGML_META_CAPTURE_LEGACY=1
     const bool legacy      = ggml_env_switch("GGML_META_CAPTURE_LEGACY");

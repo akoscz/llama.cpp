@@ -1667,6 +1667,7 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        std::optional<size_t> resident_reuse;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1711,7 +1712,7 @@ private:
                 // snapshots: recurrent/SWA rollback can shorten the raw LCP.
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const size_t reusable = server_prompt_cache::reusable_prefix(slot.prompt, task.tokens,
-                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa);
+                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa, lcp_len);
                 const float f_sim_cur = task.tokens.empty() ? 0.0f : float(reusable) / task.tokens.size();
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu, lcp=%zu) > %.3f\n",
@@ -1720,6 +1721,7 @@ private:
                 // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    resident_reuse = reusable;
 
                     ret = &slot;
                 }
@@ -1742,6 +1744,7 @@ private:
 
         // find the slot that has been least recently used
         if (ret == nullptr) {
+            resident_reuse.reset();
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
@@ -1769,7 +1772,7 @@ private:
         if (ret && prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
             const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id);
             auto * incoming = task.params.cache_prompt ?
-                prompt_cache->find_best(ret->prompt, task.tokens, pos_min, n_swa) : nullptr;
+                prompt_cache->find_best(ret->prompt, task.tokens, pos_min, n_swa, resident_reuse) : nullptr;
             if (update_cache || incoming) {
                 SRV_TRC("%s", "updating prompt cache\n");
                 const int64_t t_start = ggml_time_us();

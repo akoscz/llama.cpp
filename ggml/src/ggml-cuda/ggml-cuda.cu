@@ -4279,19 +4279,27 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 // the most one took is the most on this context so far: at INFO when that is the most memory, or the nodes held reach a
 // power of two (a -sm tensor split's context holds hundreds of small graphs), at DEBUG otherwise
 static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+    static const bool mem_stats = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_MEM_STATS");
+        return env == nullptr || atoi(env) != 0;
+    }();
     const ggml_backend_cuda_context::cuda_graphs_held held = cuda_ctx->cuda_graph_make_room(graph);
 
-    size_t free_before;
-    size_t free_after;
-    size_t total;
-    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    size_t free_before = 0;
+    size_t free_after = 0;
+    size_t total = 0;
+    if (mem_stats) {
+        CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    }
     CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    if (mem_stats) {
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    }
     const size_t bytes = free_before > free_after ? free_before - free_after : 0;
     cuda_ctx->cuda_graph_bytes += bytes;
 
-    if (held.graphs > cuda_ctx->cuda_graphs_held_max || held.nodes > cuda_ctx->cuda_graph_nodes_held_max ||
-            bytes > cuda_ctx->cuda_graph_bytes_max) {
+    if (mem_stats && (held.graphs > cuda_ctx->cuda_graphs_held_max || held.nodes > cuda_ctx->cuda_graph_nodes_held_max ||
+            bytes > cuda_ctx->cuda_graph_bytes_max)) {
         const auto pow2_floor = [](size_t n) {
             size_t p = 0;
             for (size_t q = 1; q != 0 && q <= n; q <<= 1) {

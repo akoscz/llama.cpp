@@ -324,9 +324,11 @@ class ServingRecipeTest(unittest.TestCase):
                         self.assertEqual(argv[argv.index(flag) + 1], value)
                     self.assertNotIn("--kv-unified", argv)
                     self.assertNotIn("--no-cache-idle-slots", argv)
+                    self.assertIn("--backend-sampling", argv)
                     self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
                     self.assertEqual(env["GGML_CUDA_ALLREDUCE"], "internal")
                     self.assertEqual(env["GGML_CUDA_GRAPH_MAX"], "0")
+                    self.assertEqual(env["GGML_CUDA_GRAPH_MEM_STATS"], "0")
                     self.assertNotIn("LLAMA_KPOOL_DIRECT_INDICES", env)
                     for flag, value in {"-ubd": "512", "-ctkd": "q8_0", "-ctvd": "q8_0"}.items():
                         if depth == "off":

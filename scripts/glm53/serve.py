@@ -75,7 +75,7 @@ def make_plan(args):
              "-b", "2048", "-ub", "512" if dp else "2048", "--prompt-step", str(prompt_step),
              "--alias", "GLM-5.3-Flash-Uncensored-IQ3_XXS", "--chat-template-file", str(TEMPLATE)]
     if dp:
-        argv += ["-fit", "off", "-cts", "q8_0"]
+        argv += ["-fit", "off", "-cts", "q8_0", "--backend-sampling"]
     if args.mtp_depth != "off":
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", args.mtp_depth,
                  "--spec-draft-mtp-vocab", str(DRAFT_VOCAB), "--spec-draft-mtp-adaptive", "0.18"]
@@ -96,6 +96,8 @@ def make_plan(args):
         "GGML_SCHED_DEBUG": "0",
         "LD_LIBRARY_PATH": str(server.parent),
     }
+    if dp:
+        env["GGML_CUDA_GRAPH_MEM_STATS"] = "0"
     if not dp:
         env.update({"LLAMA_KPOOL_DIRECT_INDICES": "0", "GGML_CUDA_MMQ_MOE_NCOLS": "0", "GGML_CUDA_MMQ_L2_PF": "1"})
     if args.kv_host:
