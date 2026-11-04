@@ -239,12 +239,33 @@ def test_idle_slot_kept_when_snapshot_exceeds_ram_limit():
     })
     assert other.status_code == 200
     assert "exceeds cache size limit" in log.wait_for("exceeds cache size limit")
+    for _ in range(2):
+        other = server.make_request("POST", "/completion", data={
+            "prompt": "A different conversation", "id_slot": 1, "cache_prompt": True,
+        })
+        assert other.status_code == 200
+        unchanged = log.wait_for("cache_save reason=unchanged_refusal")
+        assert "cache_save reason=unchanged_refusal" in unchanged
+        assert "exceeds cache size limit" not in unchanged
+
     resumed = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT * 10 + " The tool returned successfully.",
         "id_slot": 0, "cache_prompt": True,
     })
     assert resumed.status_code == 200
     assert resumed.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+
+    # Reusing the slot changes its target, draft and checkpoint state, even when the cache budget does not change.
+    shortened = server.make_request("POST", "/completion", data={
+        "prompt": "A small replacement", "id_slot": 0, "cache_prompt": True, "n_predict": 1,
+    })
+    assert shortened.status_code == 200
+    log.drain()
+    other = server.make_request("POST", "/completion", data={
+        "prompt": "A different conversation", "id_slot": 1, "cache_prompt": True,
+    })
+    assert other.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
 
 
 def test_kv_pressure_preserves_idle_tool_continuation():

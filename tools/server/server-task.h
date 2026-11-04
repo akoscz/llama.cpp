@@ -637,6 +637,16 @@ enum class server_prompt_cache_result {
 const char * server_prompt_cache_result_name(server_prompt_cache_result result);
 
 struct server_prompt_cache_test_access;
+struct server_prompt_cache;
+
+// The slot clears this when its resident target, draft or checkpoint state changes.
+struct server_prompt_cache_refusal {
+    const server_prompt_cache * cache = nullptr;
+    uint64_t revision = 0;
+    size_t limit_size = 0;
+    size_t limit_tokens = 0;
+    server_prompt_cache_result result = server_prompt_cache_result::failed;
+};
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -650,6 +660,7 @@ private:
     std::list<server_prompt_cache_state> states;
     size_t total_bytes = 0;
     size_t total_tokens = 0;
+    uint64_t revision = 0;
 
     void insert_state(server_prompt_cache_state && state);
     std::list<server_prompt_cache_state>::iterator erase_state(std::list<server_prompt_cache_state>::iterator it);
@@ -664,6 +675,9 @@ public:
     size_t size() const;
 
     size_t n_tokens() const;
+
+    server_prompt_cache_result save_idle(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+            common_speculative * spec, int32_t id_slot, server_prompt_cache_refusal & refusal);
 
     server_prompt_cache_result save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
             common_speculative * spec, int32_t id_slot, const server_prompt_cache_state * protect = nullptr,
