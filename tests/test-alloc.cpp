@@ -653,6 +653,24 @@ static void run_unread_input_rounds(ggml_gallocr_t galloc, bool two_buffers) {
     }
 }
 
+static void test_reallocation_output_lifetime() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    for (bool keep_middle : {false, true, false, true}) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        auto * input = make_input_1d(ctx, 32);
+        auto * middle = ggml_scale(ctx, input, 2.0f);
+        auto * output = ggml_scale(ctx, middle, 3.0f);
+        if (keep_middle) { ggml_set_output(middle); }
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        // The same nodes and sizes now expose an intermediate result, which must survive the final scale.
+        GGML_ASSERT(!keep_middle || !memory_overlap(middle, output));
+    }
+}
+
 static void test_reallocation_unread_input() {
     dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
     ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
@@ -678,6 +696,7 @@ static void run(const char * name, void (*f)()) {
 }
 
 int main() {
+    run("test_reallocation_output_lifetime", test_reallocation_output_lifetime);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);
