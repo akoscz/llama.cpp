@@ -636,6 +636,8 @@ enum class server_prompt_cache_result {
 
 const char * server_prompt_cache_result_name(server_prompt_cache_result result);
 
+struct server_prompt_cache_test_access;
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -643,6 +645,8 @@ struct server_prompt_cache {
     }
 
 private:
+    friend struct server_prompt_cache_test_access;
+
     std::list<server_prompt_cache_state> states;
     size_t total_bytes = 0;
     size_t total_tokens = 0;
