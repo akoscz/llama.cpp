@@ -25,12 +25,18 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -38,6 +44,57 @@
 static constexpr int64_t n_embd = 64;
 static constexpr int64_t n_lo   = 384; // vocab entries on the first device
 static constexpr int     n_eval = 4;
+
+struct ownership_audit {
+    struct worker {
+        size_t rank;
+        decltype(ggml_backend_i::graph_compute) compute;
+    };
+    std::map<ggml_backend_t, worker> workers;
+    std::vector<size_t> owners;
+    std::vector<bool> seen;
+    bool ok = true;
+    static ownership_audit * active;
+
+    static ggml_status compute(ggml_backend_t backend, ggml_cgraph * graph) {
+        auto & audit = *active;
+        const auto & worker = audit.workers.at(backend);
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            const auto * node = ggml_graph_node(graph, i);
+            size_t row;
+            if (!ggml_is_empty(node) && sscanf(node->name, "dp_output_%zu_", &row) == 1) {
+                GGML_ASSERT(row < audit.owners.size());
+                audit.seen[row] = true;
+                if (worker.rank != audit.owners[row]) {
+                    if (audit.ok) {
+                        printf("FAIL %s executes on rank %zu, owner is %zu\n", node->name, worker.rank, audit.owners[row]);
+                    }
+                    audit.ok = false;
+                }
+            }
+        }
+        return worker.compute(backend, graph);
+    }
+
+    ownership_audit(ggml_backend_t meta, const std::vector<int64_t> & rows) {
+        GGML_ASSERT(active == nullptr);
+        active = this;
+        for (size_t rank = 0; rank < rows.size(); ++rank) {
+            owners.insert(owners.end(), rows[rank], rank);
+            auto * backend = ggml_backend_meta_simple_backend(meta, rank);
+            workers.emplace(backend, worker{rank, backend->iface.graph_compute});
+            backend->iface.graph_compute = compute;
+        }
+        seen.resize(owners.size());
+    }
+
+    ~ownership_audit() {
+        for (const auto & [backend, worker] : workers) { backend->iface.graph_compute = worker.compute; }
+        active = nullptr;
+    }
+};
+
+ownership_audit * ownership_audit::active = nullptr;
 
 // the entries llama.cpp's build_sampling pads a row of n_vocab logits with, to keep the rows 128-byte aligned
 static int64_t n_pad_of(int64_t n_vocab) {
@@ -168,7 +225,8 @@ struct sampling_graph {
     std::vector<llama_sampler_data> out;
 
     sampling_graph(const head_weights * w, int64_t n_vocab, int64_t n_rows, const std::vector<llama_sampler *> & chains,
-            bool dp = false) {
+            const std::vector<int64_t> & dp_rows = {}) {
+        const bool dp = !dp_rows.empty();
         const size_t max_nodes = 8192;
         const ggml_init_params params = {
             /*.mem_size   =*/ max_nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false),
@@ -194,24 +252,31 @@ struct sampling_graph {
             logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_rows);
             ggml_set_name(logits, "logits");
             ggml_set_input(logits);
+            ggml_set_output(logits);
+            if (dp) { ggml_backend_meta_split_input(logits, 1, dp_rows.data(), dp_rows.size()); }
             // as llama builds it on one device: the chains read rows padded out of the logits, never the input itself
-            rows = dp ? ggml_pad(ctx, logits, 0, 1, 0, 0) :
+            rows = dp ? logits :
                 ggml_pad_ext(ctx, logits, 0, (int) n_pad_of(n_vocab), 0, 0, 0, 0, 0, 0);
         }
 
         for (int64_t r = 0; r < n_rows; r++) {
+            ggml_tensor * row = ggml_view_1d(ctx, rows, n_vocab, r*rows->nb[1]);
+            if (dp) { row = ggml_cont(ctx, row); }
             llama_sampler_data data = {
-                /*.logits     =*/ ggml_view_1d(ctx, rows, n_vocab, r*rows->nb[1]),
+                /*.logits     =*/ row,
                 /*.probs      =*/ nullptr,
                 /*.sampled    =*/ nullptr,
                 /*.candidates =*/ nullptr,
             };
             chains[r]->iface->backend_apply(chains[r], ctx, gf, &data);
+            int output = 0;
             for (ggml_tensor * t : {data.logits, data.probs, data.sampled, data.candidates}) {
                 if (t != nullptr) {
+                    if (dp) { ggml_format_name(t, "dp_output_%lld_%d", (long long) r, output); }
                     ggml_set_output(t);
                     ggml_build_forward_expand(gf, t);
                 }
+                ++output;
             }
             out.push_back(data);
         }
@@ -267,20 +332,19 @@ static bool same_output(const char * name, const ggml_tensor * m, const ggml_ten
     return false;
 }
 
-static ggml_backend_meta_split_state split_dp_by_name(const ggml_tensor * tensor, void * userdata) {
-    if (strcmp(tensor->name, "logits") == 0) {
-        const auto * counts = (const std::vector<int64_t> *) userdata;
-        ggml_backend_meta_split_state state = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-        state.ne[0] = (*counts)[0];
-        state.ne[1] = (*counts)[1];
-        return state;
-    }
+static ggml_backend_meta_split_state split_dp_by_name(const ggml_tensor *, void *) {
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
 // one shape and one chain kind; returns whether every evaluation matched
 static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, ggml_backend_t cpu, ggml_backend_dev_t meta,
-        ggml_backend_dev_t gpu, chain_kind kind, int64_t n_vocab, int64_t n_rows, std::mt19937 & rng, bool dp = false) {
+        ggml_backend_dev_t gpu, chain_kind kind, int64_t n_vocab, int64_t n_rows, std::mt19937 & rng,
+        const std::vector<int64_t> & dp_rows = {}) {
+    const bool dp = !dp_rows.empty();
+    std::unique_ptr<ownership_audit> audit;
+    if (dp && ggml_backend_dev_type(gpu) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        audit = std::make_unique<ownership_audit>(meta_backend, dp_rows);
+    }
     head_weights w(ggml_backend_dev_buffer_type(meta), n_vocab, rng);
 
     std::vector<llama_sampler *> chains_meta;
@@ -296,7 +360,7 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
         }
     }
 
-    sampling_graph g_meta(dp ? nullptr : &w, n_vocab, n_rows, chains_meta, dp);
+    sampling_graph g_meta(dp ? nullptr : &w, n_vocab, n_rows, chains_meta, dp_rows);
     sampling_graph g_ref (nullptr, n_vocab, n_rows, chains_ref);
 
     ggml_backend_t backends_meta[2] = {meta_backend, cpu};
@@ -311,11 +375,15 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
     for (int i = 0; i < ggml_graph_n_nodes(g_meta.gf); i++) {
         ggml_backend_sched_set_tensor_backend(sched_meta, ggml_graph_node(g_meta.gf, i), meta_backend);
     }
+    if (dp) {
+        ggml_backend_sched_set_tensor_backend(sched_meta, g_meta.logits, meta_backend);
+    }
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched_meta, g_meta.gf));
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched_ref,  g_ref.gf));
 
     bool ok = true;
     for (int e = 0; e < n_eval; e++) {
+        std::vector<float> input_logits;
         if (dp) {
             std::vector<float> logits(n_vocab*n_rows);
             std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -324,6 +392,7 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
                 logits[r*n_vocab + (r*37 + e*53) % n_vocab] += 10.0f;
             }
             ggml_backend_tensor_set(g_meta.logits, logits.data(), 0, ggml_nbytes(g_meta.logits));
+            input_logits = std::move(logits);
         } else {
             std::vector<float> x(n_embd*n_rows);
             std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -339,6 +408,10 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
 
         std::vector<float> logits(n_vocab*n_rows);
         ggml_backend_tensor_get(g_meta.logits, logits.data(), 0, ggml_nbytes(g_meta.logits));
+        if (dp && logits != input_logits) {
+            printf("FAIL sampling changed the raw logits output\n");
+            ok = false;
+        }
         const int64_t n_pad = n_pad_of(n_vocab);
         int64_t n_neg_zero = 0;
         int64_t n_pos_zero = 0;
@@ -389,7 +462,7 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
 
         const bool ok_eval = ok_gather && ok_chain;
         printf("%s %-34s vocab %6lld rows %lld eval %d: %s, chain outputs %s, tokens%s\n", ok_eval ? "ok  " : "FAIL",
-            dp ? "dp greedy" : chain_name(kind), (long long) n_vocab, (long long) n_rows, e,
+            chain_name(kind), (long long) n_vocab, (long long) n_rows, e,
             dp ? "row-local" : ok_gather ? "exact" : "DIFFER",
             ok_chain ? "equal" : "DIFFER", tokens.c_str());
         ok = ok && ok_eval;
@@ -397,6 +470,11 @@ static bool run_case(ggml_backend_t meta_backend, ggml_backend_t gpu_backend, gg
 
     ggml_backend_sched_free(sched_meta);
     ggml_backend_sched_free(sched_ref);
+    if (audit) {
+        const bool owned = audit->ok && std::all_of(audit->seen.begin(), audit->seen.end(), [](bool seen) { return seen; });
+        printf("%s sampler outputs execute only on their owning ranks\n", owned ? "ok  " : "FAIL");
+        ok = ok && owned;
+    }
     for (llama_sampler * c : chains_meta) {
         llama_sampler_free(c);
     }
@@ -447,9 +525,16 @@ static bool cumsum_reproducible(ggml_backend_t backend, int64_t n, std::mt19937 
     return n_differ == 0;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    const bool cpu_only = argc == 2 && strcmp(argv[1], "--cpu") == 0;
+    const bool four = argc == 2 && strcmp(argv[1], "--four") == 0;
+    if (argc != 1 && !cpu_only && !four) {
+        fprintf(stderr, "usage: %s [--cpu | --four]\n", argv[0]);
+        return 1;
+    }
     std::vector<ggml_backend_dev_t> gpus;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 2; i++) {
+    if (cpu_only) { gpus.assign(4, ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)); }
+    for (size_t i = 0; !cpu_only && i < ggml_backend_dev_count() && gpus.size() < (four ? 4u : 2u); i++) {
         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             gpus.push_back(ggml_backend_dev_get(i));
         }
@@ -458,6 +543,7 @@ int main() {
         printf("no GPU for the meta backend, skipped\n");
         return 0;
     }
+    if (four && gpus.size() != 4) { fprintf(stderr, "four physical GPUs required\n"); return 1; }
     if (gpus.size() == 1) {
         gpus.push_back(gpus[0]);
     }
@@ -482,25 +568,49 @@ int main() {
     const shape shapes[] = {{1000, 1}, {1000, 3}, {154880, 4}};
     const chain_kind kinds[] = {CHAIN_GREEDY, CHAIN_SERVED, CHAIN_TOP_K};
 
+    if (cpu_only) {
+        ggml_backend_cpu_set_n_threads(cpu, 1);
+        ggml_backend_cpu_set_n_threads(gpu_backend, 1);
+    }
     bool ok = cumsum_reproducible(gpu_backend, 154880, rng);
-    int n_cases = 0;
+    int expected_captures = 0;
     for (const shape & s : shapes) {
         for (chain_kind kind : kinds) {
+            if (cpu_only) { continue; }
             ok = run_case(meta_backend, gpu_backend, cpu, meta, gpus[0], kind, s.n_vocab, s.n_rows, rng) && ok;
-            n_cases++;
+            expected_captures += 2;
         }
     }
 
-    std::vector<int64_t> dp_rows = {1, 1};
-    ggml_backend_dev_t dp_meta = ggml_backend_meta_device(gpus.data(), 2, split_dp_by_name, &dp_rows);
+    ggml_backend_dev_t dp_meta = ggml_backend_meta_device(gpus.data(), gpus.size(), split_dp_by_name, nullptr);
     ggml_backend_t dp_backend = ggml_backend_dev_init(dp_meta, nullptr);
-    ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], CHAIN_GREEDY, 154880, 2, rng, true) && ok;
-    n_cases++;
+    if (cpu_only) {
+        for (size_t rank = 0; rank < gpus.size(); ++rank) {
+            ggml_backend_cpu_set_n_threads(ggml_backend_meta_simple_backend(dp_backend, rank), 1);
+        }
+    }
+    const std::vector<std::vector<int64_t>> layouts = gpus.size() == 4 ?
+        std::vector<std::vector<int64_t>>{{1, 0, 2, 1}, {0, 0, 0, 1}, {3, 1, 1, 0}} :
+        std::vector<std::vector<int64_t>>{{1, 1}, {0, 1}, {3, 1}};
+    for (const auto & rows : layouts) {
+        int64_t total = 0;
+        for (int64_t n : rows) { total += n; }
+        for (chain_kind kind : kinds) {
+            ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 1000, total, rng, rows) && ok;
+            expected_captures += gpus.size();
+        }
+    }
+    for (chain_kind kind : kinds) {
+        const auto & rows = layouts.front();
+        const int64_t total = std::accumulate(rows.begin(), rows.end(), int64_t(0));
+        ok = run_case(dp_backend, gpu_backend, cpu, dp_meta, gpus[0], kind, 154880, total, rng, rows) && ok;
+        expected_captures += gpus.size();
+    }
     ggml_backend_free(dp_backend);
 
     // as in test-backend-meta-capture: one executable a device for each meta graph, none under GGML_META_CAPTURE_LEGACY=1
     const bool legacy      = ggml_env_switch("GGML_META_CAPTURE_LEGACY");
-    const int  executables = legacy ? 0 : n_cases*2;
+    const int  executables = legacy || cpu_only ? 0 : expected_captures;
     const bool ok_captures = counts.executables == executables && counts.not_captured == 0;
     printf("%s %d executables made (%d expected), %d graphs not captured\n", ok_captures ? "ok  " : "FAIL",
         counts.executables, executables, counts.not_captured);

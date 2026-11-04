@@ -4756,9 +4756,9 @@ void llm_graph_context::build_sampling() const {
         }
     }
 
-    // -sm tensor: a ubatch with no output rows (the ubatches of a prompt before its last) has empty logits, and a pad of
-    // them has no split the meta backend can name. There is nothing to sample
-    if (n_rows == 0 && cparams.logits_gather) {
+    // A tensor/DP prompt ubatch with no output rows has nothing to sample or pad.
+    const bool row_local = cparams.n_seq_devices > 1;
+    if (n_rows == 0 && (cparams.logits_gather || row_local)) {
         return;
     }
 
@@ -4776,9 +4776,12 @@ void llm_graph_context::build_sampling() const {
     // for bit (ggml-backend-meta.cpp, ggml_backend_meta_is_gather), and the samplers run on them as on one device; the
     // padding keeps each row 128-byte aligned
     const int64_t n_vocab = res->t_logits->ne[0];
-    ggml_tensor * logits_t = cparams.logits_gather ?
-        ggml_pad_ext(ctx0, res->t_logits, 0, (int) (32 - n_vocab % 32), 0, 1, 0, 0, 0, 0) :
-        ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = res->t_logits;
+    if (!row_local) {
+        logits_t = cparams.logits_gather ?
+            ggml_pad_ext(ctx0, logits_t, 0, (int) (32 - n_vocab % 32), 0, 1, 0, 0, 0, 0) :
+            ggml_pad(ctx0, logits_t, 0, 1, 0, 0);
+    }
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4798,6 +4801,8 @@ void llm_graph_context::build_sampling() const {
 
         for (uint32_t i = 0; i < rows.size(); ++i) {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, n_vocab, rows[i] * logits_t->nb[1]);
+            // Copy each DP row on its owner: penalties can write it, and padding the split row axis would gather it.
+            if (row_local) { logits_seq = ggml_cont(ctx0, logits_seq); }
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
