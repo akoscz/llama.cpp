@@ -1110,6 +1110,22 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    struct llama_sampling_row {
+        llama_token token;
+        const float * logits;
+        const float * sampled_logits;
+        const float * sampled_probs;
+        const llama_token * candidates;
+        uint32_t n_sampled_logits;
+        uint32_t n_sampled_probs;
+        uint32_t n_candidates;
+    };
+
+    // Read one sampling row after one synchronization, with or without backend samplers.
+    // Indices and sampled counts match the individual getters. logits is populated only for CPU fallback.
+    // Pointers borrow the context output storage and must not be kept across operations that change it.
+    LLAMA_API struct llama_sampling_row llama_get_sampling_row_ith(struct llama_context * ctx, int32_t i);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

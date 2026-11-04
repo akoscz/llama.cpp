@@ -1690,9 +1690,10 @@ json server_task_result_apply_lora::to_json() {
 //
 void server_prompt_cache::insert_state(server_prompt_cache_state && state) {
     state.freeze_size();
-    total_bytes += state.cached_size;
-    total_tokens += state.prompt.n_tokens();
     states.push_back(std::move(state));
+    total_bytes += states.back().cached_size;
+    total_tokens += states.back().prompt.n_tokens();
+    ++revision;
 }
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_state(
@@ -1700,6 +1701,7 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_state(
     GGML_ASSERT(total_bytes >= it->cached_size && total_tokens >= (size_t) it->prompt.n_tokens());
     total_bytes -= it->cached_size;
     total_tokens -= it->prompt.n_tokens();
+    ++revision;
     return states.erase(it);
 }
 
@@ -1721,6 +1723,21 @@ const char * server_prompt_cache_result_name(server_prompt_cache_result result) 
         case server_prompt_cache_result::failed:         return "failed";
     }
     return "unknown";
+}
+
+server_prompt_cache_result server_prompt_cache::save_idle(const server_prompt & prompt,
+        llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, int32_t id_slot,
+        server_prompt_cache_refusal & refusal) {
+    if (refusal.cache == this && refusal.revision == revision &&
+            refusal.limit_size == limit_size && refusal.limit_tokens == limit_tokens &&
+            (refusal.result == server_prompt_cache_result::too_large || refusal.result == server_prompt_cache_result::no_space)) {
+        SRV_TRC("cache_save reason=unchanged_refusal slot=%d result=%s\n", id_slot, server_prompt_cache_result_name(refusal.result));
+        return refusal.result;
+    }
+
+    const auto result = save(prompt, ctx_tgt, ctx_dft, spec, id_slot, nullptr, false);
+    refusal = { this, revision, limit_size, limit_tokens, result };
+    return result;
 }
 
 server_prompt_cache_result server_prompt_cache::save(const server_prompt & prompt,
@@ -1947,6 +1964,7 @@ bool server_prompt_cache::load(server_prompt & prompt, server_prompt_cache_state
         total_tokens -= it->prompt.n_tokens();
         prompt = std::move(it->prompt);
         states.erase(it);
+        ++revision;
     } else {
         // The slot keeps only the shared prefix; the conversation the snapshot belongs to stays recoverable.
         prompt = it->prompt.clone();

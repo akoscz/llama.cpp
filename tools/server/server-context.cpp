@@ -300,6 +300,7 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    server_prompt_cache_refusal idle_cache_refusal;
 
     server_prompt_cache_result prompt_save(server_prompt_cache & prompt_cache,
             const server_prompt_cache_state * protect = nullptr, bool allow_evict = true) const {
@@ -307,10 +308,12 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, server_prompt_cache_state * selected, bool consume = true) {
+        idle_cache_refusal = {};
         return prompt_cache.load(prompt, selected, ctx_tgt, ctx_dft, spec, id, consume);
     }
 
     void prompt_clear() {
+        idle_cache_refusal = {};
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -362,6 +365,7 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void reset() {
+        idle_cache_refusal = {};
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -1838,6 +1842,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.idle_cache_refusal = {};
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2922,7 +2927,8 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                const auto saved = slot.prompt_save(*prompt_cache, nullptr, false);
+                                const auto saved = prompt_cache->save_idle(slot.prompt, slot.ctx_tgt, slot.ctx_dft,
+                                        slot.spec, slot.id, slot.idle_cache_refusal);
                                 const bool recoverable = saved == server_prompt_cache_result::saved ||
                                                          saved == server_prompt_cache_result::already_cached;
                                 if (recoverable) {
@@ -3093,6 +3099,8 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    slot->idle_cache_refusal = {};
 
                     const int64_t t_start = ggml_time_us();
 

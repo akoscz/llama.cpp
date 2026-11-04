@@ -12,6 +12,10 @@ struct server_prompt_cache_test_access {
     static size_t count(const server_prompt_cache & cache) { return cache.states.size(); }
     static const server_prompt_cache_state & front(const server_prompt_cache & cache) { return cache.states.front(); }
     static const server_prompt_cache_state & back(const server_prompt_cache & cache) { return cache.states.back(); }
+    static void erase_front(server_prompt_cache & cache) { cache.erase_state(cache.states.begin()); }
+    static server_prompt_cache_refusal refusal(const server_prompt_cache & cache, server_prompt_cache_result result) {
+        return { &cache, cache.revision, cache.limit_size, cache.limit_tokens, result };
+    }
 };
 
 static bool test_update_eviction_accounting() {
@@ -38,8 +42,41 @@ static bool test_update_eviction_accounting() {
     return true;
 }
 
+static bool test_idle_refusal_invalidation() {
+    server_prompt_cache cache(1, 100);
+    server_prompt empty;
+    const auto check = [&](server_prompt_cache_refusal & refusal, server_prompt_cache_result expected) {
+        // An uncached call reaches the empty-prompt guard without reading a context.
+        return cache.save_idle(empty, nullptr, nullptr, nullptr, 0, refusal) == expected;
+    };
+    for (auto result : {server_prompt_cache_result::too_large, server_prompt_cache_result::no_space}) {
+        auto refusal = server_prompt_cache_test_access::refusal(cache, result);
+        if (!check(refusal, result) || !check(refusal, result)) { return false; }
+        ++cache.limit_size;
+        if (!check(refusal, server_prompt_cache_result::empty)) { return false; }
+        refusal = server_prompt_cache_test_access::refusal(cache, result);
+        ++cache.limit_tokens;
+        if (!check(refusal, server_prompt_cache_result::empty)) { return false; }
+
+        server_prompt_cache_test_access::insert(cache, 1);
+        refusal = server_prompt_cache_test_access::refusal(cache, result);
+        server_prompt_cache_test_access::erase_front(cache);
+        server_prompt_cache_test_access::insert(cache, 2);
+        // Equal occupancy can still contain a newly recoverable snapshot.
+        if (!check(refusal, server_prompt_cache_result::empty)) { return false; }
+        refusal = server_prompt_cache_test_access::refusal(cache, result);
+        server_prompt_cache_test_access::erase_front(cache);
+        if (!check(refusal, server_prompt_cache_result::empty)) { return false; }
+        refusal = {};
+        if (!check(refusal, server_prompt_cache_result::empty)) { return false; }
+    }
+    auto failed = server_prompt_cache_test_access::refusal(cache, server_prompt_cache_result::failed);
+    return check(failed, server_prompt_cache_result::empty);
+}
+
 int main() {
     if (!test_update_eviction_accounting()) { return 5; }
+    if (!test_idle_refusal_invalidation()) { return 6; }
 
     server_slot_stats stats;
     // Nine delivered decode tokens over three verification rounds. The first

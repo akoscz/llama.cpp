@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -953,17 +954,22 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
-    // the most one graph slot's scheduler allocates (process_ubatch): a graph of graph_slot_max_tokens rows over every
-    // sequence, with as many outputs as a batch of it can have, measured and not allocated; a slot's buffers grow to
-    // the graphs it holds, so graph_slots_max of these bound what the slots add to the buffers above. The graph keeps
-    // every sequence (graph_reserve rounds the rows up to one per sequence): the full memory context views every
-    // stream of the cache, and a graph over fewer sequences than streams has no row count the streams divide
+    // Size the retained decode shapes over every cache stream, including the bound MTP store path.
     std::vector<size_t> slot_buf_size(backend_ptrs.size(), 0);
     if (!graph_reuse_disable && !model.hparams.no_alloc) {
-        const uint32_t n_tokens_slot = std::min(graph_slot_max_tokens, n_tokens);
-        graph_reserve(n_tokens_slot, n_seqs, std::min(n_tokens_slot, cparams.n_outputs_max),
-                mctx.get(), true, slot_buf_size.data());
+        const std::set<uint32_t> shapes = { std::min(graph_slot_max_tokens, n_tokens), std::min(graph_slot_max_rows, n_tokens) };
+        for (uint32_t rows : shapes) {
+            for (const bool store : {false, true}) {
+                if (store && !nextn_store) { continue; }
+                nextn_mode = store ? (nextn_is_target ? LLM_GRAPH_NEXTN_WRITE : LLM_GRAPH_NEXTN_READ) : LLM_GRAPH_NEXTN_NONE;
+                std::vector<size_t> sizes(backend_ptrs.size(), 0);
+                graph_reserve(rows, n_seqs, std::min(rows, cparams.n_outputs_max), mctx.get(), true, sizes.data());
+                for (size_t i = 0; i < sizes.size(); ++i) { slot_buf_size[i] = std::max(slot_buf_size[i], sizes[i]); }
+            }
+        }
+        nextn_mode = LLM_GRAPH_NEXTN_NONE;
     }
+    graph_slot_buf_limit = slot_buf_size;
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
@@ -1752,7 +1758,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return std::any_of(sampling.samplers.begin(), sampling.samplers.end(),
                 [](const auto & entry) { return llama_sampler_backend_has_inputs(entry.second); });
     };
-    const bool use_slots = !graph_reuse_disable && ubatch.n_tokens <= graph_slot_max_tokens && !sampling_has_inputs();
+    const bool mtp_shape = graph_slot_mtp_seq_tokens > 0 && ubatch.equal_seqs() &&
+        ubatch.n_seq_tokens <= graph_slot_mtp_seq_tokens && ubatch.n_tokens <= graph_slot_max_rows;
+    const bool use_slots = !graph_reuse_disable && (ubatch.n_tokens <= graph_slot_max_tokens || mtp_shape) && !sampling_has_inputs();
 
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
     for (size_t i = 0; !reuse && use_slots && i < graph_slots.size(); ++i) {
@@ -1780,8 +1788,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        // a graph of up to graph_slot_max_tokens rows is built in a slot (a new one while there is room, else over the
-        // least recently used), so the shapes a decode alternates between are kept; a larger one in gf_res_prev
+        // Each retained shape owns its scheduler and input copies. Other shapes use the main scheduler.
         if (use_slots) {
             if (graph_slots.size() < graph_slots_max) {
                 graph_slots.push_back({
@@ -1798,29 +1805,64 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             gparams  = graph_params(res, ubatch, mctx, gtype, sched_gf);
         }
 
-        res->reset();
-
-        ggml_backend_sched_reset(sched_gf);
-        ggml_backend_sched_set_eval_callback(sched_gf, cparams.cb_eval, cparams.cb_eval_user_data);
-
-        //const auto t_start_us = ggml_time_us();
-
-        {
+        const auto build = [&]() {
+            res->reset();
+            ggml_backend_sched_reset(sched_gf);
+            ggml_backend_sched_set_eval_callback(sched_gf, cparams.cb_eval, cparams.cb_eval_user_data);
             llama_decode_phase_timer t(LLAMA_DECODE_PHASE_BUILD_GRAPH);
             gf = model.build_graph(gparams);
-        }
+            return gf != nullptr;
+        };
+        const auto fallback = [&]() {
+            const auto it = std::find_if(graph_slots.begin(), graph_slots.end(),
+                    [&](const graph_slot & slot) { return slot.res.get() == res; });
+            GGML_ASSERT(it != graph_slots.end());
+            graph_slots.erase(it);
+            res = gf_res_prev.get();
+            sched_gf = sched.get();
+            t_used = nullptr;
+            gparams = graph_params(res, ubatch, mctx, gtype);
+            LLAMA_LOG_WARN("%s: MTP shape with %u rows uses the main scheduler (graph slot memory limit)\n", __func__, ubatch.n_tokens);
+        };
 
-        if (!gf) {
+        ggml_backend_sched_ptr measure;
+        const auto retained_sched = sched_gf;
+        if (t_used && ubatch.n_tokens > graph_slot_max_tokens) {
+            // A size-only reserve changes allocator state without allocating its buffers.
+            measure.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    sched_max_nodes, false, cparams.op_offload));
+            sched_gf = measure.get();
+            gparams = graph_params(res, ubatch, mctx, gtype, sched_gf);
+        }
+        if (!build()) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
+        if (measure) {
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            ggml_backend_sched_reserve_size(sched_gf, gf, sizes.data());
+            bool fits = true;
+            for (size_t i = 0; i < sizes.size(); ++i) { fits &= sizes[i] <= graph_slot_buf_limit[i]; }
+            sched_gf = retained_sched;
+            gparams = graph_params(res, ubatch, mctx, gtype, sched_gf);
+            if (!fits) { fallback(); }
+            // Measurement rewrites sources to scheduler copies. Rebuild before allocation.
+            if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
+        }
+
         llama_decode_phase_timer t_alloc(LLAMA_DECODE_PHASE_ALLOC_GRAPH);
         if (!ggml_backend_sched_alloc_graph(sched_gf, gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            if (t_used && ubatch.n_tokens > graph_slot_max_tokens) {
+                fallback();
+                if (!build()) { ret = GGML_STATUS_FAILED; return nullptr; }
+            } else {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            if (!ggml_backend_sched_alloc_graph(sched_gf, gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
         }
     }
 
@@ -3216,25 +3258,35 @@ void llama_context::nextn_set_h_rows(const int32_t * src, int32_t n, const float
 }
 
 bool llama_context::nextn_get_rows(const int32_t * rows, int32_t n, float * dst) {
-    synchronize();
     const int64_t n_embd = model.hparams.n_embd_out();
     const size_t  row    = (size_t) n_embd*sizeof(float);
     if (embd_nextn_stale) {
         const auto & st = *nextn_store;
+        // Validate every row before queuing writes into the caller's destination.
+        for (int32_t i = 0; i < n; ++i) {
+            if (rows[i] < 0 || rows[i] >= st.n_rows) { return false; }
+        }
+        const auto backend = sched_res ? ggml_backend_sched_get_tensor_backend(sched_res, st.t) : nullptr;
+        if (!backend) { synchronize(); }
         for (int32_t i0 = 0; i0 < n; ) {
             int32_t i1 = i0 + 1;
-            while (st.n_devices == 1 && i1 < n && rows[i1] == rows[i1 - 1] + 1) {
+            while (i1 < n && st.row(st.half, rows[i1]) == st.row(st.half, rows[i1 - 1]) + 1) {
                 ++i1;
             }
-            if (rows[i0] < 0 || rows[i1 - 1] >= st.n_rows) {
-                return false;
+            const size_t offset = st.row(st.half, rows[i0])*row;
+            const size_t size = (i1 - i0)*row;
+            if (backend) {
+                ggml_backend_tensor_get_async(backend, st.t, dst + (size_t) i0*n_embd, offset, size);
+            } else {
+                ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, offset, size);
             }
-            ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, st.row(st.half, rows[i0])*row, (i1 - i0)*row);
             i0 = i1;
         }
+        if (backend) { synchronize(); }
         n_nextn_to_host += n;
         return true;
     }
+    synchronize();
     if (embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
         return false;
     }
@@ -4626,11 +4678,18 @@ void llama_context::mtp_index_capture() {
                         mtp_index.tensor, i, mtp_index.backend);
             }
         } else {
-            synchronize();
             const int64_t width = mtp_index.tensor->ne[0];
+            std::vector<int32_t> rows(width*mtp_index.seqs.size());
+            if (mtp_index.backend) {
+                ggml_backend_tensor_get_async(mtp_index.backend, mtp_index.tensor, rows.data(), 0, rows.size()*sizeof(int32_t));
+                synchronize();
+            } else {
+                synchronize();
+                ggml_backend_tensor_get(mtp_index.tensor, rows.data(), 0, rows.size()*sizeof(int32_t));
+            }
             std::vector<int32_t> row(width);
             for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
-                ggml_backend_tensor_get(mtp_index.tensor, row.data(), i*width*sizeof(int32_t), width*sizeof(int32_t));
+                std::copy_n(rows.data() + i*width, width, row.data());
                 draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
             }
         }
@@ -4650,6 +4709,23 @@ bool llama_context::mtp_draft_step(int32_t step) {
 
 bool llama_mtp_draft_step(llama_context * ctx, int32_t step) {
     return ctx && ctx->mtp_draft_step(step);
+}
+
+bool llama_context::set_mtp_graph_reuse(int32_t n_max) {
+    if (model.arch != LLM_ARCH_GLM5NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+            model.hparams.n_layer_nextn != 1 || n_max < 0) { return false; }
+    const uint32_t seq_tokens = n_max == 0 ? 0 : std::min<uint64_t>(uint64_t(n_max) + 1, cparams.n_ubatch);
+    if (seq_tokens != graph_slot_mtp_seq_tokens) {
+        graph_slot_mtp_seq_tokens = seq_tokens;
+        graph_slot_max_rows = std::max<uint32_t>(graph_slot_max_tokens,
+                std::min<uint64_t>(uint64_t(seq_tokens)*cparams.n_seq_max, cparams.n_ubatch));
+        sched_need_reserve = true;
+    }
+    return true;
+}
+
+bool llama_set_mtp_graph_reuse(llama_context * ctx, int32_t n_max) {
+    return ctx && ctx->set_mtp_graph_reuse(n_max);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
@@ -4703,6 +4779,23 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+llama_sampling_row llama_get_sampling_row_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    llama_sampling_row row = {};
+    row.token = ctx->get_sampled_token_ith(i);
+    row.sampled_logits = ctx->get_sampled_logits_ith(i);
+    row.sampled_probs = ctx->get_sampled_probs_ith(i);
+    row.candidates = ctx->get_sampled_candidates_ith(i);
+    row.n_sampled_logits = ctx->get_sampled_logits_count(i);
+    row.n_sampled_probs = ctx->get_sampled_probs_count(i);
+    row.n_candidates = ctx->get_sampled_candidates_count(i);
+    if (!row.sampled_logits && !row.sampled_probs && ctx->get_logits()) {
+        row.logits = ctx->get_logits_ith(i);
+    }
+    return row;
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

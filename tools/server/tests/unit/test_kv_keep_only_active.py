@@ -239,12 +239,33 @@ def test_idle_slot_kept_when_snapshot_exceeds_ram_limit():
     })
     assert other.status_code == 200
     assert "exceeds cache size limit" in log.wait_for("exceeds cache size limit")
+    for _ in range(2):
+        other = server.make_request("POST", "/completion", data={
+            "prompt": "A different conversation", "id_slot": 1, "cache_prompt": True,
+        })
+        assert other.status_code == 200
+        unchanged = log.wait_for("cache_save reason=unchanged_refusal")
+        assert "cache_save reason=unchanged_refusal" in unchanged
+        assert "exceeds cache size limit" not in unchanged
+
     resumed = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT * 10 + " The tool returned successfully.",
         "id_slot": 0, "cache_prompt": True,
     })
     assert resumed.status_code == 200
     assert resumed.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+
+    # Reusing the slot changes its target, draft and checkpoint state, even when the cache budget does not change.
+    shortened = server.make_request("POST", "/completion", data={
+        "prompt": "A small replacement", "id_slot": 0, "cache_prompt": True, "n_predict": 1,
+    })
+    assert shortened.status_code == 200
+    log.drain()
+    other = server.make_request("POST", "/completion", data={
+        "prompt": "A different conversation", "id_slot": 1, "cache_prompt": True,
+    })
+    assert other.status_code == 200
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
 
 
 def test_kv_pressure_preserves_idle_tool_continuation():
@@ -369,6 +390,38 @@ def test_consumed_restore_does_not_inflate_future_token_evictions():
     complete(c)
     # A and B still fit beside one another, so B must not be evicted by A's already-consumed tokens.
     assert complete(b)["cache_n"] > 0
+
+
+def test_consumed_restore_retries_idle_cache_refusal():
+    server.cache_ram = -1
+    server.n_ctx = 512
+    server.n_slots = 3
+    server.start()
+    log = LogReader(server.log_path)
+
+    def complete(tokens, slot):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": tokens, "id_slot": slot, "cache_prompt": True, "n_predict": 1,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]
+
+    # Two RAM snapshots nearly fill the 512-token budget; each fits beside the idle resident in KV.
+    complete([12] * 300, 2)
+    complete([11] * 200, 1)
+    complete([13] * 200, 0)
+    log.drain()
+    complete([14], 2)
+    refused = log.drain()
+    assert "cache_idle action=retain reason=no_space" in refused
+
+    # Restoring into empty slot 1 consumes its snapshot. Slot 0 is checked before slot 2 can change the cache.
+    restored = complete([11] * 200 + [15], 1)
+    assert restored["cache_n"] >= 199
+    retried = log.wait_for("cache_save reason=saved slot=0")
+    assert "consumed=1" in retried
+    assert "cache_save reason=saved slot=0" in retried
+    assert "cache_save reason=unchanged_refusal slot=0" not in retried
 
 
 def test_admission_eviction_preserves_recent_snapshot():

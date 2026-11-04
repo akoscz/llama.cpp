@@ -352,6 +352,14 @@ static bool test_stream_view(ggml_backend_dev_t device, ggml_type type, bool sin
     std::vector<float> result(ggml_nelements(out));
     ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
     const size_t streams[] = {2, 9, 10, 15};
+    std::vector<uint8_t> async_result(ggml_nbytes(out));
+    const size_t part = async_result.size()/3 + 7;
+    for (size_t offset = 0; offset < async_result.size(); offset += part) {
+        ggml_backend_tensor_get_async(backend, out, async_result.data() + offset, offset,
+                std::min(part, async_result.size() - offset));
+    }
+    ggml_backend_synchronize(backend);
+    ok = ok && std::memcmp(async_result.data(), result.data(), async_result.size()) == 0;
     for (size_t s = 0; s < (size_t) n_streams; ++s) {
         for (size_t row = 0; row < 32; ++row) {
             for (size_t col = 0; col < 32; ++col) {

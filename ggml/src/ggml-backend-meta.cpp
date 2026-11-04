@@ -2931,7 +2931,6 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2945,6 +2944,24 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
         case GGML_BACKEND_SPLIT_AXIS_3: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = split_state.axis == GGML_BACKEND_SPLIT_AXIS_3 ? ggml_nbytes(tensor) : tensor->nb[split_state.axis + 1];
+            if (chunk_size_full == ggml_nbytes(tensor)) {
+                // An outermost split is a concatenation of device ranges, including empty owners.
+                size_t start = 0;
+                for (size_t j = 0; j < n_backends; ++j) {
+                    const auto * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t end = start + ggml_nbytes(simple_tensor);
+                    const size_t first = std::max(start, offset);
+                    const size_t last = std::min(end, offset + size);
+                    if (first < last) {
+                        ggml_backend_tensor_get_async(ggml_backend_meta_simple_backend(backend, j), simple_tensor,
+                                (char *) data + first - offset, first - start, last - first);
+                    }
+                    start = end;
+                }
+                GGML_ASSERT(start == chunk_size_full);
+                break;
+            }
+            GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;

@@ -197,10 +197,10 @@ struct common_sampler {
     }
 
     // top_k > 0: the candidates are the top_k largest logits, sorted, instead of every token's
-    void set_logits(struct llama_context * ctx, int idx, int32_t top_k = 0) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    void set_logits(struct llama_context * ctx, const llama_sampling_row & row, int32_t top_k = 0) {
+        const float *       sampled_probs  = row.sampled_probs;
+        const float *       sampled_logits = row.sampled_logits;
+        const llama_token * sampled_ids    = row.candidates;
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -208,13 +208,13 @@ struct common_sampler {
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
         if (sampled_probs) {
-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+            const uint32_t sampled_probs_count = row.n_sampled_probs;
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
             }
         } else if (sampled_logits) {
-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+            const uint32_t sampled_logits_count = row.n_sampled_logits;
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
@@ -230,10 +230,10 @@ struct common_sampler {
                 return;
             }
         } else {
-            const auto * logits = llama_get_logits_ith(ctx, idx);
+            const auto * logits = row.logits;
             GGML_ASSERT(logits != nullptr);
             // a token the backend sampled is looked up among the candidates, so they stay every token's
-            if (top_k > 0 && top_k < n_vocab && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+            if (top_k > 0 && top_k < n_vocab && row.token == LLAMA_TOKEN_NULL) {
                 common_sampler_top_k_candidates(logits, n_vocab, top_k, cur);
                 cur_p = { cur.data(), cur.size(), -1, true };
                 return;
@@ -791,7 +791,7 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    const auto row = llama_get_sampling_row_ith(ctx, idx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -808,12 +808,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const bool every_token = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
         (grammar_first && grammar_should_apply(gsmpl));
 
-    gsmpl->set_logits(ctx, idx, every_token ? 0 : gsmpl->n_candidates);
+    gsmpl->set_logits(ctx, row, every_token ? 0 : gsmpl->n_candidates);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = row.token;
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
@@ -836,7 +836,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // a row a backend cut to its top k holds no other token: as for a sampled token, a grammar or reasoning budget that
     // would change these logits must have taken the slot off the backend
-    GGML_ASSERT((common_sampler_backend_passive(gsmpl) || llama_get_sampled_logits_ith(ctx, idx) == nullptr) &&
+    GGML_ASSERT((common_sampler_backend_passive(gsmpl) || row.sampled_logits == nullptr) &&
             "backend top-k candidates while the grammar or reasoning budget constrains");
 
     // apply reasoning budget first
@@ -869,7 +869,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(ctx, row);
 
     llama_sampler_apply(rbudget,  &cur_p);
 
