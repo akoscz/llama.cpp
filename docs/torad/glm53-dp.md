@@ -2,7 +2,9 @@
 
 Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline and extended by the November 3 completion work below. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The selected model is the BoldingBuilds uncensored pack. Capacity and numerical qualification remain separate requirements; a successful boot or component test does not qualify concurrent 400K sessions.
 
-Last measured four-card result: host KV with MTP 2 allocates 72 private 442,368-cell slots and passes short concurrent decode, but median throughput is only 0.587 tokens/s per request. Fully occupied concurrent 400K capacity is unqualified. Long-context testing is stopped at the user's request until short-context concurrent throughput is fixed and measured. The rental is stopped; the production engine pin and placed profiles are unchanged.
+Latest four-card throughput measurement: the November 4 profiling run below uses 40 configured private slots, host KV and MTP2 on runtime `82ad56cb8`. One active session produces 128-token replies at 45.3 tokens/s with a 512-token prompt, 35.2 at 4,096 and 31.7 at 24,576. The shorter concurrent probes return about 28 tokens/s per session at two sessions, 12-16 at four and 6 at eight. Fully occupied concurrent 400K capacity remains unqualified. The temporary rental was deleted after collection; production pins and placed profiles are unchanged.
+
+The earlier 72-slot capacity probe allocated private 442,368-cell slots and passed short concurrent decode at a median 0.587 tokens/s per request. That historical result is not the current throughput baseline. Long-context capacity testing remains deferred until concurrent throughput is usable.
 
 ## Follow-ups after PR #116
 
@@ -315,3 +317,68 @@ Two regressions, then, both in tensor mode on two cards with no DP flag set: one
 Every raw row and partial JSONL row stores `request_start_s` and `request_end_s` on the run's shared monotonic clock, relative to run start. Per-turn `output_tps_aggregate` divides delivered output tokens by `max(request_end_s) - min(request_start_s)`. It includes prefill, queueing, HTTP and gaps between staggered requests. It is not server decode throughput. The old `decode_tps_aggregate` sum of request rates was removed. Historical rows without endpoints have unavailable common-interval throughput. Report `elapsed_s` also includes history construction and sampler shutdown, and is not the throughput denominator.
 
 Raw producer timings and finish reasons are retained. Summary diagnostics sum draft, accepted, delivered, round, verify and replay counters and each verify-row histogram bucket. Acceptance and delivered-per-round use summed paired counts; missing fields remain unavailable rather than observed zeros. These reporting changes do not establish any speedup.
+
+### November 4: 40-slot startup with backend sampling
+
+Four RTX PRO 6000 Blackwell Server Edition cards (97,887 MiB each, 600 W, driver 615.71.09) on Vast machine 156124. These are different cards from the earlier Max-Q measurements. The pack is BoldingBuilds/orcarouter_GLM-5.3-Flash-Uncensored-GGUF IQ3_XXS at revision `1bc0afadd92f4ff9fc2b1281a95a7921b058d35d`; all three shards and the projector passed SHA256 verification.
+
+The tracked `dp-4` recipe used 40 private slots, `-c 17694720`, host latent KV, Q8 caches and recurrent state, MTP2, backend sampling, batch 2048 and ubatch 512. Main `7728616ce` aborted during startup: the fused-GDN probe requested 640 output rows, but the sampler limit marked only 120, so DP ownership counts disagreed with the output-ID tensor. Commit `82ad56cb8` makes reservation use the marked count. The new regression fails before the fix and passes after it on CPU and physical two/four-GPU DP, including fully and partly sampled 40-sequence batches and exact greedy verification tokens against an unsampled context. The graph-key, graph-aging, disabled-memory-diagnostics, four-device capture, host-KV ownership, sampling-row, Meta sampler and MTP checks passed on the cards.
+
+With the fix, the full server loaded 40 slots of 442,368 cells each with MTP enabled. Sampled peak memory was 69,235 MiB on card 0 and 67,595 MiB on each other card. This verifies startup allocation with host KV; the slots were not filled with 400k histories. Two identical 128-token prompts produced matching eight-token greedy replies. Their server-reported prefill rates were 23.65 tokens/s on the first execution and 273.11 on the repeat; decode was 12.79 and 11.79 tokens/s. These short probes include insufficient warmup to establish steady throughput.
+
+The timed sweep failed before its first token: the HTTP stream ended before the common interval began. The collected log has no CUDA error or memory-headroom failure; the cause of the stream closure is unresolved. The client works against a local CPU server, including the same greedy/prime/stream sequence with 40 slots and 128/1200-token prompts. Its next version records HTTP headers and unexpected response data so the failure is distinguishable from an inference error. There is no valid 1/4/12/40-stream throughput result, tool-cache continuation result, profiler capture or 400k capacity result from this window.
+
+All temporary instances were stopped and deleted after collection. The original cached-model instance remains stopped because its host would not restart it. Local receipts are under `.Codex/tmp/dp-gpu-20261104/`: `receipts/results` records the main startup failure; `retry/receipts/results` records the fixed CUDA checks and a download timeout; `final-retry/receipts/results` records the successful full-model startup, short probes, memory samples and incomplete sweep.
+
+### November 4: single-session profiling and scaling controls
+
+Runtime `82ad56cb8b67c83c0977ae9e4d23da9b5779d469`, built for SM120a, on Vast machine 156135: four RTX PRO 6000 Blackwell Server Edition cards, 97,887 MiB and 600 W each, driver 615.71.09. This is another machine, not the earlier 156124 or Max-Q host. The same BoldingBuilds pack and revision above passed full shard/projector SHA256 verification. The [machine-readable measurements](glm53-dp-profile-20261104.json) retain each response's native timing, MTP counters and the trace summaries.
+
+The candidate uses `scripts/glm53/serve.py --profile dp-4`, `-sm dp -ts 1,1,1,1`, private 442,368-cell slots, Q8 caches/state, backend sampling, MTP2, batch 2048, ubatch/prompt step 512 and 8/16 CPU threads. Host-KV legs set `LLAMA_KV_HOST=1`; every leg enables the existing `LLAMA_TIME_DECODE` timers. CUDA graph count is unlimited, the node budget retains its default 32,768, and graph memory diagnostics are off. No production recipe was changed.
+
+One active session, native decode tokens/s:
+
+| Configured slots | Latent KV | MTP | 512-token prompt | 24,576-token prompt | 24,576-token prefill tokens/s |
+| --- | --- | --- | ---: | ---: | ---: |
+| 40 | Host | 2 | 45.3 | 31.7 | 604 |
+| 1 | Host | 2 | 46.3 | 36.7 | 608 |
+| 1 | GPU | 2 | 45.6 | 36.8 | 698 |
+| 1 | GPU | Off, diagnostic | 62.4 | 25.5 | 720 |
+
+Each reply contains 128 generated tokens. The 512 column averages two post-warmup requests; the longer-context entries are single measurements. The 40-slot host/MTP2 leg also measured 35.2 decode tokens/s and 649 prefill tokens/s at 4,096 context. Returning to 512 after the longer prompts gave 42.1 decode tokens/s. Cold first-use prefill was slower and is retained separately. These are bounded warmed requests, not a long-running stationarity test.
+
+All MTP-on controls produced the same 128 token IDs for the corresponding prompt and seed. The MTP-off output differs, so its rate is a same-request diagnostic with a different expert-routing/token path, not an exact fixed-token ablation. The observation supports retaining MTP for longer contexts and investigating its short-context cost; it does not support disabling MTP globally. Configured slot count does not explain the short-context floor, and host KV has almost no decode penalty in the one-slot 24K comparison. The 40-slot 24K result is about 14% below the one-slot result; there was no randomized repeated-order experiment to isolate that difference.
+
+Concurrent requests use distinct slot prefixes, 512-token prompts and 64 generated tokens per session:
+
+| Active sessions | Native decode tokens/s per session | Delivered output tokens/s over the common HTTP interval, including prefill |
+| ---: | ---: | ---: |
+| 2 | 28.1-28.7 | 33.8 |
+| 4 | 12.3-15.6 | 30.9 |
+| 8 | 5.85-6.57 | 30.3 |
+
+The concurrent reply length differs from the 128-token single-session controls. The common-interval column includes prefill, queueing and HTTP; it is not aggregate steady decode throughput. Per-session rates are not summed into a claimed aggregate rate. The equal-length 2/4/8-session comparison already shows poor scaling. A bounded 16-token SSE request also completed; this run did not reproduce or explain the earlier stream closure.
+
+Nsight Systems 2026.1.3 captured separate 48-token, single-session requests at 512 and 4,096 context after warmup. CUDA/NVTX/OS-runtime traces were analyzed locally after collection. Profiled rates are excluded from the baseline table.
+
+| Trace observation | 512 context | 4,096 context |
+| --- | ---: | ---: |
+| Span from first to last GPU kernel | 1,552.9 ms | 1,714.1 ms |
+| Collective share of summed kernel durations across four GPUs | 74.6% | 73.2% |
+| `cudaGraphInstantiate` calls | 368 | 1,076 |
+| Summed host duration of those calls | 224.4 ms | 275.5 ms |
+| `cudaStreamSynchronize` calls | 1,296 | 1,424 |
+
+The main finding is coordination overhead in the DP execution path. Collective durations include waiting for other ranks, and summing durations across GPUs does not measure critical-path wall time. On GPU0, collectives account for about 38-40% of summed kernel duration; on the other cards they account for about 87-89%. Each card has no active kernel for roughly 46-51% of the captured kernel interval; copy-engine activity is excluded from that calculation. This is not evidence that the cards sustain their memory bandwidth or that all collective time could be removed.
+
+One specific extra collective is outside the intended MoE gather/reduction pair. `llm_graph_context::build_sampling` in `src/llama-graph.cpp:4773` adds a dummy logits row with PAD. Under DP, logits are split by owning rows, and `ggml_backend_meta_is_gather` in `ggml/src/ggml-backend-meta.cpp:1784` treats padding on that split axis as a gather. The first target output in the NVTX trace has `PAD ... r=619520 w=1239040` on its owner and zero input bytes on the other ranks, followed by the large unsigned gather kernels. Full vocabulary rows are therefore gathered onto all four cards before sampling even for one owning stream. The large peer-push gather kernels alone account for about 21-22% of summed GPU kernel duration in these traces. That kernel-family percentage also includes captured executions whose tensor identity was not separately logged; it is not a projected speedup from fixing sampling. Owner-local DP sampling is a concrete optimization candidate; no implementation or measured speedup is claimed here.
+
+Graph instantiation remains another measured cost. Most small instantiations in the 512 trace occur near its beginning, but further expensive instantiations occur throughout the request; the 4K trace has another large burst mid-request. The counts alone do not distinguish new shapes, Meta capture replacement and CUDA LRU eviction. The existing host timers place 85-95% of cumulative decode-call time in `graph_compute`; those aggregates mix target/draft and prefill/decode calls, so they are not a separate steady-decode CPU profile. Cache-lifetime and graph-identity attribution should precede changes to cache caps.
+
+Bulk peer-copy measurements over 64 MiB transfers were 53.7-55.3 GB/s across all twelve directed GPU pairs, with P2P available everywhere. This rules out absent P2P on this host, not small-collective latency or rank-arrival imbalance. Compute Sanitizer 2026.2.1 passed `test-backend-meta-split --host-kv-four` with zero errors, including mapped Q8 attention and changing selections. GPU memory/utilization/power/clocks and PCIe telemetry were collected; occasional NVML query timeouts leave gaps. Sampled memory during the 40-slot requests peaked at 69,545 MiB on GPU0 and about 67,933 MiB on the other cards. The one-slot host run briefly overlapped the previous profiler process's CUDA cleanup during startup; its own server became ready and served requests after that old allocation was released. Transition peaks are identified separately in the JSON.
+
+Nsight Compute 2026.2.1 was attempted remotely before downloading the model and refused access with `ERR_NVGPUCTRPERM`. CPU stack sampling also failed the host's `perf_event_open` capability check (paranoid level 4). Thus there are no hardware-counter rooflines or sampled CPU stacks from this run. The CUDA traces, engine timers, transport measurements and sanitizer results remain valid evidence. Running the profiler frontend elsewhere would still require permission to collect counters on the target.
+
+The next work supported by this evidence is owner-local DP sampling, attribution of repeated graph capture/instantiation, and the collective/MTP scheduling path under concurrency. Arithmetic kernels, host-KV capacity and raw PCIe bandwidth are not established as the main cause. No 400K capacity, perplexity/KL, tool-call cache-continuity or 40-active-session qualification was attempted in this window.
+
+Receipts, launch commands, raw responses, model hashes, telemetry and `.nsys-rep` files are in `.Codex/tmp/dp-profile-20261104/receipts/results`; `summary.json` and `early/` hold the local analysis. The raw archive SHA256 is retained in the tracked JSON. The first empty rental failed its direct-port mapping and was deleted. The replacement used proxy SSH, completed the measurements, and was stopped/deleted after collection at about 16 minutes into the successful controller run. Credit decreased about $1.44 across this profiling effort, including startup attempts and transfer. Only the original cached-model instance 59024660 remains, stopped and still incurring its existing disk charge.

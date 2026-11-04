@@ -1327,9 +1327,73 @@ static bool test_graph_shapes(llama_model * model) {
     return true;
 }
 
+static bool test_sampler_reserve(llama_model * model) {
+    const int n_seq = 40;
+    const int width = N_MAX + 1;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    auto params = llama_context_default_params();
+    params.n_ctx = n_seq*128;
+    params.n_seq_max = n_seq;
+    params.n_batch = 2048;
+    params.n_ubatch = 512;
+    params.n_outputs_max = n_seq*width;
+    params.n_outputs_max_per_seq = width;
+    params.n_threads = params.n_threads_batch = 4;
+    params.kv_unified = false;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ref(llama_init_from_model(model, params));
+    if (!ref) { return fail("sampler reserve reference context failed"); }
+
+    llama_batch batch = llama_batch_init(n_seq*width, 0, 1);
+    for (int s = n_seq - 1; s >= 0; --s) {
+        for (int p = 0; p < width; ++p) {
+            common_batch_add(batch, (s + p) % n_vocab, p, {s}, true);
+        }
+    }
+    const auto finish = [&](bool result) {
+        llama_batch_free(batch);
+        return result;
+    };
+    if (llama_decode(ref.get(), batch) != 0) { return finish(fail("sampler reserve reference decode failed")); }
+    std::vector<llama_token> expected;
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        const float * row = llama_get_logits_ith(ref.get(), i);
+        expected.push_back(std::max_element(row, row + n_vocab) - row);
+    }
+    ref.reset();
+
+    // Fused-op probes request more outputs than the sampler limits allow, including with unsampled sequences.
+    for (int n_sampled : {n_seq, n_seq/2}) {
+        std::vector<llama_sampler_ptr> samplers;
+        std::vector<llama_sampler_seq_config> configs;
+        for (int s = 0; s < n_sampled; ++s) {
+            samplers.emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            llama_sampler_chain_add(samplers.back().get(), llama_sampler_init_greedy());
+            configs.push_back({s, samplers.back().get()});
+        }
+        params.samplers = configs.data();
+        params.n_samplers = configs.size();
+        llama_context_ptr ctx(llama_init_from_model(model, params));
+        if (!ctx) { return finish(fail("sampler-limited context reservation failed")); }
+        if (llama_decode(ctx.get(), batch) != 0) { return finish(fail("sampler-limited verification decode failed")); }
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            llama_token actual;
+            if (batch.seq_id[i][0] < n_sampled) {
+                actual = llama_get_sampled_token_ith(ctx.get(), i);
+            } else {
+                const float * row = llama_get_logits_ith(ctx.get(), i);
+                actual = std::max_element(row, row + n_vocab) - row;
+            }
+            if (actual != expected[i]) { return finish(fail("reserved sampler graph changed a verification token")); }
+        }
+    }
+    return finish(true);
+}
+
 static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cache) {
     auto baseline = glm_model(1234, {devices.front()});
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
+    if (!q8_cache && !test_sampler_reserve(split.get())) { return false; }
     set_env("LLAMA_MTP_DEVICE_H", "1");
     server_rig ref(baseline.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
     server_rig dp(split.get(), 0, N_MAX, 0, 32, GGML_TYPE_F16, 64, true, q8_cache);
@@ -1430,6 +1494,7 @@ int main(int argc, char ** argv) {
         set_env("LLAMA_MTP_TIMING_LEGACY", "1");
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
+            { "sampler-reserve", test_sampler_reserve },
             { "graph-shapes", test_graph_shapes },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },
