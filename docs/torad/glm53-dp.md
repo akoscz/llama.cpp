@@ -2,6 +2,8 @@
 
 Experimental DP from [PR #110](https://github.com/torad-labs/llama.cpp/pull/110), combined with main for the November 2 baseline and extended by the November 3 completion work below. Four RTX PRO 6000 96 GB cards and 40 long-context slots are the target. The selected model is the BoldingBuilds uncensored pack. Capacity and numerical qualification remain separate requirements; a successful boot or component test does not qualify concurrent 400K sessions.
 
+Current result: host KV with MTP 2 allocates 72 private 442,368-cell slots and passes short concurrent decode, but median throughput is only 0.587 tokens/s per request. Fully occupied concurrent 400K capacity is unqualified. Long-context testing is stopped at the user's request until short-context concurrent throughput is fixed and measured. The rental is stopped; the production engine pin and placed profiles are unchanged.
+
 ## November 3 completion candidate
 
 Runtime source `8fae0c4009cf0b9f49cb62e521091c6a647b18be` adds three paths:
@@ -28,7 +30,7 @@ Thirty-six slots loaded with 6,832 MiB free on card 0. All 36 independent 30,720
 
 Four separate 409,088-token seeds completed at 2,111-2,159 prefill tokens/s each. Restoring the first seed into slot 4 retained its prefix, but the extension aborted in `ggml_backend_meta_set_tensor_async`: the outer-range byte sum did not equal the view's visible byte length. No 36-way 400K decode or second-turn result was obtained. Results were collected, stop was requested 4.27 s after compute ended, and the provider confirmed the box stopped at 19:10:57 UTC on November 3.
 
-Commit `dfc9ce76cdf9cf46fd916ff5ed66b0c7f630c2b5` fixes that byte calculation. A contiguous view containing one outer plane can retain an unused stride from its larger parent; its visible bytes, not that stride, determine the transfer interval. The existing stream-view test reproduces the same assertion on CPU before the fix. F32 and Q8 cases pass afterward, including a non-first local stream, asynchronous transfers, partial memset and checks that other streams remain unchanged. The full CPU meta-split and k-pool suites pass. The portable CUDA build passes; artifact SHA-256 is `cdc9cded2b5a0c8407dd8e12fab39ccb5095a096e30c65773efdd2aeee175b98`. Actual long-context restoration on GPUs remains pending for this repair.
+Commit `dfc9ce76cdf9cf46fd916ff5ed66b0c7f630c2b5` fixes that byte calculation. A contiguous view containing one outer plane can retain an unused stride from its larger parent; its visible bytes, not that stride, determine the transfer interval. The existing stream-view test reproduces the same assertion on CPU before the fix. F32 and Q8 cases pass afterward, including a non-first local stream, asynchronous transfers, partial memset and checks that other streams remain unchanged. The full CPU meta-split and k-pool suites pass. The portable CUDA build passes; artifact SHA-256 is `cdc9cded2b5a0c8407dd8e12fab39ccb5095a096e30c65773efdd2aeee175b98`. Later host-KV runs below verify the repair on physical GPUs, including 54 additional full-prefix restores.
 
 The slow cold workload also exposes a scheduling constraint: a balanced 512-row microbatch over 36 sequences supplies 14 tokens per sequence. KDA's chunked path requires at least 128, and its decay-precompute path at least 32. This identifies unavailable fast paths from source, not their share of measured runtime. No scheduling policy or KDA arithmetic was changed. Concurrent capacity, throughput and the strict numerical requirement remain unqualified; no four-card serving profile is promoted.
 
@@ -149,7 +151,34 @@ python3 scripts/glm53/capacity.py \
   --host-kv --host-budget-mib 200000 --peak-extra-mib 4096
 ```
 
-No GPU execution of this new host-KV path or serving measurement is claimed yet. The existing strict cross-layout KL requirement remains unmet. Keep this candidate out of Rig's placed profile and engine pin until component, MTP/restore, quality and active-memory checks pass remotely.
+The strict cross-layout KL requirement remains unmet. Keep this candidate out of Rig's placed profile and engine pin until component, MTP/restore, quality and active-memory checks pass remotely.
+
+### November 3 host-KV measurements
+
+Vast box 59024660 has four RTX PRO 6000 Max-Q cards with 97,342 MiB each. All twelve directed peer-read checks pass. These runs retain the BoldingBuilds pack and projector, non-unified caches, MTP depth 2 and the serving flags above. Public model files were verified by SHA-256. The box is stopped between runs and immediately after essential result collection.
+
+The first full-model host-KV preflight found a greedy-token difference against resident KV at 8K. Commit `c55a759f9a34dce1d3866ec7249cebb2a26ae31c` restores the resident path's bounded early attention-kernel selection: stage the small cache below the sparse-path cutoff, then stage selected rows above it. A CPU graph-construction regression fails before the fix and passes afterward. On four physical GPUs, masked and direct sparse attention tests pass under captured replay and Compute Sanitizer reports zero errors. Resident and host KV then generate the same 64 greedy tokens at 8K with MTP enabled. Non-first local stream restoration and a real tool-call/result cache continuation also pass. These are limited correctness checks, not full-model KL qualification.
+
+That build boots forty slots with 442,368 cells each. All forty short requests complete and are observed decoding concurrently. Card 0 has 28,462 MiB free after load and 27,056 MiB after the short decode. This establishes allocation headroom, not forty fully occupied 400K contexts. The 128-token output round takes 182.437 s including admission and prefill: 28.064 aggregate output tokens/s, with median native per-response decode of 0.922 tokens/s. The 64-slot follow-up was interrupted to investigate this slowdown; it was not an OOM result.
+
+A separate Nsight Systems capture contains a 34.745 s forty-stream interval with 8,943 graph instantiations and 17,886 CUDA memory queries. Their summed API durations are 2.040 s and 4.379 s across host threads; these are not wall-time shares. Mapped-host row staging totals 0.120 s of GPU kernel time across devices. Every scheduled model segment uses the Meta GPU backend; no CPU model fallback was observed.
+
+An attempt to merge the input-limited scheduler segments (`75d5bd454`) passed small CPU/GPU replay, sanitizer, 8K generation, restore and tool-cache checks, but failed the forty-slot MTP reservation. Keeping all copied inputs alive together required a 32,227.06 MiB allocation on GPU 0, which failed with OOM. Commit `a3ea9b8ce73c64271931dc8720f5215f01ecbd12` reverts that attempt. The split limit bounds staging memory even though its input array can grow; it cannot simply be removed. The box was stopped after collection. The resumed capacity run uses the previously validated `c55a759f9` binary. Graph-cache churn remains a separate performance issue, with no claimed fix or speedup.
+
+The resumed run completes short concurrent rounds at all four allocation sizes. Each slot reserves 442,368 cells and starts with a distinct 128-token prompt. All requested slots are observed decoding concurrently. The forty-slot round generates 128 tokens per request; the other rounds generate 32. Native decode rates are per-response intervals, not aggregate wall throughput or fully occupied 400K rates.
+
+| Slots | Least free after load, MiB | Least free after short decode, MiB | Median native decode, tokens/s per request |
+| --- | ---: | ---: | ---: |
+| 40 | 28,462 | 26,952 | 0.897 |
+| 64 | 13,168 | 11,852 | 0.571 |
+| 68 | 10,534 | 9,022 | 0.512 |
+| 72 | 7,904 | 6,464 | 0.587 |
+
+With seventy-two slots allocated, a fresh 409,088-token seed completes in 644.170 s, or 635.063 prompt tokens/s. Fifty-four additional slots successfully restore 409,088 cached tokens and process their distinct tails. The partial deep run peaks at 90,056 MiB on card 0, leaving 7,286 MiB. Sequential restore latency grows to about 17 s per request by slot 37. On each new task the server visits idle slots to publish RAM-cache snapshots; even a rejected no-space save computes target/draft state sizes before its admission check. This is a separate source-level scaling concern from CUDA graph reuse.
+
+That run does not complete concurrent 400K decode. A replacement test driver uses a ten-second status timeout during heavy cache bookkeeping, times out, and triggers controlled shutdown. This is a harness failure, not a CUDA failure or a completed capacity qualification.
+
+A final bounded attempt starts with the same runtime and flags, a longer status timeout, and concurrent admission while keeping the seed slot idle. The user stops it before qualification completes because short-context throughput is already unusable. The workload is interrupted and the provider confirms the box exited with both current and intended state stopped. No completed full-context result is claimed, and the box is not restarted to retrieve incomplete data. Existing closed results and the Nsight capture are retained locally. Further GPU work must establish useful concurrent throughput with short prompts before spending on long-context capacity.
 
 ## Further capacity approaches checked on November 3
 
