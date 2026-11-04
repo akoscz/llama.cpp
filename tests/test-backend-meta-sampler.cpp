@@ -539,11 +539,11 @@ int main(int argc, char ** argv) {
             gpus.push_back(ggml_backend_dev_get(i));
         }
     }
+    if (four && gpus.size() != 4) { fprintf(stderr, "four physical GPUs required\n"); return 1; }
     if (gpus.empty()) {
         printf("no GPU for the meta backend, skipped\n");
         return 0;
     }
-    if (four && gpus.size() != 4) { fprintf(stderr, "four physical GPUs required\n"); return 1; }
     if (gpus.size() == 1) {
         gpus.push_back(gpus[0]);
     }

@@ -105,6 +105,31 @@ class ServingStandIn(http.server.BaseHTTPRequestHandler):
                 response.update(content="", tokens=[], stop=True)
                 self.wfile.write(b"data: " + json.dumps(response).encode() + b"\n\n")
                 return
+            elif case in ("stream-deadline", "stream-deadline-stall", "stream-deadline-framing") and payload.get("stream"):
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                def send_event(event):
+                    raw = b"data: " + json.dumps(event).encode() + b"\n\n"
+                    header = f"{len(raw):x}".encode()
+                    if case == "stream-deadline-framing" and event.get("tokens") == [6]:
+                        for byte in header + b";padding=" + b"x"*40:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(0.05)
+                    else:
+                        self.wfile.write(header)
+                    self.wfile.write(b"\r\n" + raw + b"\r\n")
+                    self.wfile.flush()
+                try:
+                    for token in range(tokens):
+                        send_event(dict(content="x", tokens=[token], stop=False))
+                        time.sleep(2 if case == "stream-deadline-stall" and token == 11 else 0.05)
+                    send_event(response | dict(content="", tokens=[], stop=True))
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             elif case == "chunked":
                 self.send_response(200)
                 self.send_header("Transfer-Encoding", "chunked")
@@ -213,6 +238,44 @@ class ServingEvidence(unittest.TestCase):
             measured = json.loads((folder / "decode-512-1-0.json").read_text())
             self.assertEqual(measured["streams"][0]["token_ids"], list(range(8)))
             self.assertTrue(json.loads((folder / "process-exit.json").read_text())["exit"] is not None)
+
+    def check_stream_deadline(self, case):
+        self.server.case = case
+        self.args.mode = "scaling"
+        self.args.sessions = [2]
+        self.args.prompt_tokens = [512]
+        self.args.tokens = 64
+        self.args.deadline = time.time() + 0.9
+        leg = ServingLeg(self.args)
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            leg.run()
+        self.assertLess(time.monotonic() - started, 1.4)
+        records = [row for row in self.capture_records(leg) if row["request"].get("stream")]
+        self.assertEqual({row["request"]["id_slot"] for row in records}, {0, 1})
+        for record in records:
+            self.assertEqual(record["status"], 200)
+            self.assertIn("TimeoutError", record["error"])
+            body = leg.out / record["body_file"]
+            self.assertIn(b"data:", body.read_bytes())
+            events = [json.loads(line) for line in body.with_suffix(".events.jsonl").read_text().splitlines()]
+            self.assertTrue(events)
+            self.assertFalse(any(row["event"].get("stop") for row in events))
+            self.assertFalse(body.with_suffix(".stream.json").exists())
+        self.assertFalse((leg.out / "workload.json").exists())
+        exits = json.loads((leg.out / "process-exit.json").read_text())
+        self.assertIsNotNone(exits["exit"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(exits["pid"], 0)
+
+    def test_progressing_streams_stop_at_deadline_and_clean_up(self):
+        self.check_stream_deadline("stream-deadline")
+
+    def test_stalled_stream_reads_use_the_remaining_deadline(self):
+        self.check_stream_deadline("stream-deadline-stall")
+
+    def test_partial_chunk_framing_cannot_extend_the_deadline(self):
+        self.check_stream_deadline("stream-deadline-framing")
 
     def test_rejected_completion_keeps_its_request_and_raw_reply(self):
         for case in ("short-generation", "short-prompt", "empty", "application-error", "http-error", "bad-json", "short-body"):

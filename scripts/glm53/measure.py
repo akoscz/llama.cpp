@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -80,8 +81,9 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
 
 
-def retained_chunks(response, saved):
+def retained_chunks(response, saved, timeout):
     while True:
+        timeout()
         try:
             raw = response.read1(65536)
         except http.client.IncompleteRead as exc:
@@ -93,19 +95,21 @@ def retained_chunks(response, saved):
             remaining = getattr(response, "length", None)
             if remaining:
                 raise http.client.IncompleteRead(b"", remaining)
+            timeout()
             return
         saved.write(raw)
         saved.flush()
+        timeout()
         yield raw
 
 
-def retain_body(response, saved):
-    return b"".join(retained_chunks(response, saved))
+def retain_body(response, saved, timeout):
+    return b"".join(retained_chunks(response, saved, timeout))
 
 
-def retained_lines(response, saved):
+def retained_lines(response, saved, timeout):
     pending = b""
-    for chunk in retained_chunks(response, saved):
+    for chunk in retained_chunks(response, saved, timeout):
         pending += chunk
         while b"\n" in pending:
             line, pending = pending.split(b"\n", 1)
@@ -218,6 +222,32 @@ class ServingLeg:
             return folder / f"{self.request_number:06d}.json"
 
     @contextlib.contextmanager
+    def response_deadline(self, response):
+        stream = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        # A chunked read can keep receiving framing bytes without returning. Interrupt the socket at the deadline.
+        connection = stream.fp.raw._sock
+        expired = threading.Event()
+        def expire():
+            expired.set()
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # The response may already have closed its socket.
+        timer = threading.Timer(self.timeout(math.inf), expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+            self.timeout()
+        except Exception as exc:
+            if expired.is_set():
+                raise TimeoutError("serving deadline reached") from exc
+            raise
+        finally:
+            timer.cancel()
+            timer.join()
+
+    @contextlib.contextmanager
     def capture_response(self, path, data=None, maximum=300, record=None, context=None):
         record = record or self.response_record()
         raw = record.with_suffix(".body")
@@ -231,11 +261,11 @@ class ServingLeg:
                 response = urllib.request.urlopen(req, timeout=self.timeout(maximum))
             except urllib.error.HTTPError as exc:
                 meta["status"] = exc.code
-                with exc, raw.open("wb") as saved:
-                    retain_body(exc, saved)
+                with exc, raw.open("wb") as saved, self.response_deadline(exc):
+                    retain_body(exc, saved, lambda: self.timeout(maximum))
                 raise
             meta["status"] = response.status
-            with response, raw.open("wb") as saved:
+            with response, raw.open("wb") as saved, self.response_deadline(response):
                 yield response, saved
         except Exception as exc:
             meta["error"] = f"{type(exc).__name__}: {exc}"
@@ -251,7 +281,7 @@ class ServingLeg:
 
     def request(self, path, data=None, maximum=300, record=None, context=None):
         with self.capture_response(path, data, maximum, record, context) as (response, saved):
-            return json.loads(retain_body(response, saved))
+            return json.loads(retain_body(response, saved, lambda: self.timeout(maximum)))
 
     def complete(self, prompt, tokens=384, slot=0, prompt_tokens=None, repeat=None):
         before = time.monotonic()
@@ -281,7 +311,7 @@ class ServingLeg:
                 def keep_event(event):
                     events.write(json.dumps(event, allow_nan=False) + "\n")
                     events.flush()
-                result = read_completion_stream(retained_lines(response, saved), tokens, prompt_tokens, on_event=keep_event)
+                result = read_completion_stream(retained_lines(response, saved, self.timeout), tokens, prompt_tokens, on_event=keep_event)
         raw = prompt["prompt"].encode() if isinstance(prompt["prompt"], str) else json.dumps(prompt["prompt"]).encode()
         result.update(slot=slot, request=payload, prompt_sha256=hashlib.sha256(raw).hexdigest(),
                       started=started, ended=time.monotonic(), response_record=str(record.relative_to(self.out)))
@@ -342,8 +372,7 @@ class ServingLeg:
         payload = completion_payload("Explain merge sort and give several examples.", 4096, 0) | {"stream": True}
         first = None
         with self.capture_response("/completion", payload, maximum=60) as (stream, saved):
-            for line in retained_lines(stream, saved):
-                self.timeout()
+            for line in retained_lines(stream, saved, lambda: self.timeout(60)):
                 if line.startswith(b"data: ") and line.strip() != b"data: [DONE]":
                     item = json.loads(line[6:])
                     if item.get("content"):
