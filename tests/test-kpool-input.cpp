@@ -1555,9 +1555,9 @@ static void run_resident_patches(std::mt19937 & rng) {
     printf("resident patches: %llu writes, %llu actual callback bytes\n", (unsigned long long) calls, (unsigned long long) bytes);
 }
 
-static void run_draft_bank() {
+static void run_draft_bank(std::vector<ggml_backend_dev_t> devs) {
     constexpr uint32_t devices = 4, slots = 9;
-    std::vector<ggml_backend_dev_t> devs(devices, ggml_backend_get_device(resident_test_backend()));
+    GGML_ASSERT(devs.size() == devices);
     auto * meta = ggml_backend_meta_device(devs.data(), devs.size(),
         [](const ggml_tensor *, void *) -> ggml_backend_meta_split_state {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
@@ -1567,7 +1567,7 @@ static void run_draft_bank() {
     llama_kpool_draft draft;
     std::shared_ptr<llama_kpool_backend_tensor> previous;
     for (int round = 0; round < 12; ++round) {
-        const int width = round < 6 ? 8 : 12;
+        const int width = round < 6 ? 128 : 192;
         std::vector<llama_seq_id> seqs;
         std::vector<int64_t> counts(devices, 0);
         for (uint32_t d = 0; d < devices; ++d) {
@@ -1786,7 +1786,25 @@ static void run_resident_bank(std::mt19937 & rng, uint32_t slots, uint32_t devic
     ggml_backend_free(backend);
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc != 1) {
+        if (argc != 6 || strcmp(argv[1], "--draft-bank") != 0) {
+            fprintf(stderr, "usage: %s [--draft-bank DEVICE0 DEVICE1 DEVICE2 DEVICE3]\n", argv[0]);
+            return 1;
+        }
+        ggml_backend_load_all();
+        std::vector<ggml_backend_dev_t> devs;
+        for (int i = 2; i < argc; ++i) {
+            auto * dev = ggml_backend_dev_by_name(argv[i]);
+            if (!dev) {
+                fprintf(stderr, "unknown draft-bank device: %s\n", argv[i]);
+                return 1;
+            }
+            devs.push_back(dev);
+        }
+        run_draft_bank(devs);
+        return n_fail != 0;
+    }
     std::mt19937 rng(20260930);
 
     run_resident_patches(rng);
@@ -1794,7 +1812,7 @@ int main() {
     run_resident_bank(rng, 41, 4);
     run_direct_indices(rng);
     run_draft_rounds(rng);
-    run_draft_bank();
+    run_draft_bank(std::vector<ggml_backend_dev_t>(4, ggml_backend_get_device(resident_test_backend())));
 
     run_shift_regroups();
     run_compress_chunks();
