@@ -127,6 +127,7 @@ struct llama_context {
     void set_lens_channels(bool enabled);
     void set_nextn_layer_offset(int32_t offset);
     bool mtp_draft_step(int32_t step);
+    bool set_mtp_graph_reuse(int32_t n_max);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -450,6 +451,9 @@ private:
     };
     static constexpr uint32_t graph_slot_max_tokens = 32;
     static constexpr size_t   graph_slots_max       = 3;
+    uint32_t graph_slot_mtp_seq_tokens = 0;
+    uint32_t graph_slot_max_rows = graph_slot_max_tokens;
+    std::vector<size_t> graph_slot_buf_limit;
     std::vector<graph_slot> graph_slots;
     uint64_t graph_clock = 0; // process_ubatch calls, the slots' use times
 

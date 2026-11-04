@@ -180,15 +180,16 @@ struct server_rig {
 
     server_rig(llama_model * model, float adaptive, int32_t n_max = N_MAX, int32_t n_min = 0, int32_t n_ubatch_dft = 0,
                ggml_type type_idx = GGML_TYPE_F16, int32_t n_ubatch_tgt = 512,
-               bool private_streams = false, bool q8_cache = false) : n_max(n_max) {
+               bool private_streams = false, bool q8_cache = false, int32_t n_seq = N_SEQ) : n_max(n_max) {
+        seqs.resize(n_seq);
         params.n_ctx      = 8192;
         params.cache_type_idx = type_idx;
-        params.n_parallel = N_SEQ;
+        params.n_parallel = n_seq;
         params.n_batch    = 512;
         params.n_ubatch   = n_ubatch_tgt;
         params.kv_unified = !private_streams;
         if (private_streams) {
-            params.n_ctx = N_SEQ*1024;
+            params.n_ctx = n_seq*1024;
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         }
         params.cpuparams.n_threads       = 4;
@@ -217,7 +218,7 @@ struct server_rig {
         }
         params.speculative.draft.ctx_tgt = tgt.get();
         params.speculative.draft.ctx_dft = init->context();
-        spec.reset(common_speculative_init(params.speculative, N_SEQ));
+        spec.reset(common_speculative_init(params.speculative, n_seq));
         if (!spec) {
             throw std::runtime_error("failed to create the drafter");
         }
@@ -353,7 +354,7 @@ struct acceptance {
 };
 
 static void log_errors(ggml_log_level level, const char * text, void *) {
-    if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
+    if (level >= GGML_LOG_LEVEL_ERROR || getenv("LLAMA_GRAPH_RESULT_DEBUG")) fputs(text, stderr);
 }
 
 static bool fail(const char * what) {
@@ -1274,6 +1275,58 @@ static bool test_device_h_rows(llama_model * model) {
     return true;
 }
 
+static bool test_graph_shapes(llama_model * model) {
+    for (int n_seq : {32, 33, 40}) {
+        server_rig rig(model, 0, N_MAX, 0, 128, GGML_TYPE_F16, 128, true, false, n_seq);
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+        server_rig ref(model, 0, N_MAX, 0, 128, GGML_TYPE_F16, 128, true, false, n_seq);
+        set_env("LLAMA_GRAPH_REUSE_DISABLE", nullptr);
+        const int n_embd = llama_model_n_embd_out(model);
+
+        for (int round = 0; round < 8; ++round) {
+            const int width = round % 2 ? N_MAX + 1 : 1;
+            const int active = round < 6 ? n_seq : n_seq - (round - 5);
+            llama_batch batch = llama_batch_init(active*width, 0, 1);
+            std::vector<float> hidden((size_t) active*width*n_embd);
+            for (size_t i = 0; i < hidden.size(); ++i) { hidden[i] = 0.01f*((i + round) % 17); }
+            for (int s = 0; s < active; ++s) {
+                for (int p = 0; p < width; ++p) {
+                    common_batch_add(batch, (s + p + round) % rig.n_vocab, p, {s}, p == width - 1);
+                }
+            }
+            batch.embd = hidden.data();
+            const auto finish = [&](bool result) {
+                batch.embd = nullptr;
+                llama_batch_free(batch);
+                return result;
+            };
+            std::vector<float> expected;
+            for (auto * current : {&ref, &rig}) {
+                auto * ctx = current->init->context();
+                llama_memory_clear(llama_get_memory(ctx), true);
+                const auto before = llama_perf_context(ctx).n_reused;
+                if (llama_decode(ctx, batch) != 0) { return finish(fail("concurrent MTP shape decode failed")); }
+                std::vector<float> actual;
+                for (int s = 0; s < active; ++s) {
+                    const auto * row = llama_get_logits_ith(ctx, (s + 1)*width - 1);
+                    actual.insert(actual.end(), row, row + rig.n_vocab);
+                }
+                if (current == &ref) {
+                    expected = std::move(actual);
+                } else {
+                    if (actual != expected) { return finish(fail("retained MTP graph changed logits")); }
+                    if (round >= 2 && round < 6 && llama_perf_context(ctx).n_reused != before + 1) {
+                        fprintf(stderr, "MTP graph reuse: %d sequences, %d rows, round %d\n", n_seq, active*width, round);
+                        return finish(fail("ordinary concurrent MTP shape rebuilt after warmup"));
+                    }
+                }
+            }
+            finish(true);
+        }
+    }
+    return true;
+}
+
 static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cache) {
     auto baseline = glm_model(1234, {devices.front()});
     auto split = glm_model(1234, devices, LLAMA_SPLIT_MODE_DATA);
@@ -1343,7 +1396,7 @@ static bool test_dp(const std::vector<ggml_backend_dev_t> & devices, bool q8_cac
     for (auto count : forced_counts) { if (count == 0) { return fail("DP acceptance coverage is incomplete"); } }
     printf("DP MTP %zu ranks %s: 48 identical draft/verify rounds, %zu greedy matches, controlled 0/1/2 accepts %zu/%zu/%zu\n",
         devices.size(), q8_cache ? "Q8" : "default", greedy_accepted, forced_counts[0], forced_counts[1], forced_counts[2]);
-    return true;
+    return q8_cache || test_graph_shapes(split.get());
 }
 
 int main(int argc, char ** argv) {
@@ -1371,11 +1424,13 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return ok ? 0 : 1;
         }
-        if (argc != 1) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,...]"); }
+        const std::string requested = argc == 3 && strcmp(argv[1], "--test") == 0 ? argv[2] : "";
+        if (argc != 1 && requested.empty()) { throw std::runtime_error("usage: test-speculative-mtp [--dp-device CPU|CUDA0,CUDA1,... | --test NAME]"); }
         // These model histories assert the fixed-cost policy; synthetic tests cover measured service costs.
         set_env("LLAMA_MTP_TIMING_LEGACY", "1");
         auto model = glm_model(1234);
         const std::pair<const char *, std::function<bool(llama_model *)>> tests[] = {
+            { "graph-shapes", test_graph_shapes },
             { "service-timing", test_service_timing },
             { "timed-driver", test_timed_driver },
             { "baseline",  test_baseline  },
@@ -1391,11 +1446,15 @@ int main(int argc, char ** argv) {
             { "device-h",  test_device_h  },
             { "device-h-rows", test_device_h_rows },
         };
+        bool ran = false;
         for (const auto & t : tests) {
+            if (!requested.empty() && requested != t.first) { continue; }
+            ran = true;
             const bool pass = t.second(model.get());
             printf("%-10s %s\n", t.first, pass ? "OK" : "FAIL");
             ok = ok && pass;
         }
+        if (!ran) { throw std::runtime_error("unknown test " + requested); }
     } catch (const std::exception & err) {
         fprintf(stderr, "error: %s\n", err.what());
         ok = false;
