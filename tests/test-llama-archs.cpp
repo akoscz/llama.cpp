@@ -1646,15 +1646,26 @@ static bool test_glm_nextn_store(const size_t seed, const std::vector<ggml_backe
                 return fail("the bound target's logits differ");
             }
         }
-        // the first and last rows of each sequence through the kept-row read, then every row through the host buffer
+        // Adjacent, disjoint and repeated rows must stay in caller order across owners.
         std::vector<int32_t> ends;
         for (size_t j = 0; j < parts.size(); ++j) {
             ends.push_back(first[j]);
+            if (parts[j].second > 1) { ends.push_back(first[j] + 1); }
             ends.push_back(first[j] + parts[j].second - 1);
         }
+        ends.push_back(ends.front());
         std::vector<float> h_ends(ends.size()*n_embd);
         const float * h_host = llama_get_embeddings_nextn(tgt_host.get());
         if (device) {
+            const int32_t invalid[] = {0, n};
+            std::vector<float> untouched(2*n_embd, -123.0f);
+            if (llama_get_embeddings_nextn_rows(tgt_dev.get(), invalid, 2, untouched.data())) {
+                return fail("an out-of-range kept row was accepted");
+            }
+            llama_synchronize(tgt_dev.get());
+            if (!std::all_of(untouched.begin(), untouched.end(), [](float v) { return v == -123.0f; })) {
+                return fail("an invalid read queued a partial host write");
+            }
             if (!llama_get_embeddings_nextn_rows(tgt_dev.get(), ends.data(), (int32_t) ends.size(), h_ends.data())) {
                 return fail("the kept rows could not be read");
             }

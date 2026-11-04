@@ -3258,25 +3258,35 @@ void llama_context::nextn_set_h_rows(const int32_t * src, int32_t n, const float
 }
 
 bool llama_context::nextn_get_rows(const int32_t * rows, int32_t n, float * dst) {
-    synchronize();
     const int64_t n_embd = model.hparams.n_embd_out();
     const size_t  row    = (size_t) n_embd*sizeof(float);
     if (embd_nextn_stale) {
         const auto & st = *nextn_store;
+        // Validate every row before queuing writes into the caller's destination.
+        for (int32_t i = 0; i < n; ++i) {
+            if (rows[i] < 0 || rows[i] >= st.n_rows) { return false; }
+        }
+        const auto backend = sched_res ? ggml_backend_sched_get_tensor_backend(sched_res, st.t) : nullptr;
+        if (!backend) { synchronize(); }
         for (int32_t i0 = 0; i0 < n; ) {
             int32_t i1 = i0 + 1;
-            while (st.n_devices == 1 && i1 < n && rows[i1] == rows[i1 - 1] + 1) {
+            while (i1 < n && st.row(st.half, rows[i1]) == st.row(st.half, rows[i1 - 1]) + 1) {
                 ++i1;
             }
-            if (rows[i0] < 0 || rows[i1 - 1] >= st.n_rows) {
-                return false;
+            const size_t offset = st.row(st.half, rows[i0])*row;
+            const size_t size = (i1 - i0)*row;
+            if (backend) {
+                ggml_backend_tensor_get_async(backend, st.t, dst + (size_t) i0*n_embd, offset, size);
+            } else {
+                ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, offset, size);
             }
-            ggml_backend_tensor_get(st.t, dst + (size_t) i0*n_embd, st.row(st.half, rows[i0])*row, (i1 - i0)*row);
             i0 = i1;
         }
+        if (backend) { synchronize(); }
         n_nextn_to_host += n;
         return true;
     }
+    synchronize();
     if (embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
         return false;
     }
@@ -4668,11 +4678,18 @@ void llama_context::mtp_index_capture() {
                         mtp_index.tensor, i, mtp_index.backend);
             }
         } else {
-            synchronize();
             const int64_t width = mtp_index.tensor->ne[0];
+            std::vector<int32_t> rows(width*mtp_index.seqs.size());
+            if (mtp_index.backend) {
+                ggml_backend_tensor_get_async(mtp_index.backend, mtp_index.tensor, rows.data(), 0, rows.size()*sizeof(int32_t));
+                synchronize();
+            } else {
+                synchronize();
+                ggml_backend_tensor_get(mtp_index.tensor, rows.data(), 0, rows.size()*sizeof(int32_t));
+            }
             std::vector<int32_t> row(width);
             for (size_t i = 0; i < mtp_index.seqs.size(); ++i) {
-                ggml_backend_tensor_get(mtp_index.tensor, row.data(), i*width*sizeof(int32_t), width*sizeof(int32_t));
+                std::copy_n(rows.data() + i*width, width, row.data());
                 draft->capture(mtp_index.seqs[i], mtp_index.positions[i], mtp_index.n_kv, row);
             }
         }
