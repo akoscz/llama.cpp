@@ -989,12 +989,12 @@ static void test_tagged_peg_parser(testing & t) {
 
 static void test_tool_id_after_tool_close(testing & t) {
     auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
-        auto unnamed = p.tool_open(p.literal("<call>")) + p.tool_close(p.literal("</call>")) + p.tool_id(p.literal("id_1"));
+        auto unnamed = p.tool_open(p.literal("<call>")) + p.tool_id(p.literal("call_id_longer_than_sso")) + p.tool_close(p.literal("</call>")) + p.tool_id(p.literal("id_1"));
         auto named   = p.tool_open(p.literal("<call>")) + p.tool_name(p.literal("get_weather")) + p.tool_close(p.literal("</call>"));
         return unnamed + named + p.end();
     });
 
-    std::string input = "<call></call>id_1<call>get_weather</call>";
+    std::string input = "<call>call_id_longer_than_sso</call>id_1<call>get_weather</call>";
 
     common_peg_parse_context ctx(input);
     auto result = parser.parse(ctx);
