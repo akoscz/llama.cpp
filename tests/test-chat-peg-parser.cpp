@@ -990,11 +990,11 @@ static void test_tagged_peg_parser(testing & t) {
 static void test_tool_id_after_tool_close(testing & t) {
     auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
         auto unnamed = p.tool_open(p.literal("<call>")) + p.tool_id(p.literal("call_id_longer_than_sso")) + p.tool_close(p.literal("</call>")) + p.tool_id(p.literal("id_1"));
-        auto named   = p.tool_open(p.literal("<call>")) + p.tool_name(p.literal("get_weather")) + p.tool_close(p.literal("</call>"));
+        auto named   = p.tool_open(p.literal("<call>")) + p.tool_id(p.literal("id_2")) + p.tool_name(p.literal("get_weather")) + p.tool_close(p.literal("</call>"));
         return unnamed + named + p.end();
     });
 
-    std::string input = "<call>call_id_longer_than_sso</call>id_1<call>get_weather</call>";
+    std::string input = "<call>call_id_longer_than_sso</call>id_1<call>id_2get_weather</call>";
 
     common_peg_parse_context ctx(input);
     auto result = parser.parse(ctx);
@@ -1003,9 +1003,12 @@ static void test_tool_id_after_tool_close(testing & t) {
     common_chat_msg msg;
     common_chat_peg_mapper(msg).from_ast(ctx.ast, result);
 
+    // The use-after-free itself (the "id_1" node writing through a current_tool left
+    // dangling by the preceding tool-close, #29942) is only detected under ASan
+    // (LLAMA_SANITIZE_ADDRESS); these asserts guard the parse result.
     t.assert_equal("only the named tool call is kept", 1u, msg.tool_calls.size());
-    t.assert_equal("tool name", "get_weather", msg.tool_calls[0].name);
-    t.assert_equal("tool id not set from the discarded call", "", msg.tool_calls[0].id);
+    t.assert_equal("kept call has its own id", "id_2", msg.tool_calls[0].id);
+    t.assert_equal("kept call has its own name", "get_weather", msg.tool_calls[0].name);
 }
 
 static void test_permute(testing & t) {
